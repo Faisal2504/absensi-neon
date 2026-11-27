@@ -66,8 +66,8 @@ export default function AllInAttendanceSystem() {
   const [settings, setSettings] = useState<SettingsData>({
     office_name: "Kantor Utama MPI-BTG",
     qr_code: "ABSENSI-KANTOR-MPI-BTG",
-    latitude: -6.6167,
-    longitude: 110.6667,
+    latitude: -6.9148609,
+    longitude: 109.7446830,
     radius_meters: 150,
     shift_start: "07:00",
     late_tolerance: 10,
