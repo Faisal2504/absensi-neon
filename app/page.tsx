@@ -11,6 +11,8 @@ interface Employee {
   role: RoleType;
   department: string;
   pin_code: string;
+  hourly_rate?: number;
+  shift_id?: number;
 }
 
 interface LocationItem {
@@ -30,6 +32,7 @@ interface TimeEntry {
   punched_at: string;
   is_offline_sync?: boolean;
   qr_code?: string;
+  notes?: string;
   latitude?: number | null;
   longitude?: number | null;
   distance_meters?: number | null;
@@ -50,10 +53,10 @@ interface BarcodeDetectorInstance {
   detect: (video: HTMLVideoElement) => Promise<Array<{ rawValue?: string }>>;
 }
 
-const CACHE_KEY = "absensi_qr_face_cache_v1";
-const QUEUE_KEY = "absensi_qr_face_queue_v1";
-const ACTIVE_EMP_KEY = "absensi_qr_face_emp_id_v1";
-const QR_CODE_KEY = "absensi_qr_office_code_v1";
+const CACHE_KEY = "absensi_qr_face_cache_v2";
+const QUEUE_KEY = "absensi_qr_face_queue_v2";
+const ACTIVE_EMP_KEY = "absensi_qr_face_emp_id_v2";
+const QR_CODE_KEY = "absensi_qr_office_code_v2";
 
 const DEFAULT_EMPLOYEES: Employee[] = [
   {
@@ -63,6 +66,8 @@ const DEFAULT_EMPLOYEES: Employee[] = [
     role: "STAFF",
     department: "Operasional",
     pin_code: "1111",
+    hourly_rate: 25000,
+    shift_id: 1,
   },
   {
     id: 2,
@@ -71,6 +76,8 @@ const DEFAULT_EMPLOYEES: Employee[] = [
     role: "ADMIN",
     department: "Manajemen",
     pin_code: "0000",
+    hourly_rate: 50000,
+    shift_id: 1,
   },
 ];
 
@@ -93,6 +100,21 @@ const formatTimeWIB = (iso?: string | null) =>
         minute: "2-digit",
         second: "2-digit",
       });
+
+const formatDateTimeLocalWIB = (iso?: string | null) => {
+  if (!iso) return "";
+  const parts = new Intl.DateTimeFormat("sv-SE", {
+    timeZone: "Asia/Jakarta",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  })
+    .format(new Date(iso))
+    .replace(" ", "T");
+  return parts;
+};
 
 const getNowTimeWIB = () =>
   new Date().toLocaleTimeString("id-ID", {
@@ -166,19 +188,33 @@ function getInitialStorageState() {
 export default function AbsensiQrFacePage() {
   const initialState = useMemo(() => getInitialStorageState(), []);
 
-  const [employees, setEmployees] = useState<Employee[]>(initialState.employees);
-  const [locations, setLocations] = useState<LocationItem[]>(initialState.locations);
-  const [serverEntries, setServerEntries] = useState<TimeEntry[]>(initialState.entries);
-  const [offlineQueue, setOfflineQueue] = useState<TimeEntry[]>(initialState.queue);
-  const [selectedEmpId, setSelectedEmpId] = useState<number>(initialState.empId);
-  const [adminView, setAdminView] = useState<"absen" | "monitoring">("absen");
+  const [employees, setEmployees] = useState<Employee[]>(
+    initialState.employees
+  );
+  const [locations, setLocations] = useState<LocationItem[]>(
+    initialState.locations
+  );
+  const [serverEntries, setServerEntries] = useState<TimeEntry[]>(
+    initialState.entries
+  );
+  const [offlineQueue, setOfflineQueue] = useState<TimeEntry[]>(
+    initialState.queue
+  );
+  const [selectedEmpId, setSelectedEmpId] = useState<number>(
+    initialState.empId
+  );
+  const [adminTab, setAdminTab] = useState<
+    "monitoring" | "absen" | "kelola"
+  >("monitoring");
   const [accountPickerOpen, setAccountPickerOpen] = useState(false);
 
   const [isOnline, setIsOnline] = useState<boolean>(() =>
     typeof navigator !== "undefined" ? navigator.onLine : true
   );
   const [isSyncing, setIsSyncing] = useState(false);
-  const [lastSyncLabel, setLastSyncLabel] = useState<string>(() => getNowTimeWIB());
+  const [lastSyncLabel, setLastSyncLabel] = useState<string>(() =>
+    getNowTimeWIB()
+  );
 
   const [officeQrCode, setOfficeQrCode] = useState<string>(initialState.qrCode);
   const [qrCodeInput, setQrCodeInput] = useState("");
@@ -200,6 +236,32 @@ export default function AbsensiQrFacePage() {
     "Wajib ambil foto selfie wajah sebelum absen masuk atau keluar."
   );
   const [isSubmitting, setIsSubmitting] = useState(false);
+
+  // State Edit Absen (Khusus Admin)
+  const [editingEntryUuid, setEditingEntryUuid] = useState<string | null>(null);
+  const [editEntryId, setEditEntryId] = useState<number | undefined>(undefined);
+  const [editEntryType, setEditEntryType] = useState<
+    "CLOCK_IN" | "CLOCK_OUT"
+  >("CLOCK_IN");
+  const [editPunchedAtLocal, setEditPunchedAtLocal] = useState("");
+  const [editNotes, setEditNotes] = useState("");
+
+  // State Kelola Lokasi & Karyawan (Khusus Admin)
+  const [locForm, setLocForm] = useState({
+    id: 0,
+    name: "",
+    latitude: "",
+    longitude: "",
+    radius_meters: "150",
+  });
+  const [empForm, setEmpForm] = useState({
+    id: 0,
+    emp_code: "",
+    full_name: "",
+    role: "STAFF" as RoleType,
+    department: "Operasional",
+    pin_code: "1234",
+  });
 
   const [toast, setToast] = useState<{
     type: "ok" | "warn" | "err";
@@ -712,15 +774,6 @@ export default function AbsensiQrFacePage() {
     }
   };
 
-  const handleKeluarSession = () => {
-    stopQrCamera();
-    stopSelfieCamera();
-    setQrCodeInput("");
-    setQrVerified(false);
-    setCapturedSelfie(null);
-    setAccountPickerOpen(true);
-  };
-
   const combinedEntries = useMemo(() => {
     const seen = new Set(serverEntries.map((e) => e.client_uuid));
     const pendingOnly = offlineQueue.filter((q) => !seen.has(q.client_uuid));
@@ -729,6 +782,304 @@ export default function AbsensiQrFacePage() {
         new Date(b.punched_at).getTime() - new Date(a.punched_at).getTime()
     );
   }, [serverEntries, offlineQueue]);
+
+  // Aksi Edit & Hapus Absen (Khusus Admin)
+  const beginEditEntry = (entry: TimeEntry) => {
+    if (!isAdmin) return;
+    setEditingEntryUuid(entry.client_uuid);
+    setEditEntryId(entry.id);
+    setEditEntryType(entry.entry_type);
+    setEditPunchedAtLocal(formatDateTimeLocalWIB(entry.punched_at));
+    setEditNotes(entry.notes || "");
+  };
+
+  const saveEditedEntry = async () => {
+    if (!isAdmin || !editingEntryUuid) return;
+    const parsedDate = editPunchedAtLocal
+      ? new Date(`${editPunchedAtLocal}:00+07:00`)
+      : new Date();
+    const updatedIso = isNaN(parsedDate.getTime())
+      ? new Date().toISOString()
+      : parsedDate.toISOString();
+
+    setServerEntries((prev) =>
+      prev.map((item) =>
+        item.client_uuid === editingEntryUuid
+          ? {
+              ...item,
+              entry_type: editEntryType,
+              punched_at: updatedIso,
+              notes: editNotes,
+            }
+          : item
+      )
+    );
+    setOfflineQueue((prev) => {
+      const next = prev.map((item) =>
+        item.client_uuid === editingEntryUuid
+          ? {
+              ...item,
+              entry_type: editEntryType,
+              punched_at: updatedIso,
+              notes: editNotes,
+            }
+          : item
+      );
+      localStorage.setItem(QUEUE_KEY, JSON.stringify(next));
+      return next;
+    });
+
+    if (navigator.onLine) {
+      try {
+        await fetch("/api/manage", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            action: "UPDATE_ENTRY",
+            payload: {
+              id: editEntryId,
+              client_uuid: editingEntryUuid,
+              entry_type: editEntryType,
+              punched_at: updatedIso,
+              notes: editNotes,
+            },
+          }),
+        });
+        await loadServerData();
+      } catch {
+        // Tetap tersimpan di state/antrean
+      }
+    }
+
+    setEditingEntryUuid(null);
+    showToast("ok", "Data absensi berhasil diperbarui.");
+  };
+
+  const deleteEntry = async (entry: TimeEntry) => {
+    if (!isAdmin) return;
+    setServerEntries((prev) =>
+      prev.filter(
+        (item) =>
+          item.client_uuid !== entry.client_uuid &&
+          (!entry.id || item.id !== entry.id)
+      )
+    );
+    setOfflineQueue((prev) => {
+      const next = prev.filter((item) => item.client_uuid !== entry.client_uuid);
+      localStorage.setItem(QUEUE_KEY, JSON.stringify(next));
+      return next;
+    });
+
+    if (navigator.onLine) {
+      try {
+        await fetch("/api/manage", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            action: "DELETE_ENTRY",
+            payload: { id: entry.id, client_uuid: entry.client_uuid },
+          }),
+        });
+        await loadServerData();
+      } catch {
+        // Abaikan error jaringan
+      }
+    }
+    showToast("ok", "Data absensi dihapus.");
+  };
+
+  // Unduh / Ekspor Data Absen (Khusus Admin)
+  const downloadAttendanceCsv = () => {
+    if (!isAdmin) return;
+    const headers = [
+      "Tanggal_Jam_WIB",
+      "Kode_Karyawan",
+      "Nama_Karyawan",
+      "Jenis_Absen",
+      "Kode_QR",
+      "Jarak_Meter",
+      "Wajah_Terdeteksi",
+      "Catatan",
+    ];
+    const rows = combinedEntries.map((e) => [
+      new Date(e.punched_at).toLocaleString("id-ID", {
+        timeZone: "Asia/Jakarta",
+      }),
+      e.emp_code || "",
+      e.full_name || "",
+      e.entry_type === "CLOCK_IN" ? "ABSEN MASUK" : "ABSEN KELUAR",
+      e.qr_code || "",
+      e.distance_meters ?? "",
+      e.face_detected ? "YA" : "TIDAK",
+      (e.notes || "").replace(/"/g, '""'),
+    ]);
+    const csv = [headers, ...rows]
+      .map((r) => r.map((cell) => `"${String(cell)}"`).join(","))
+      .join("\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `Rekap_Absensi_Admin_${new Date()
+      .toISOString()
+      .slice(0, 10)}.csv`;
+    link.click();
+    URL.revokeObjectURL(url);
+    showToast("ok", "File CSV absensi berhasil diunduh.");
+  };
+
+  // Kelola Lokasi & Karyawan (Khusus Admin)
+  const saveLocationAdmin = async () => {
+    if (!isAdmin || !locForm.name || !locForm.latitude || !locForm.longitude) {
+      showToast("err", "Lengkapi nama, latitude, dan longitude lokasi.");
+      return;
+    }
+    const payload = {
+      id: locForm.id || undefined,
+      name: locForm.name.trim(),
+      latitude: Number(locForm.latitude),
+      longitude: Number(locForm.longitude),
+      radius_meters: Number(locForm.radius_meters) || 150,
+    };
+    if (navigator.onLine) {
+      try {
+        const res = await fetch("/api/manage", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "SAVE_LOCATION", payload }),
+        });
+        const data = await res.json();
+        if (data.ok) {
+          await loadServerData();
+          setLocForm({
+            id: 0,
+            name: "",
+            latitude: "",
+            longitude: "",
+            radius_meters: "150",
+          });
+          showToast("ok", "Lokasi & radius berhasil disimpan.");
+          return;
+        }
+      } catch {
+        // Fallback lokal
+      }
+    }
+    setLocations((prev) => {
+      if (locForm.id) {
+        return prev.map((l) => (l.id === locForm.id ? { ...l, ...payload } : l));
+      }
+      return [...prev, { ...payload, id: Date.now() }];
+    });
+    setLocForm({
+      id: 0,
+      name: "",
+      latitude: "",
+      longitude: "",
+      radius_meters: "150",
+    });
+    showToast("ok", "Lokasi diperbarui.");
+  };
+
+  const deleteLocationAdmin = async (id: number) => {
+    if (!isAdmin) return;
+    if (navigator.onLine) {
+      try {
+        await fetch("/api/manage", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "DELETE_LOCATION", payload: { id } }),
+        });
+        await loadServerData();
+      } catch {
+        // Abaikan error
+      }
+    }
+    setLocations((prev) => prev.filter((l) => l.id !== id));
+    showToast("ok", "Lokasi dihapus.");
+  };
+
+  const saveEmployeeAdmin = async () => {
+    if (!isAdmin || !empForm.emp_code.trim() || !empForm.full_name.trim()) {
+      showToast("err", "Isi kode dan nama lengkap karyawan.");
+      return;
+    }
+    const payload = {
+      id: empForm.id || undefined,
+      emp_code: empForm.emp_code.trim(),
+      full_name: empForm.full_name.trim(),
+      role: empForm.role,
+      department: empForm.department.trim() || "Operasional",
+      pin_code: empForm.pin_code.trim() || "1234",
+    };
+    if (navigator.onLine) {
+      try {
+        const res = await fetch("/api/manage", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "SAVE_EMPLOYEE", payload }),
+        });
+        const data = await res.json();
+        if (data.ok) {
+          await loadServerData();
+          setEmpForm({
+            id: 0,
+            emp_code: "",
+            full_name: "",
+            role: "STAFF",
+            department: "Operasional",
+            pin_code: "1234",
+          });
+          showToast("ok", "Data karyawan tersimpan.");
+          return;
+        }
+      } catch {
+        // Fallback lokal
+      }
+    }
+    setEmployees((prev) => {
+      if (empForm.id) {
+        return prev.map((e) => (e.id === empForm.id ? { ...e, ...payload } : e));
+      }
+      return [...prev, { ...payload, id: Date.now() }];
+    });
+    setEmpForm({
+      id: 0,
+      emp_code: "",
+      full_name: "",
+      role: "STAFF",
+      department: "Operasional",
+      pin_code: "1234",
+    });
+    showToast("ok", "Karyawan diperbarui.");
+  };
+
+  const deleteEmployeeAdmin = async (id: number) => {
+    if (!isAdmin) return;
+    if (navigator.onLine) {
+      try {
+        await fetch("/api/manage", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "DELETE_EMPLOYEE", payload: { id } }),
+        });
+        await loadServerData();
+      } catch {
+        // Abaikan error
+      }
+    }
+    setEmployees((prev) => prev.filter((e) => e.id !== id));
+    showToast("ok", "Karyawan dihapus.");
+  };
+
+  const handleKeluarSession = () => {
+    stopQrCamera();
+    stopSelfieCamera();
+    setQrCodeInput("");
+    setQrVerified(false);
+    setCapturedSelfie(null);
+    setAccountPickerOpen(true);
+  };
 
   const myRecentEntries = useMemo(() => {
     if (!activeEmployee) return [];
@@ -743,7 +1094,7 @@ export default function AbsensiQrFacePage() {
 
   return (
     <div className="min-h-screen bg-[#EEF1F5] text-slate-900 p-3 sm:p-5">
-      <div className="max-w-lg mx-auto space-y-4">
+      <div className="max-w-xl mx-auto space-y-4">
         {toast && (
           <div
             className={`px-4 py-2.5 rounded-xl text-white text-xs font-bold flex items-center gap-2 shadow ${
@@ -778,7 +1129,7 @@ export default function AbsensiQrFacePage() {
                   : "bg-sky-500/20 text-sky-300 border border-sky-400/30"
               }`}
             >
-              {isAdmin ? "ADMIN" : "MODE TERBATAS"}
+              {isAdmin ? "ADMIN FULL AKSES" : "MODE TERBATAS"}
             </span>
           </div>
 
@@ -842,7 +1193,7 @@ export default function AbsensiQrFacePage() {
                       setSelectedEmpId(Number(emp.id));
                       localStorage.setItem(ACTIVE_EMP_KEY, String(emp.id));
                       setAccountPickerOpen(false);
-                      setAdminView("absen");
+                      setAdminTab("monitoring");
                       showToast(
                         "ok",
                         `Beralih ke ${emp.full_name} (${emp.role})`
@@ -872,58 +1223,138 @@ export default function AbsensiQrFacePage() {
           </section>
         )}
 
-        {/* Navigasi Khusus Admin Saja */}
+        {/* Menu Full Akses Khusus Admin */}
         {isAdmin && (
-          <section className="bg-white rounded-2xl p-3 border border-slate-200 shadow-sm space-y-2.5">
-            <div className="grid grid-cols-2 gap-2">
+          <section className="bg-white rounded-2xl p-2.5 border border-slate-200 shadow-sm">
+            <div className="grid grid-cols-3 gap-2">
               <button
                 type="button"
-                onClick={() => setAdminView("monitoring")}
-                className={`py-2.5 px-3 rounded-xl text-xs font-bold ${
-                  adminView === "monitoring"
+                onClick={() => setAdminTab("monitoring")}
+                className={`py-2.5 px-2 rounded-xl text-xs font-bold ${
+                  adminTab === "monitoring"
                     ? "bg-blue-600 text-white"
                     : "bg-slate-100 text-slate-700"
                 }`}
               >
-                Monitoring &amp; Absen Langsung
+                Data Absen &amp; Edit
               </button>
               <button
                 type="button"
-                onClick={() => setAdminView("absen")}
-                className={`py-2.5 px-3 rounded-xl text-xs font-bold ${
-                  adminView === "absen"
+                onClick={() => setAdminTab("absen")}
+                className={`py-2.5 px-2 rounded-xl text-xs font-bold ${
+                  adminTab === "absen"
                     ? "bg-blue-600 text-white"
                     : "bg-slate-100 text-slate-700"
                 }`}
               >
-                Scan QR &amp; GPS
+                Scan QR &amp; Absen
+              </button>
+              <button
+                type="button"
+                onClick={() => setAdminTab("kelola")}
+                className={`py-2.5 px-2 rounded-xl text-xs font-bold ${
+                  adminTab === "kelola"
+                    ? "bg-blue-600 text-white"
+                    : "bg-slate-100 text-slate-700"
+                }`}
+              >
+                Kelola &amp; QR
               </button>
             </div>
           </section>
         )}
 
-        {/* Tampilan Monitoring Khusus Admin */}
-        {isAdmin && adminView === "monitoring" ? (
+        {/* ADMIN TAB 1: Pengambilan Data Absen, Edit, Hapus & Unduh */}
+        {isAdmin && adminTab === "monitoring" && (
           <section className="bg-white rounded-2xl p-4 border border-slate-200 shadow-sm space-y-3">
-            <div className="flex items-center justify-between border-b border-slate-100 pb-2.5">
-              <span className="font-bold text-sm text-slate-900">
-                Monitoring Absensi Terbaru
-              </span>
-              <span className="text-xs font-bold text-slate-500">
-                {combinedEntries.length} catatan
-              </span>
+            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 pb-2.5">
+              <div>
+                <h2 className="font-bold text-sm text-slate-900">
+                  Data Absensi Lengkap ({combinedEntries.length})
+                </h2>
+                <p className="text-[11px] text-slate-500">
+                  Ambil data, edit jam/status, hapus, atau unduh rekap CSV.
+                </p>
+              </div>
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => void loadServerData()}
+                  className="px-3 py-1.5 rounded-lg bg-blue-50 text-blue-700 text-xs font-bold"
+                >
+                  Ambil Data
+                </button>
+                <button
+                  type="button"
+                  onClick={downloadAttendanceCsv}
+                  className="px-3 py-1.5 rounded-lg bg-emerald-600 text-white text-xs font-bold"
+                >
+                  Unduh CSV
+                </button>
+              </div>
             </div>
+
+            {editingEntryUuid && (
+              <div className="p-3.5 rounded-xl bg-amber-50 border border-amber-300 space-y-2.5">
+                <div className="text-xs font-extrabold text-amber-900">
+                  Edit Data Absen
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <select
+                    value={editEntryType}
+                    onChange={(e) =>
+                      setEditEntryType(
+                        e.target.value as "CLOCK_IN" | "CLOCK_OUT"
+                      )
+                    }
+                    className="rounded-xl border border-amber-300 bg-white px-3 py-2 text-xs font-semibold"
+                  >
+                    <option value="CLOCK_IN">ABSEN MASUK</option>
+                    <option value="CLOCK_OUT">ABSEN KELUAR</option>
+                  </select>
+                  <input
+                    type="datetime-local"
+                    value={editPunchedAtLocal}
+                    onChange={(e) => setEditPunchedAtLocal(e.target.value)}
+                    className="rounded-xl border border-amber-300 bg-white px-3 py-2 text-xs"
+                  />
+                </div>
+                <input
+                  type="text"
+                  placeholder="Catatan admin..."
+                  value={editNotes}
+                  onChange={(e) => setEditNotes(e.target.value)}
+                  className="w-full rounded-xl border border-amber-300 bg-white px-3 py-2 text-xs"
+                />
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() => void saveEditedEntry()}
+                    className="px-4 py-2 rounded-xl bg-emerald-600 text-white text-xs font-bold"
+                  >
+                    Simpan Perubahan
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setEditingEntryUuid(null)}
+                    className="px-4 py-2 rounded-xl bg-slate-200 text-slate-800 text-xs font-bold"
+                  >
+                    Batal
+                  </button>
+                </div>
+              </div>
+            )}
 
             <div className="space-y-2 max-h-96 overflow-y-auto">
               {combinedEntries.length === 0 ? (
                 <p className="text-xs text-slate-500 py-4 text-center">
-                  Belum ada data absensi masuk.
+                  Belum ada data absensi. Tekan Ambil Data atau Refresh Server.
                 </p>
               ) : (
                 combinedEntries.map((item, idx) => (
                   <div
                     key={`${item.client_uuid}-${idx}`}
-                    className="p-3 rounded-xl bg-slate-50 border border-slate-200/70 flex items-center justify-between gap-3"
+                    className="p-3 rounded-xl bg-slate-50 border border-slate-200/70 flex items-center justify-between gap-2.5"
                   >
                     <div className="flex items-center gap-2.5 min-w-0">
                       {item.selfie_data ? (
@@ -942,7 +1373,7 @@ export default function AbsensiQrFacePage() {
                         <div className="text-xs font-bold text-slate-900 truncate">
                           {item.full_name || "Karyawan"} ({item.emp_code || "-"})
                         </div>
-                        <div className="text-[11px] text-slate-500">
+                        <div className="text-[11px] text-slate-600">
                           {item.entry_type === "CLOCK_IN"
                             ? "ABSEN MASUK"
                             : "ABSEN KELUAR"}{" "}
@@ -951,17 +1382,39 @@ export default function AbsensiQrFacePage() {
                         <div className="text-[10px] text-slate-400 truncate">
                           QR: {item.qr_code || "-"} • Wajah:{" "}
                           {item.face_detected ? "Terdeteksi" : "Standar"}
+                          {item.notes ? ` • ${item.notes}` : ""}
                         </div>
                       </div>
+                    </div>
+                    <div className="flex flex-col gap-1 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => beginEditEntry(item)}
+                        className="px-2.5 py-1 rounded-lg bg-amber-500 text-white text-[11px] font-bold"
+                      >
+                        Edit
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void deleteEntry(item)}
+                        className="px-2.5 py-1 rounded-lg bg-rose-600 text-white text-[11px] font-bold"
+                      >
+                        Hapus
+                      </button>
                     </div>
                   </div>
                 ))
               )}
             </div>
+          </section>
+        )}
 
-            {/* QR Code Resmi & Download Khusus Admin */}
-            <div className="pt-3 border-t border-slate-100 text-center space-y-2">
-              <div className="text-xs font-extrabold text-slate-800">
+        {/* ADMIN TAB 3: Kelola Lokasi, Karyawan, Kode QR Resmi & Download PNG */}
+        {isAdmin && adminTab === "kelola" && (
+          <div className="space-y-4">
+            {/* QR Code Resmi & Download PNG */}
+            <section className="bg-white rounded-2xl p-4 border border-slate-200 shadow-sm text-center space-y-2.5">
+              <div className="text-xs font-extrabold text-slate-800 uppercase">
                 QR Code Resmi Kantor (Khusus Admin)
               </div>
               <input
@@ -987,14 +1440,230 @@ export default function AbsensiQrFacePage() {
                 download={`${officeQrCode}.png`}
                 target="_blank"
                 rel="noreferrer"
-                className="inline-flex items-center justify-center gap-1.5 px-4 py-2 rounded-xl bg-emerald-700 text-white text-xs font-bold"
+                className="inline-flex items-center justify-center px-4 py-2 rounded-xl bg-emerald-700 text-white text-xs font-bold"
               >
-                <span>Download PNG</span>
+                Download PNG
               </a>
-            </div>
-          </section>
-        ) : (
-          /* Mode Terbatas Karyawan: Hanya Absen Masuk & Keluar via Scan QR + Selfie Deteksi Wajah */
+            </section>
+
+            {/* Kelola Lokasi & Radius */}
+            <section className="bg-white rounded-2xl p-4 border border-slate-200 shadow-sm space-y-2.5">
+              <div className="flex items-center justify-between">
+                <h3 className="text-xs font-extrabold text-slate-800 uppercase">
+                  Kelola Lokasi &amp; Radius
+                </h3>
+                {gpsCoords && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setLocForm((prev) => ({
+                        ...prev,
+                        latitude: String(gpsCoords.lat),
+                        longitude: String(gpsCoords.lng),
+                      }))
+                    }
+                    className="px-2.5 py-1 rounded-lg bg-emerald-50 text-emerald-700 text-[11px] font-bold"
+                  >
+                    Ambil GPS Saya
+                  </button>
+                )}
+              </div>
+              <input
+                type="text"
+                placeholder="Nama Lokasi"
+                value={locForm.name}
+                onChange={(e) =>
+                  setLocForm((prev) => ({ ...prev, name: e.target.value }))
+                }
+                className="w-full rounded-xl border border-slate-300 px-3 py-2 text-xs"
+              />
+              <div className="grid grid-cols-3 gap-2">
+                <input
+                  type="text"
+                  placeholder="Latitude"
+                  value={locForm.latitude}
+                  onChange={(e) =>
+                    setLocForm((prev) => ({ ...prev, latitude: e.target.value }))
+                  }
+                  className="rounded-xl border border-slate-300 px-2.5 py-2 text-xs"
+                />
+                <input
+                  type="text"
+                  placeholder="Longitude"
+                  value={locForm.longitude}
+                  onChange={(e) =>
+                    setLocForm((prev) => ({
+                      ...prev,
+                      longitude: e.target.value,
+                    }))
+                  }
+                  className="rounded-xl border border-slate-300 px-2.5 py-2 text-xs"
+                />
+                <input
+                  type="number"
+                  placeholder="Radius (m)"
+                  value={locForm.radius_meters}
+                  onChange={(e) =>
+                    setLocForm((prev) => ({
+                      ...prev,
+                      radius_meters: e.target.value,
+                    }))
+                  }
+                  className="rounded-xl border border-slate-300 px-2.5 py-2 text-xs"
+                />
+              </div>
+              <button
+                type="button"
+                onClick={() => void saveLocationAdmin()}
+                className="w-full py-2.5 rounded-xl bg-blue-600 text-white text-xs font-bold"
+              >
+                {locForm.id ? "Simpan Edit Lokasi" : "+ Tambah Lokasi"}
+              </button>
+              <div className="space-y-1.5 pt-1">
+                {locations.map((loc) => (
+                  <div
+                    key={loc.id}
+                    className="p-2.5 rounded-xl bg-slate-50 flex items-center justify-between text-xs"
+                  >
+                    <div>
+                      <div className="font-bold">{loc.name}</div>
+                      <div className="text-[11px] text-slate-500">
+                        {loc.latitude}, {loc.longitude} ({loc.radius_meters}m)
+                      </div>
+                    </div>
+                    <div className="flex gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setLocForm({
+                            id: loc.id,
+                            name: loc.name,
+                            latitude: String(loc.latitude),
+                            longitude: String(loc.longitude),
+                            radius_meters: String(loc.radius_meters),
+                          })
+                        }
+                        className="px-2 py-1 rounded bg-amber-500 text-white font-bold text-[11px]"
+                      >
+                        Edit
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void deleteLocationAdmin(loc.id)}
+                        className="px-2 py-1 rounded bg-rose-600 text-white font-bold text-[11px]"
+                      >
+                        Hapus
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </section>
+
+            {/* Kelola Karyawan */}
+            <section className="bg-white rounded-2xl p-4 border border-slate-200 shadow-sm space-y-2.5">
+              <h3 className="text-xs font-extrabold text-slate-800 uppercase">
+                Kelola Akun Karyawan &amp; Role
+              </h3>
+              <div className="grid grid-cols-2 gap-2">
+                <input
+                  type="text"
+                  placeholder="Kode (KRY-002)"
+                  value={empForm.emp_code}
+                  onChange={(e) =>
+                    setEmpForm((prev) => ({ ...prev, emp_code: e.target.value }))
+                  }
+                  className="rounded-xl border border-slate-300 px-3 py-2 text-xs"
+                />
+                <input
+                  type="text"
+                  placeholder="Nama Lengkap"
+                  value={empForm.full_name}
+                  onChange={(e) =>
+                    setEmpForm((prev) => ({
+                      ...prev,
+                      full_name: e.target.value,
+                    }))
+                  }
+                  className="rounded-xl border border-slate-300 px-3 py-2 text-xs"
+                />
+                <select
+                  value={empForm.role}
+                  onChange={(e) =>
+                    setEmpForm((prev) => ({
+                      ...prev,
+                      role: e.target.value as RoleType,
+                    }))
+                  }
+                  className="rounded-xl border border-slate-300 px-3 py-2 text-xs bg-white"
+                >
+                  <option value="STAFF">STAFF (Mode Terbatas)</option>
+                  <option value="ADMIN">ADMIN (Full Akses)</option>
+                  <option value="MANAGER">MANAGER (Full Akses)</option>
+                </select>
+                <input
+                  type="text"
+                  placeholder="PIN"
+                  value={empForm.pin_code}
+                  onChange={(e) =>
+                    setEmpForm((prev) => ({ ...prev, pin_code: e.target.value }))
+                  }
+                  className="rounded-xl border border-slate-300 px-3 py-2 text-xs"
+                />
+              </div>
+              <button
+                type="button"
+                onClick={() => void saveEmployeeAdmin()}
+                className="w-full py-2.5 rounded-xl bg-emerald-600 text-white text-xs font-bold"
+              >
+                {empForm.id ? "Simpan Edit Karyawan" : "+ Tambah Karyawan"}
+              </button>
+              <div className="space-y-1.5 pt-1">
+                {employees.map((emp) => (
+                  <div
+                    key={emp.id}
+                    className="p-2.5 rounded-xl bg-slate-50 flex items-center justify-between text-xs"
+                  >
+                    <div>
+                      <span className="font-bold">{emp.full_name}</span> (
+                      {emp.emp_code}) • {emp.role}
+                    </div>
+                    <div className="flex gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setEmpForm({
+                            id: emp.id,
+                            emp_code: emp.emp_code,
+                            full_name: emp.full_name,
+                            role: emp.role,
+                            department: emp.department,
+                            pin_code: emp.pin_code,
+                          })
+                        }
+                        className="px-2 py-1 rounded bg-amber-500 text-white font-bold text-[11px]"
+                      >
+                        Edit
+                      </button>
+                      {emp.role !== "ADMIN" && (
+                        <button
+                          type="button"
+                          onClick={() => void deleteEmployeeAdmin(emp.id)}
+                          className="px-2 py-1 rounded bg-rose-600 text-white font-bold text-[11px]"
+                        >
+                          Hapus
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </section>
+          </div>
+        )}
+
+        {/* MODE TERBATAS KARYAWAN (dan Tab Absen Admin): Hanya Absen Masuk & Keluar via Scan QR + Selfie Deteksi Wajah */}
+        {(!isAdmin || adminTab === "absen") && (
           <section className="bg-white rounded-2xl p-4 border-2 border-blue-200 shadow-sm space-y-4">
             <div className="flex items-center justify-between gap-2 border-b border-slate-100 pb-3">
               <div>
@@ -1002,8 +1671,9 @@ export default function AbsensiQrFacePage() {
                   Absen Real-Time Saya ({activeEmployee?.full_name || "Karyawan"})
                 </h2>
                 <p className="text-[11px] text-slate-500">
-                  Mode terbatas: wajib Scan QR Code &amp; Foto Selfie Wajah •{" "}
-                  {gpsLabel}
+                  {isAdmin
+                    ? `Mode Absen QR & Wajah • ${gpsLabel}`
+                    : `Mode terbatas: hanya Absen Masuk & Keluar pakai Scan QR + Selfie Wajah • ${gpsLabel}`}
                 </p>
               </div>
               <button
@@ -1191,10 +1861,10 @@ export default function AbsensiQrFacePage() {
               </button>
             </div>
 
-            {/* Log Singkat Absensi Masuk/Keluar Milik Karyawan */}
+            {/* Riwayat Masuk/Keluar Milik Sendiri */}
             <div className="pt-2 border-t border-slate-100 space-y-1.5">
               <div className="text-[11px] font-bold text-slate-500 uppercase">
-                Riwayat Absen Masuk/Keluar Terakhir
+                Riwayat Absen Masuk/Keluar Saya
               </div>
               {myRecentEntries.length === 0 ? (
                 <div className="text-xs text-slate-400">
