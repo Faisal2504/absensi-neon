@@ -85,20 +85,40 @@ const INITIAL_LOCATIONS: LocationRecord[] = [
   },
 ];
 
-function getNeonConfig(): { endpoint: string; conn: string } | null {
-  const raw = (
-    process.env.DATABASE_URL ||
-    process.env.POSTGRES_URL ||
-    process.env.NEON_DATABASE_URL ||
-    ""
-  ).trim();
-  if (!raw) return null;
+function findDatabaseUrl(): { envKey: string; url: string } | null {
+  const keys = [
+    "DATABASE_URL",
+    "DATABASE_URL_UNPOOLED",
+    "POSTGRES_URL",
+    "POSTGRES_PRISMA_URL",
+    "POSTGRES_URL_NON_POOLING",
+    "NEON_DATABASE_URL",
+  ];
+  for (const k of keys) {
+    const val = (process.env[k] || "").trim();
+    if (val) {
+      return {
+        envKey: k,
+        url: val.replace(/^postgres:\/\//i, "postgresql://"),
+      };
+    }
+  }
+  return null;
+}
+
+function getNeonConfig(): {
+  envKey: string;
+  endpoint: string;
+  conn: string;
+} | null {
+  const found = findDatabaseUrl();
+  if (!found) return null;
   try {
-    const normalized = raw.replace(/^postgres:\/\//i, "postgresql://");
-    const u = new URL(normalized);
+    const u = new URL(found.url);
     return {
+      envKey: found.envKey,
       endpoint: `https://${u.hostname}/sql`,
-      conn: normalized,
+      conn: found.url,
     };
   } catch {
     return null;
@@ -114,7 +134,7 @@ async function runNeonSql(
     return {
       ok: false,
       rows: [],
-      error: "DATABASE_URL belum diatur di Environment Variables Vercel",
+      error: "DATABASE_URL tidak ditemukan di Environment Variables Vercel",
     };
   }
 
@@ -134,7 +154,7 @@ async function runNeonSql(
       return {
         ok: false,
         rows: [],
-        error: `Neon HTTP ${res.status}: ${text.slice(0, 160)}`,
+        error: `Neon HTTP ${res.status} (${cfg.envKey}): ${text.slice(0, 200)}`,
       };
     }
 
@@ -230,13 +250,17 @@ async function ensureNeonTables(): Promise<{ ok: boolean; error?: string }> {
   return { ok: true };
 }
 
-export async function GET() {
+export async function GET(req: NextRequest) {
+  const isDiag = req.nextUrl.searchParams.get("diag") === "1";
+  const cfg = getNeonConfig();
   const schema = await ensureNeonTables();
+
   if (!schema.ok) {
     return NextResponse.json({
       ok: true,
       dbConnected: false,
       dbError: schema.error,
+      envKeyUsed: cfg?.envKey || null,
       serverTime: new Date().toISOString(),
       employees: INITIAL_EMPLOYEES,
       locations: INITIAL_LOCATIONS,
@@ -326,10 +350,20 @@ export async function GET() {
   return NextResponse.json({
     ok: true,
     dbConnected: true,
+    envKeyUsed: cfg?.envKey || null,
     serverTime: new Date().toISOString(),
     employees,
     locations,
     entries,
+    ...(isDiag
+      ? {
+          diag: {
+            endpoint: cfg?.endpoint || null,
+            entriesInDb: entries.length,
+            employeesInDb: employees.length,
+          },
+        }
+      : {}),
   });
 }
 
@@ -364,9 +398,10 @@ export async function POST(req: NextRequest) {
           String(p.entry_type || "CLOCK_IN").toUpperCase() === "CLOCK_OUT"
             ? "CLOCK_OUT"
             : "CLOCK_IN";
-        const punchedAt = p.punched_at
-          ? new Date(p.punched_at).toISOString()
-          : new Date().toISOString();
+        const parsedDate = p.punched_at ? new Date(p.punched_at) : new Date();
+        const punchedAt = isNaN(parsedDate.getTime())
+          ? new Date().toISOString()
+          : parsedDate.toISOString();
 
         const ins = await runNeonSql(
           `
@@ -397,7 +432,7 @@ export async function POST(req: NextRequest) {
           `,
           [
             String(p.client_uuid),
-            Number(p.employee_id) || 3,
+            Math.max(1, Number(p.employee_id) || 3),
             p.emp_code ? String(p.emp_code) : null,
             p.full_name ? String(p.full_name) : null,
             entryType,
@@ -406,14 +441,20 @@ export async function POST(req: NextRequest) {
             p.qr_code ? String(p.qr_code) : null,
             String(p.mode || "BARCODE + WAJAH"),
             String(p.notes || ""),
-            p.latitude !== undefined && p.latitude !== null
+            p.latitude !== undefined &&
+            p.latitude !== null &&
+            !Number.isNaN(Number(p.latitude))
               ? Number(p.latitude)
               : null,
-            p.longitude !== undefined && p.longitude !== null
+            p.longitude !== undefined &&
+            p.longitude !== null &&
+            !Number.isNaN(Number(p.longitude))
               ? Number(p.longitude)
               : null,
-            p.distance_meters !== undefined && p.distance_meters !== null
-              ? Number(p.distance_meters)
+            p.distance_meters !== undefined &&
+            p.distance_meters !== null &&
+            !Number.isNaN(Number(p.distance_meters))
+              ? Math.round(Number(p.distance_meters))
               : 0,
             p.is_within_geofence !== undefined
               ? Boolean(p.is_within_geofence)
@@ -558,7 +599,10 @@ export async function POST(req: NextRequest) {
   } catch (err) {
     console.error("POST /api/absen error:", err);
     return NextResponse.json(
-      { ok: false, error: "Gagal memproses data absen" },
+      {
+        ok: false,
+        error: err instanceof Error ? err.message : "Gagal memproses data absen",
+      },
       { status: 500 }
     );
   }
