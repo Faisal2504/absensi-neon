@@ -92,25 +92,13 @@ const DEFAULT_LOCATIONS: LocationItem[] = [
 function normalizeShiftTime(raw?: string | null): string {
   const s = String(raw || "").trim();
   if (!s) return "07.00";
-  if (
-    s.includes("15:00") ||
-    s.includes("15.00") ||
-    s.toLowerCase().includes("siang")
-  ) {
+  if (s.includes("15:00") || s.includes("15.00") || s.toLowerCase().includes("siang")) {
     return "15.00";
   }
-  if (
-    s.includes("23:00") ||
-    s.includes("23.00") ||
-    s.toLowerCase().includes("malam")
-  ) {
+  if (s.includes("23:00") || s.includes("23.00") || s.toLowerCase().includes("malam")) {
     return "23.00";
   }
-  if (
-    s.includes("07:00") ||
-    s.includes("07.00") ||
-    s.toLowerCase().includes("pagi")
-  ) {
+  if (s.includes("07:00") || s.includes("07.00") || s.toLowerCase().includes("pagi")) {
     return "07.00";
   }
   return s.replace(":", ".");
@@ -135,14 +123,7 @@ function parseSavedLocation(raw: string | null): LocationItem | null {
     const lat = Number(p.latitude);
     const lng = Number(p.longitude);
     const rad = Math.max(10, Number(p.radius_meters) || DEFAULT_RADIUS);
-    if (
-      !isNaN(lat) &&
-      !isNaN(lng) &&
-      lat >= -90 &&
-      lat <= 90 &&
-      lng >= -180 &&
-      lng <= 180
-    ) {
+    if (!isNaN(lat) && !isNaN(lng) && lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180) {
       return {
         id: Number(p.id) || 1,
         name: String(p.name || "Kantor Utama"),
@@ -167,12 +148,7 @@ const formatTimeWIB = (iso?: string | null) =>
         second: "2-digit",
       });
 
-function haversineMeters(
-  lat1: number,
-  lon1: number,
-  lat2: number,
-  lon2: number
-) {
+function haversineMeters(lat1: number, lon1: number, lat2: number, lon2: number) {
   const R = 6371e3;
   const p1 = (lat1 * Math.PI) / 180;
   const p2 = (lat2 * Math.PI) / 180;
@@ -285,10 +261,9 @@ export default function KaryawanPage() {
   );
   const [qrInput, setQrInput] = useState("");
   const [qrCameraOn, setQrCameraOn] = useState(false);
-  const [gpsCoords, setGpsCoords] = useState<{
-    lat: number;
-    lng: number;
-  } | null>(null);
+  const [gpsCoords, setGpsCoords] = useState<{ lat: number; lng: number } | null>(
+    null
+  );
   const [gpsStatusText, setGpsStatusText] = useState<string>(
     "Menunggu pembacaan GPS perangkat..."
   );
@@ -314,13 +289,10 @@ export default function KaryawanPage() {
   const faceRafRef = useRef<number | null>(null);
   const offsetRef = useRef<number>(0);
 
-  const notify = useCallback(
-    (type: "ok" | "warn" | "err", text: string) => {
-      setToast({ type, text });
-      setTimeout(() => setToast(null), 4000);
-    },
-    []
-  );
+  const notify = useCallback((type: "ok" | "warn" | "err", text: string) => {
+    setToast({ type, text });
+    setTimeout(() => setToast(null), 4000);
+  }, []);
 
   useEffect(() => {
     offsetRef.current = serverOffsetMs;
@@ -398,22 +370,43 @@ export default function KaryawanPage() {
       if (!navigator.onLine || queue.length === 0) return;
       setIsSyncing(true);
       try {
-        const res = await fetch("/api/sync", {
+        let synced = false;
+        const syncRes = await fetch("/api/sync", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ punches: queue }),
+          body: JSON.stringify({ punches: queue, entries: queue }),
         });
-        if (!res.ok) return;
-        const data = await res.json();
-        if (data?.ok) {
+        if (syncRes.ok) {
+          const data = await syncRes.json();
+          if (data?.ok !== false) synced = true;
+        }
+
+        if (!synced) {
+          const results = await Promise.all(
+            queue.map(async (item) => {
+              const res = await fetch("/api/manage", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  action: "CREATE_ENTRY",
+                  payload: item,
+                }),
+              });
+              return res.ok;
+            })
+          );
+          if (results.every(Boolean)) synced = true;
+        }
+
+        if (synced) {
           localStorage.removeItem(QUEUE_KEY);
           setOfflineQueue([]);
           if (!silent) {
-            notify("ok", `${data.syncedCount || queue.length} data tersinkron.`);
+            notify("ok", `${queue.length} data absen masuk ke server.`);
           }
         }
       } catch {
-        // Tetap di antrean lokal
+        // Tetap di antrean lokal untuk dicoba ulang otomatis
       } finally {
         setIsSyncing(false);
       }
@@ -432,7 +425,9 @@ export default function KaryawanPage() {
       try {
         const rawQ = localStorage.getItem(QUEUE_KEY);
         const pending: TimeEntry[] = rawQ ? JSON.parse(rawQ) : [];
-        if (pending.length > 0) await syncOfflineQueue(pending, true);
+        if (pending.length > 0) {
+          await syncOfflineQueue(pending, true);
+        }
 
         const res = await fetch("/api/bootstrap", { cache: "no-store" });
         const headerDate = res.headers.get("date");
@@ -495,6 +490,13 @@ export default function KaryawanPage() {
               : serverEntries;
             setServerEntries(nextEntries);
 
+            const srvUuids = new Set(nextEntries.map((x) => x.client_uuid));
+            setOfflineQueue((prevQ) => {
+              const remaining = prevQ.filter((q) => !srvUuids.has(q.client_uuid));
+              localStorage.setItem(QUEUE_KEY, JSON.stringify(remaining));
+              return remaining;
+            });
+
             localStorage.setItem(
               CACHE_KEY,
               JSON.stringify({
@@ -519,6 +521,15 @@ export default function KaryawanPage() {
     },
     [notify, syncOfflineQueue, staffList, serverEntries]
   );
+
+  // Coba sinkronkan antrean secara otomatis setiap 5 detik saat online
+  useEffect(() => {
+    if (!isOnline || offlineQueue.length === 0) return;
+    const timer = window.setInterval(() => {
+      void refreshClockAndData(true);
+    }, 5000);
+    return () => clearInterval(timer);
+  }, [isOnline, offlineQueue.length, refreshClockAndData]);
 
   const requestCurrentGps = useCallback(() => {
     if (!("geolocation" in navigator)) {
