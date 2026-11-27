@@ -600,6 +600,35 @@ export default function AllInAttendanceSystem() {
               </div>
             )}
             <div style={{ display: "flex", gap: 6 }}>
+              <input className="inp" placeholder={isAdmin ? `Input kode QR (${settings.qr_code})` : "Masukkan kode QR resmi kantor"} value={qrInput} onChange={(e) => setQrInput(e.target.value)} />
+              <button className="btn" style={{ background: "#0f172a", color: "#fff" }} onClick={() => submitQrPunch(qrInput)}>Kirim</button>
+            </div>
+          </div>
+
+          {isAdmin && (
+            <div className="card" style={{ textAlign: "center" }}>
+              <strong>QR Code Resmi ({settings.office_name})</strong>
+              <p style={{ fontSize: 12, color: "#64748b" }}>Radius GPS: Maks. {settings.radius_meters} meter</p>
+              <img src={qrUrl} alt="QR Kantor" style={{ width: 200, height: 200, border: "1px solid #e2e8f0", borderRadius: 12, padding: 8 }} />
+              <div style={{ fontWeight: 800, marginTop: 8 }}>{settings.qr_code}</div>
+              <div style={{ display: "flex", gap: 8, justifyContent: "center", marginTop: 12 }}>
+                <a href={qrUrl} download={`${settings.qr_code}.png`} target="_blank" rel="noreferrer" className="btn" style={{ background: "#047857", color: "#fff", textDecoration: "none" }}>Download PNG</a>
+                <button className="btn" style={{ background: "#0f172a", color: "#fff" }} onClick={() => window.print()}>Cetak QR</button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+            {!scanning ? (
+              <button className="btn" style={{ width: "100%", background: "#047857", color: "#fff", padding: 12, marginBottom: 10 }} onClick={startScan}>Buka Kamera Scan QR</button>
+            ) : (
+              <div style={{ textAlign: "center", marginBottom: 10 }}>
+                <video ref={videoRef} autoPlay playsInline muted style={{ width: "100%", maxWidth: 260, borderRadius: 12, background: "#000" }} />
+                <br />
+                <button className="btn" style={{ background: "#dc2626", color: "#fff", marginTop: 6 }} onClick={stopScan}>Tutup Kamera</button>
+              </div>
+            )}
+            <div style={{ display: "flex", gap: 6 }}>
               <input className="inp" placeholder={`Input kode QR manual (${settings.qr_code})`} value={qrInput} onChange={(e) => setQrInput(e.target.value)} />
               <button className="btn" style={{ background: "#0f172a", color: "#fff" }} onClick={() => submitQrPunch(qrInput)}>Kirim</button>
             </div>
@@ -645,7 +674,7 @@ export default function AllInAttendanceSystem() {
                 )}
               </div>
               <div style={{ borderTop: "1px solid #e2e8f0", paddingTop: 10, marginTop: 4 }}>
-                <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 4 }}>Import Massal Karyawan & Jadwal (.CSV)</div>
+                <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 4 }}>Import Massal Karyawan & Jadwal (.PDF) (.CSV)</div>
                 <input type="file" accept=".csv" onChange={handleCsvImport} style={{ fontSize: 12 }} />
               </div>
             </div>
