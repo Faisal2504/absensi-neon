@@ -61,9 +61,9 @@ const DEFAULT_RADIUS = 2000;
 const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
 
 const SHIFT_OPTIONS = [
-  { label: "Shift Pagi (07.00)", time: "07.00" },
-  { label: "Shift Siang (15.00)", time: "15.00" },
-  { label: "Shift Malam (23.00)", time: "23.00" },
+  { label: "Shift Pagi (07.00)", time: "15.00" },
+  { label: "Shift Siang (15.00)", time: "23.00" },
+  { label: "Shift Malam (23.00)", time: "07.00" },
   { label: "Shift Fleksibel", time: "FLEKSIBEL" },
 ];
 
