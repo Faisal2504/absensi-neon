@@ -56,16 +56,16 @@ interface BarcodeDetectorInstance {
 
 const DEFAULT_LAT = -6.9148609;
 const DEFAULT_LNG = 109.744683;
-const DEFAULT_RADIUS = 2000;
+const DEFAULT_RADIUS = 200;
 const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
 
-const CACHE_KEY = "absensi_v9_cache";
-const QUEUE_KEY = "absensi_v9_queue";
-const QR_CODE_KEY = "absensi_v9_qr";
-const LOC_KEY = "absensi_v9_custom_loc";
-const DEVICE_LOCK_KEY = "absensi_v9_device_locked_karyawan";
-const STAFF_EMP_KEY = "absensi_v9_staff_emp_id";
-const AUTH_SERVER_KEY = "absensi_v9_auth_server";
+const CACHE_KEY = "absensi_v11_cache";
+const QUEUE_KEY = "absensi_v11_queue";
+const QR_CODE_KEY = "absensi_v11_qr";
+const LOC_KEY = "absensi_v11_custom_loc";
+const DEVICE_LOCK_KEY = "absensi_v11_device_locked_karyawan";
+const STAFF_EMP_KEY = "absensi_v11_staff_emp_id";
+const AUTH_SERVER_KEY = "absensi_v11_auth_server";
 
 const DEFAULT_STAFF: Employee[] = [
   {
@@ -92,13 +92,17 @@ const DEFAULT_LOCATIONS: LocationItem[] = [
 function normalizeShiftTime(raw?: string | null): string {
   const s = String(raw || "").trim();
   if (!s) return "07.00";
-  if (s.includes("15:00") || s.includes("15.00") || s.toLowerCase().includes("siang")) {
+  const lower = s.toLowerCase();
+  if (lower.includes("flex") || lower.includes("fleks") || lower.includes("bebas")) {
+    return "FLEKSIBEL";
+  }
+  if (s.includes("15:00") || s.includes("15.00") || lower.includes("siang")) {
     return "15.00";
   }
-  if (s.includes("23:00") || s.includes("23.00") || s.toLowerCase().includes("malam")) {
+  if (s.includes("23:00") || s.includes("23.00") || lower.includes("malam")) {
     return "23.00";
   }
-  if (s.includes("07:00") || s.includes("07.00") || s.toLowerCase().includes("pagi")) {
+  if (s.includes("07:00") || s.includes("07.00") || lower.includes("pagi")) {
     return "07.00";
   }
   return s.replace(":", ".");
@@ -114,6 +118,90 @@ function normalizeRole(raw?: string | null): RoleType {
 function normalizeEntryType(raw?: string | null): "CLOCK_IN" | "CLOCK_OUT" {
   const t = String(raw || "CLOCK_IN").toUpperCase();
   return t === "CLOCK_OUT" || t === "OUT" ? "CLOCK_OUT" : "CLOCK_IN";
+}
+
+function getWibMinutesOfDay(iso: string): number {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Jakarta",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  })
+    .format(new Date(iso))
+    .split(":");
+  return Number(parts[0]) * 60 + Number(parts[1]);
+}
+
+function calcLateMinutes(punchedIso: string, shiftStart = "07.00"): number {
+  const norm = normalizeShiftTime(shiftStart);
+  if (norm === "FLEKSIBEL") return 0;
+
+  const actualMin = getWibMinutesOfDay(punchedIso);
+  let shiftMin = 7 * 60;
+  if (norm === "15.00") shiftMin = 15 * 60;
+  else if (norm === "23.00") shiftMin = 23 * 60;
+  else if (norm !== "07.00") {
+    const [sh, sm] = norm.replace(".", ":").split(":").map(Number);
+    if (!isNaN(sh)) shiftMin = sh * 60 + (isNaN(sm) ? 0 : sm);
+  }
+  return Math.max(0, actualMin - shiftMin);
+}
+
+function playMelodicRestChime() {
+  if (typeof window === "undefined") return;
+  try {
+    const AudioCtx =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext?: typeof AudioContext })
+        .webkitAudioContext;
+    if (!AudioCtx) return;
+    const ctx = new AudioCtx();
+    const notes = [523.25, 659.25, 783.99, 1046.5];
+    notes.forEach((freq, i) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = "sine";
+      osc.frequency.setValueAtTime(freq, ctx.currentTime + i * 0.14);
+      gain.gain.setValueAtTime(0.001, ctx.currentTime + i * 0.14);
+      gain.gain.exponentialRampToValueAtTime(0.08, ctx.currentTime + i * 0.14 + 0.04);
+      gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + i * 0.14 + 0.55);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(ctx.currentTime + i * 0.14);
+      osc.stop(ctx.currentTime + i * 0.14 + 0.6);
+    });
+  } catch {
+    // Abaikan jika audio diblokir
+  }
+}
+
+function speakIndonesian(text: string, opts?: { melodicRest?: boolean }) {
+  if (typeof window === "undefined") return;
+  if (opts?.melodicRest) {
+    playMelodicRestChime();
+  }
+  try {
+    if (!("speechSynthesis" in window)) return;
+    window.speechSynthesis.cancel();
+    const utter = new SpeechSynthesisUtterance(text);
+    utter.lang = "id-ID";
+    utter.rate = opts?.melodicRest ? 0.92 : 0.98;
+    utter.pitch = opts?.melodicRest ? 1.24 : 1.05;
+
+    const voices = window.speechSynthesis.getVoices();
+    const femaleIdVoice =
+      voices.find(
+        (v) =>
+          v.lang.toLowerCase().startsWith("id") &&
+          /female|wanita|gadis|siti|damayanti|ayu|nina|amelia/i.test(v.name)
+      ) || voices.find((v) => v.lang.toLowerCase().startsWith("id"));
+    if (femaleIdVoice) {
+      utter.voice = femaleIdVoice;
+    }
+    window.speechSynthesis.speak(utter);
+  } catch {
+    // Abaikan jika TTS tidak didukung
+  }
 }
 
 function parseSavedLocation(raw: string | null): LocationItem | null {
@@ -277,6 +365,12 @@ export default function KaryawanPage() {
     "Wajib selfie dengan wajah terdeteksi sebelum klik MASUK atau KELUAR."
   );
 
+  const [lateBanner, setLateBanner] = useState<{
+    employeeName: string;
+    lateMinutes: number;
+    shiftLabel: string;
+  } | null>(null);
+
   const [toast, setToast] = useState<{
     type: "ok" | "warn" | "err";
     text: string;
@@ -288,10 +382,11 @@ export default function KaryawanPage() {
   const selfieCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const faceRafRef = useRef<number | null>(null);
   const offsetRef = useRef<number>(0);
+  const syncInFlightRef = useRef<boolean>(false);
 
   const notify = useCallback((type: "ok" | "warn" | "err", text: string) => {
     setToast({ type, text });
-    setTimeout(() => setToast(null), 4000);
+    setTimeout(() => setToast(null), 4500);
   }, []);
 
   useEffect(() => {
@@ -365,49 +460,55 @@ export default function KaryawanPage() {
     setSelfieCameraOn(false);
   }, []);
 
-  const syncOfflineQueue = useCallback(
-    async (queue: TimeEntry[], silent = false) => {
-      if (!navigator.onLine || queue.length === 0) return;
+  const pushPunchesToDb = useCallback(
+    async (queue: TimeEntry[], silent = false): Promise<boolean> => {
+      if (!navigator.onLine || queue.length === 0 || syncInFlightRef.current) {
+        return false;
+      }
+      syncInFlightRef.current = true;
       setIsSyncing(true);
       try {
-        let synced = false;
-        const syncRes = await fetch("/api/sync", {
+        const payloadPunches = queue.map((item) => ({
+          ...item,
+          is_offline_sync: Boolean(item.is_offline_sync),
+        }));
+        const res = await fetch("/api/absen", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ punches: queue, entries: queue }),
+          body: JSON.stringify({
+            action: "SUBMIT_PUNCH",
+            punches: payloadPunches,
+          }),
+          cache: "no-store",
         });
-        if (syncRes.ok) {
-          const data = await syncRes.json();
-          if (data?.ok !== false) synced = true;
-        }
-
-        if (!synced) {
-          const results = await Promise.all(
-            queue.map(async (item) => {
-              const res = await fetch("/api/manage", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                  action: "CREATE_ENTRY",
-                  payload: item,
-                }),
-              });
-              return res.ok;
-            })
+        const data = await res.json();
+        if (res.ok && data?.ok) {
+          const syncedSet = new Set<string>(
+            Array.isArray(data.syncedUuids)
+              ? data.syncedUuids.map(String)
+              : queue.map((q) => q.client_uuid)
           );
-          if (results.every(Boolean)) synced = true;
-        }
-
-        if (synced) {
-          localStorage.removeItem(QUEUE_KEY);
-          setOfflineQueue([]);
-          if (!silent) {
-            notify("ok", `${queue.length} data absen masuk ke server.`);
+          setOfflineQueue((prev) => {
+            const remaining = prev.filter((q) => !syncedSet.has(q.client_uuid));
+            localStorage.setItem(QUEUE_KEY, JSON.stringify(remaining));
+            return remaining;
+          });
+          if (Array.isArray(data.entries)) {
+            setServerEntries(data.entries);
           }
+          if (!silent) {
+            notify("ok", "Data absen langsung tersimpan ke database Neon!");
+          }
+          return true;
         }
+        if (!silent && data?.error) {
+          notify("err", `Gagal kirim ke server: ${data.error}`);
+        }
+        return false;
       } catch {
-        // Tetap di antrean lokal untuk dicoba ulang otomatis
+        return false;
       } finally {
+        syncInFlightRef.current = false;
         setIsSyncing(false);
       }
     },
@@ -426,10 +527,10 @@ export default function KaryawanPage() {
         const rawQ = localStorage.getItem(QUEUE_KEY);
         const pending: TimeEntry[] = rawQ ? JSON.parse(rawQ) : [];
         if (pending.length > 0) {
-          await syncOfflineQueue(pending, true);
+          await pushPunchesToDb(pending, true);
         }
 
-        const res = await fetch("/api/bootstrap", { cache: "no-store" });
+        const res = await fetch("/api/absen", { cache: "no-store" });
         const headerDate = res.headers.get("date");
         let nextOffset = offsetRef.current;
         if (headerDate) {
@@ -506,7 +607,12 @@ export default function KaryawanPage() {
               })
             );
             if (!silent) {
-              notify("ok", "Jam WIB & data karyawan tersinkronisasi.");
+              notify(
+                data.dbConnected ? "ok" : "warn",
+                data.dbConnected
+                  ? "Terhubung ke Database Neon & Jam WIB sinkron."
+                  : `Peringatan DB: ${data.dbError || "Mode lokal"}`
+              );
             }
           }
         }
@@ -519,17 +625,16 @@ export default function KaryawanPage() {
         setIsSyncing(false);
       }
     },
-    [notify, syncOfflineQueue, staffList, serverEntries]
+    [notify, pushPunchesToDb, staffList, serverEntries]
   );
 
-  // Coba sinkronkan antrean secara otomatis setiap 5 detik saat online
   useEffect(() => {
     if (!isOnline || offlineQueue.length === 0) return;
     const timer = window.setInterval(() => {
-      void refreshClockAndData(true);
-    }, 5000);
+      void pushPunchesToDb(offlineQueue, true);
+    }, 1500);
     return () => clearInterval(timer);
-  }, [isOnline, offlineQueue.length, refreshClockAndData]);
+  }, [isOnline, offlineQueue, pushPunchesToDb]);
 
   const requestCurrentGps = useCallback(() => {
     if (!("geolocation" in navigator)) {
@@ -556,19 +661,47 @@ export default function KaryawanPage() {
   }, []);
 
   useEffect(() => {
+    const flushNow = () => {
+      const onlineNow = navigator.onLine;
+      setIsOnline(onlineNow);
+      if (onlineNow) {
+        try {
+          const rawQ = localStorage.getItem(QUEUE_KEY);
+          const pending: TimeEntry[] = rawQ ? JSON.parse(rawQ) : [];
+          if (pending.length > 0) {
+            void pushPunchesToDb(pending, true);
+          } else {
+            void refreshClockAndData(true);
+          }
+        } catch {
+          void refreshClockAndData(true);
+        }
+      }
+    };
+
     const onOnline = () => {
       setIsOnline(true);
-      void refreshClockAndData(true);
+      flushNow();
+      notify("ok", "Koneksi kembali online — menyinkronkan absen ke server...");
     };
     const onOffline = () => {
       setIsOnline(false);
-      notify("warn", "Offline: absensi masuk antrean lokal.");
+      notify("warn", "Offline: absensi masuk antrean lokal & otomatis kirim saat online.");
     };
+    const onVisibilityOrFocus = () => {
+      if (document.visibilityState === "visible") {
+        flushNow();
+      }
+    };
+
     window.addEventListener("online", onOnline);
     window.addEventListener("offline", onOffline);
+    window.addEventListener("focus", flushNow);
+    window.addEventListener("pageshow", flushNow);
+    document.addEventListener("visibilitychange", onVisibilityOrFocus);
 
     const t = window.setTimeout(() => {
-      void refreshClockAndData(true);
+      flushNow();
       requestCurrentGps();
     }, 0);
 
@@ -576,10 +709,20 @@ export default function KaryawanPage() {
       clearTimeout(t);
       window.removeEventListener("online", onOnline);
       window.removeEventListener("offline", onOffline);
+      window.removeEventListener("focus", flushNow);
+      window.removeEventListener("pageshow", flushNow);
+      document.removeEventListener("visibilitychange", onVisibilityOrFocus);
       stopQrCam();
       stopSelfieCam();
     };
-  }, [refreshClockAndData, requestCurrentGps, notify, stopQrCam, stopSelfieCam]);
+  }, [
+    pushPunchesToDb,
+    refreshClockAndData,
+    requestCurrentGps,
+    notify,
+    stopQrCam,
+    stopSelfieCam,
+  ]);
 
   const targetLocation = useMemo(() => {
     const loc = locations[0] || DEFAULT_LOCATIONS[0];
@@ -859,12 +1002,13 @@ export default function KaryawanPage() {
         ? crypto.randomUUID()
         : `${syncedNow}-${Math.random().toString(36).slice(2)}`;
 
+    const isOfflinePunch = !navigator.onLine;
     const newPunch: TimeEntry = {
       client_uuid: uuid,
       employee_id: Number(activeStaff.id),
       entry_type: entryType,
       punched_at: punchedAtIso,
-      is_offline_sync: !navigator.onLine,
+      is_offline_sync: isOfflinePunch,
       qr_code: effectiveQr,
       mode: "BARCODE + WAJAH",
       latitude: gpsCoords.lat,
@@ -887,15 +1031,47 @@ export default function KaryawanPage() {
       "Wajib selfie dengan wajah terdeteksi sebelum klik MASUK atau KELUAR."
     );
 
+    if (entryType === "CLOCK_IN") {
+      const shiftVal = normalizeShiftTime(activeStaff.shift_start_time);
+      const lateMins = calcLateMinutes(punchedAtIso, shiftVal);
+      if (lateMins > 0) {
+        const shiftDisp = shiftVal === "FLEKSIBEL" ? "07.00" : shiftVal;
+        setLateBanner({
+          employeeName: activeStaff.full_name,
+          lateMinutes: lateMins,
+          shiftLabel: shiftDisp,
+        });
+        speakIndonesian(
+          `Perhatian, ${activeStaff.full_name} terlambat ${lateMins} menit dari jam masuk ${shiftDisp}.`
+        );
+      } else {
+        setLateBanner(null);
+        speakIndonesian(
+          `Absen masuk ${activeStaff.full_name} tercatat tepat waktu.`
+        );
+      }
+    } else {
+      setLateBanner(null);
+      speakIndonesian("terima kasih selamat beristirahat", {
+        melodicRest: true,
+      });
+    }
+
     if (navigator.onLine) {
-      await syncOfflineQueue(nextQueue, true);
-      await refreshClockAndData(true);
+      const ok = await pushPunchesToDb(nextQueue, true);
+      if (ok) {
+        notify(
+          "ok",
+          entryType === "CLOCK_IN"
+            ? "Absen MASUK masuk langsung ke server Admin & Manager!"
+            : "Terima kasih selamat beristirahat — Absen KELUAR masuk ke server!"
+        );
+        return;
+      }
     }
     notify(
-      "ok",
-      entryType === "CLOCK_IN"
-        ? "Absen MASUK tercatat sesuai jam WIB!"
-        : "Absen KELUAR tercatat sesuai jam WIB!"
+      "warn",
+      "Absen masuk antrean & otomatis dikirim ke server saat terhubung."
     );
   };
 
@@ -924,6 +1100,24 @@ export default function KaryawanPage() {
           </div>
         )}
 
+        {lateBanner && (
+          <div className="p-3.5 rounded-2xl bg-rose-600 text-white shadow-md border-2 border-rose-200 space-y-1">
+            <div className="text-[11px] font-extrabold uppercase tracking-wider text-rose-100">
+              Peringatan Keterlambatan • Jam Masuk {lateBanner.shiftLabel}
+            </div>
+            <div className="text-lg sm:text-xl font-black leading-tight">
+              {lateBanner.employeeName} — Terlambat {lateBanner.lateMinutes} Menit
+            </div>
+            <button
+              type="button"
+              onClick={() => setLateBanner(null)}
+              className="text-[10px] font-bold underline text-rose-100 pt-0.5"
+            >
+              Tutup Pemberitahuan
+            </button>
+          </div>
+        )}
+
         <header className="bg-[#0B1220] text-white rounded-2xl p-3.5 shadow space-y-2.5">
           <div className="flex items-start justify-between gap-2">
             <div>
@@ -931,7 +1125,7 @@ export default function KaryawanPage() {
                 ABSENSI KARYAWAN
               </h1>
               <p className="text-[11px] text-slate-300 mt-0.5">
-                {activeStaff.full_name} ({activeStaff.emp_code}) • Shift{" "}
+                {activeStaff.full_name} ({activeStaff.emp_code}) • Jam Masuk{" "}
                 {activeStaff.shift_start_time || "07.00"}
               </p>
             </div>
@@ -977,7 +1171,7 @@ export default function KaryawanPage() {
           >
             {staffList.map((emp) => (
               <option key={emp.id} value={emp.id}>
-                {emp.full_name} ({emp.emp_code}) • Shift{" "}
+                {emp.full_name} ({emp.emp_code}) • Jam Masuk{" "}
                 {emp.shift_start_time || "07.00"}
               </option>
             ))}
@@ -987,7 +1181,7 @@ export default function KaryawanPage() {
         <section className="bg-white rounded-2xl p-3.5 border-t-4 border-t-blue-500 border border-slate-200/80 shadow-sm space-y-2.5">
           <div className="flex items-center justify-between gap-2">
             <h2 className="text-xs font-extrabold text-slate-800">
-              Absen Masuk &amp; Keluar
+              Absen Masuk &amp; Keluar (07.00 / 15.00 / 23.00)
             </h2>
             <span
               className={`text-[10px] font-bold ${
