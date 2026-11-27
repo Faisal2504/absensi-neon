@@ -30,7 +30,7 @@ export async function GET() {
              jenis, waktu_scan, jadwal_berangkat, telat_menit, status,
              koordinat_gps, jarak_meter, mode_rekam, qr_id
       FROM log_absensi
-      ORDER BY created_at DESC
+      ORDER BY tanggal DESC, waktu_scan DESC, created_at DESC
       LIMIT 500
     `;
     return NextResponse.json({ status: 'ok', data: rows });
@@ -59,6 +59,51 @@ export async function POST(req: Request) {
       `;
     }
     return NextResponse.json({ status: 'ok', synced: records.length });
+  } catch (error: unknown) {
+    return NextResponse.json({ status: 'error', message: String(error) }, { status: 500 });
+  }
+}
+
+export async function PUT(req: Request) {
+  try {
+    await ensureLogTable();
+    const body = await req.json();
+    const id_log = String(body.id_log || '').trim();
+    const tanggal = String(body.tanggal || '').trim();
+    const jenis = body.jenis === 'KELUAR' ? 'KELUAR' : 'MASUK';
+    const waktu_scan = String(body.waktu_scan || '').trim();
+    const telat_menit = Number(body.telat_menit || 0);
+    const status = String(body.status || 'Tepat Waktu').trim();
+
+    if (!id_log) {
+      return NextResponse.json({ status: 'error', message: 'ID log wajib diisi' }, { status: 400 });
+    }
+
+    await sql`
+      UPDATE log_absensi
+      SET tanggal = ${tanggal},
+          jenis = ${jenis},
+          waktu_scan = ${waktu_scan},
+          telat_menit = ${telat_menit},
+          status = ${status}
+      WHERE id_log = ${id_log}
+    `;
+    return NextResponse.json({ status: 'ok' });
+  } catch (error: unknown) {
+    return NextResponse.json({ status: 'error', message: String(error) }, { status: 500 });
+  }
+}
+
+export async function DELETE(req: Request) {
+  try {
+    await ensureLogTable();
+    const { searchParams } = new URL(req.url);
+    const id_log = String(searchParams.get('id_log') || '').trim();
+    if (!id_log) {
+      return NextResponse.json({ status: 'error', message: 'ID log wajib diisi' }, { status: 400 });
+    }
+    await sql`DELETE FROM log_absensi WHERE id_log = ${id_log}`;
+    return NextResponse.json({ status: 'ok' });
   } catch (error: unknown) {
     return NextResponse.json({ status: 'error', message: String(error) }, { status: 500 });
   }
