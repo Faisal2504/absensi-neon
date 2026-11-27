@@ -4,6 +4,7 @@ import React, { useState, useEffect, useRef, useMemo, useCallback } from "react"
 
 type RoleType = "ADMIN" | "MANAGER" | "STAFF";
 type ServerMode = "ADMIN" | "MANAGER" | "KARYAWAN";
+type ShiftCode = "P" | "S" | "M" | "OFF";
 
 interface Employee {
   id: number;
@@ -43,6 +44,14 @@ interface TimeEntry {
   emp_code?: string;
 }
 
+interface ParsedScheduleItem {
+  emp_code: string;
+  full_name: string;
+  shift_code: ShiftCode;
+  shift_label: string;
+  shift_time: string;
+}
+
 interface FaceDetectorInstance {
   detect: (
     image: HTMLVideoElement | HTMLCanvasElement | HTMLImageElement
@@ -61,10 +70,10 @@ const DEFAULT_RADIUS = 2000;
 const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
 
 const SHIFT_OPTIONS = [
-  { label: "Shift Pagi (07.00)", time: "15.00" },
-  { label: "Shift Siang (15.00)", time: "23.00" },
-  { label: "Shift Malam (23.00)", time: "07.00" },
-  { label: "Shift Fleksibel", time: "FLEKSIBEL" },
+  { label: "( P ) Pagi (07.00)", time: "07.00" },
+  { label: "( S ) Siang (15.00)", time: "15.00" },
+  { label: "( M ) Malam (23.00)", time: "23.00" },
+  { label: "( OFF ) Libur", time: "OFF" },
 ];
 
 const CACHE_KEY = "absensi_v11_cache";
@@ -75,24 +84,41 @@ const DEVICE_LOCK_KEY = "absensi_v11_device_locked_karyawan";
 const STAFF_EMP_KEY = "absensi_v11_staff_emp_id";
 const AUTH_SERVER_KEY = "absensi_v11_auth_server";
 
+function shiftCodeToStartTime(code: ShiftCode): string {
+  if (code === "S") return "15.00";
+  if (code === "M") return "23.00";
+  if (code === "OFF") return "OFF";
+  return "07.00";
+}
+
+function shiftCodeToLabel(code: ShiftCode): string {
+  if (code === "S") return "( S ) Siang";
+  if (code === "M") return "( M ) Malam";
+  if (code === "OFF") return "( OFF ) Libur";
+  return "( P ) Pagi";
+}
+
 function normalizeShiftTime(raw?: string | null): string {
   const s = String(raw || "").trim();
   if (!s) return "07.00";
+  const upper = s.toUpperCase();
   const lower = s.toLowerCase();
   if (
+    upper === "OFF" ||
+    lower.includes("libur") ||
+    lower.includes("off") ||
     lower.includes("flex") ||
-    lower.includes("fleks") ||
-    lower.includes("bebas")
+    lower.includes("fleks")
   ) {
-    return "FLEKSIBEL";
+    return "OFF";
   }
-  if (s.includes("15:00") || s.includes("15.00") || lower.includes("siang")) {
+  if (s.includes("15:00") || s.includes("15.00") || lower.includes("siang") || upper === "S") {
     return "15.00";
   }
-  if (s.includes("23:00") || s.includes("23.00") || lower.includes("malam")) {
+  if (s.includes("23:00") || s.includes("23.00") || lower.includes("malam") || upper === "M") {
     return "23.00";
   }
-  if (s.includes("07:00") || s.includes("07.00") || lower.includes("pagi")) {
+  if (s.includes("07:00") || s.includes("07.00") || lower.includes("pagi") || upper === "P") {
     return "07.00";
   }
   return s.replace(":", ".");
@@ -196,7 +222,7 @@ function getEffectiveShiftStartMinutes(
   shiftStart = "07.00"
 ): number | null {
   const norm = normalizeShiftTime(shiftStart);
-  if (norm === "FLEKSIBEL") return null;
+  if (norm === "OFF") return null;
 
   if (norm === "07.00" || norm === "15.00" || norm === "23.00") {
     const fixedShifts = [
@@ -288,8 +314,8 @@ function speakIndonesian(text: string, opts?: { melodicRest?: boolean }) {
       const utter = new SpeechSynthesisUtterance(text);
       utter.lang = "id-ID";
       utter.volume = 1;
-      utter.rate = opts?.melodicRest ? 0.92 : 0.98;
-      utter.pitch = opts?.melodicRest ? 1.24 : 1.05;
+      utter.rate = opts?.melodicRest ? 0.94 : 0.98;
+      utter.pitch = opts?.melodicRest ? 1.24 : 1.18;
 
       const voices = synth.getVoices();
       const femaleIdVoice =
@@ -343,29 +369,71 @@ function haversineMeters(
 function extractLinesFromPdfBytes(bytes: Uint8Array): string[] {
   const raw = new TextDecoder("latin1").decode(bytes);
   const lines: string[] = [];
-  const matches = raw.match(/\(([^()\\]{2,160})\)/g) || [];
-  for (const m of matches) {
+
+  const parenMatches = raw.match(/\(([^()\\]{1,180})\)/g) || [];
+  for (const m of parenMatches) {
     const cleaned = m
       .slice(1, -1)
       .replace(/\\([()\\])/g, "$1")
       .replace(/[^\x20-\x7E]/g, " ")
       .replace(/\s+/g, " ")
       .trim();
-    if (cleaned.length >= 2 && /[a-zA-Z0-9]/.test(cleaned)) {
+    if (cleaned.length >= 1 && /[a-zA-Z0-9]/.test(cleaned)) {
       lines.push(cleaned);
     }
   }
+
+  const hexMatches = raw.match(/<([0-9A-Fa-f\s]{4,240})>/g) || [];
+  for (const hm of hexMatches) {
+    const hex = hm.slice(1, -1).replace(/\s+/g, "");
+    if (hex.length >= 4 && hex.length % 2 === 0) {
+      let decoded = "";
+      for (let i = 0; i < hex.length; i += 2) {
+        const code = parseInt(hex.slice(i, i + 2), 16);
+        if (code >= 32 && code <= 126) decoded += String.fromCharCode(code);
+      }
+      const cleaned = decoded.replace(/\s+/g, " ").trim();
+      if (cleaned.length >= 2 && /[a-zA-Z0-9]/.test(cleaned)) {
+        lines.push(cleaned);
+      }
+    }
+  }
+
   return lines;
 }
 
-function parseScheduleLines(
-  lines: string[]
-): Array<{ emp_code: string; full_name: string; shift_time: string }> {
-  const parsed: Array<{
-    emp_code: string;
-    full_name: string;
-    shift_time: string;
-  }> = [];
+function detectShiftCodeFromText(text: string): ShiftCode {
+  const upper = text.toUpperCase();
+  const lower = text.toLowerCase();
+
+  if (
+    /\bOFF\b/.test(upper) ||
+    lower.includes("libur") ||
+    lower.includes("off")
+  ) {
+    return "OFF";
+  }
+  if (
+    /\bM\b/.test(upper) ||
+    lower.includes("malam") ||
+    text.includes("23.00") ||
+    text.includes("23:00")
+  ) {
+    return "M";
+  }
+  if (
+    /\bS\b/.test(upper) ||
+    lower.includes("siang") ||
+    text.includes("15.00") ||
+    text.includes("15:00")
+  ) {
+    return "S";
+  }
+  return "P";
+}
+
+function parseScheduleLines(lines: string[]): ParsedScheduleItem[] {
+  const parsed: ParsedScheduleItem[] = [];
 
   for (const rawLine of lines) {
     const line = rawLine.trim();
@@ -373,29 +441,15 @@ function parseScheduleLines(
     const lower = line.toLowerCase();
     if (
       lower.includes("emp_code") ||
-      (lower.includes("jadwal") && lower.length < 20) ||
-      (lower.includes("nama") && lower.includes("shift") && lower.length < 32)
+      (lower.includes("jadwal") && lower.length < 22) ||
+      (lower.includes("nama") && lower.includes("shift") && lower.length < 34)
     ) {
       continue;
     }
 
-    const timeMatch = line.match(
-      /\b(07[:.]00|15[:.]00|23[:.]00|[012]?\d[:.]\d{2})\b/
-    );
-    let shiftTime = "07.00";
-    if (timeMatch) {
-      shiftTime = normalizeShiftTime(timeMatch[1]);
-    } else if (lower.includes("siang")) {
-      shiftTime = "15.00";
-    } else if (lower.includes("malam")) {
-      shiftTime = "23.00";
-    } else if (lower.includes("pagi")) {
-      shiftTime = "07.00";
-    } else if (lower.includes("flex") || lower.includes("fleks")) {
-      shiftTime = "FLEKSIBEL";
-    }
+    const shiftCode = detectShiftCodeFromText(line);
+    const codeMatch = line.match(/\b([A-Z]{2,6}[-_]\d{1,6})\b/i);
 
-    const codeMatch = line.match(/\b([A-Z]{2,5}[-_]\d{1,5})\b/i);
     let cols = line
       .split(/[,;|]+/)
       .map((c) => c.trim())
@@ -417,26 +471,27 @@ function parseScheduleLines(
         fullName = cols[0];
       }
     } else {
-      fullName = line
-        .replace(/\b([A-Z]{2,5}[-_]\d{1,5})\b/gi, " ")
-        .replace(/shift\s*(pagi|siang|malam|fleksibel|flexible)/gi, " ")
-        .replace(/\b([012]?\d[:.]\d{2})\b/g, " ")
-        .replace(/\s+/g, " ")
-        .trim();
+      fullName = line;
     }
 
     fullName = fullName
-      .replace(/shift\s*(pagi|siang|malam|fleksibel|flexible)/gi, " ")
+      .replace(/\b([A-Z]{2,6}[-_]\d{1,6})\b/gi, " ")
+      .replace(/\b(OFF|P|S|M)\b/g, " ")
+      .replace(/shift\s*(pagi|siang|malam|libur|off)/gi, " ")
+      .replace(/\b(pagi|siang|malam|libur)\b/gi, " ")
       .replace(/\b([012]?\d[:.]\d{2})\b/g, " ")
       .replace(/\s+/g, " ")
       .trim();
 
     if (fullName || empCode) {
+      const code =
+        empCode || `KRY-${String(parsed.length + 1).padStart(3, "0")}`;
       parsed.push({
-        emp_code:
-          empCode || `KRY-${String(parsed.length + 1).padStart(3, "0")}`,
-        full_name: fullName || empCode,
-        shift_time: shiftTime,
+        emp_code: code,
+        full_name: fullName || code,
+        shift_code: shiftCode,
+        shift_label: shiftCodeToLabel(shiftCode),
+        shift_time: shiftCodeToStartTime(shiftCode),
       });
     }
   }
@@ -646,9 +701,9 @@ export default function AbsensiMultiServerPage() {
   const [scheduleFileName, setScheduleFileName] = useState(
     "Tidak ada file yang dipilih"
   );
-  const [schedulePreview, setSchedulePreview] = useState<
-    Array<{ emp_code: string; full_name: string; shift_time: string }>
-  >([]);
+  const [schedulePreview, setSchedulePreview] = useState<ParsedScheduleItem[]>(
+    []
+  );
 
   const [reportFilter, setReportFilter] = useState<
     "Harian" | "Mingguan" | "Bulanan"
@@ -1353,26 +1408,37 @@ export default function AbsensiMultiServerPage() {
       const shiftVal = normalizeShiftTime(activeUser.shift_start_time);
       const lateMins = calcLateMinutes(punchedAtIso, shiftVal);
       if (lateMins > 0) {
-        const shiftDisp = shiftVal === "FLEKSIBEL" ? "07.00" : shiftVal;
+        const shiftDisp = shiftVal === "OFF" ? "07.00" : shiftVal;
         setLateBanner({
           employeeName: activeUser.full_name,
           lateMinutes: lateMins,
           shiftLabel: shiftDisp,
         });
-        speakIndonesian(
-          `Perhatian, ${activeUser.full_name} terlambat ${lateMins} menit dari jam masuk ${shiftDisp}.`
-        );
       } else {
         setLateBanner(null);
+      }
+      if (isAdminServer) {
+        speakIndonesian("Terimakasih Sudah Hadir, Selamat Bertempur");
+      } else {
         speakIndonesian(
-          `Absen masuk ${activeUser.full_name} tercatat tepat waktu.`
+          lateMins > 0
+            ? `Perhatian, ${activeUser.full_name} terlambat ${lateMins} menit dari jam masuk ${
+                shiftVal === "OFF" ? "07.00" : shiftVal
+              }.`
+            : `Absen masuk ${activeUser.full_name} tercatat tepat waktu.`
         );
       }
     } else {
       setLateBanner(null);
-      speakIndonesian("terima kasih selamat beristirahat", {
-        melodicRest: true,
-      });
+      if (isAdminServer) {
+        speakIndonesian("Terimakasih, semoga selamat sampai rumah", {
+          melodicRest: true,
+        });
+      } else {
+        speakIndonesian("terima kasih selamat beristirahat", {
+          melodicRest: true,
+        });
+      }
     }
 
     if (navigator.onLine) {
@@ -1382,8 +1448,8 @@ export default function AbsensiMultiServerPage() {
     notify(
       "ok",
       entryType === "CLOCK_IN"
-        ? "Absen MASUK tercatat sesuai jam WIB!"
-        : "Terima kasih selamat beristirahat — Absen KELUAR tercatat!"
+        ? "Terimakasih Sudah Hadir, Selamat Bertempur!"
+        : "Terimakasih, semoga selamat sampai rumah!"
     );
   };
 
@@ -1473,11 +1539,7 @@ export default function AbsensiMultiServerPage() {
       const isPdf =
         file.type === "application/pdf" ||
         file.name.toLowerCase().endsWith(".pdf");
-      let parsed: Array<{
-        emp_code: string;
-        full_name: string;
-        shift_time: string;
-      }> = [];
+      let parsed: ParsedScheduleItem[] = [];
 
       if (isPdf) {
         const bytes = new Uint8Array(await file.arrayBuffer());
@@ -1501,11 +1563,18 @@ export default function AbsensiMultiServerPage() {
               r.full_name.toLowerCase() === emp.full_name.toLowerCase()
           );
           return match
-            ? { ...emp, shift_start_time: normalizeShiftTime(match.shift_time) }
+            ? {
+                ...emp,
+                full_name: match.full_name || emp.full_name,
+                shift_start_time: match.shift_time,
+              }
             : emp;
         });
         setEmployees(updated);
-        notify("ok", `${parsed.length} jadwal dimuat dari ${file.name}.`);
+        notify(
+          "ok",
+          `${parsed.length} jadwal PDF disesuaikan otomatis (P/S/M/OFF) dari ${file.name}.`
+        );
       } else {
         notify("warn", `File ${file.name} dibaca tanpa baris jadwal cocok.`);
       }
@@ -1557,7 +1626,7 @@ export default function AbsensiMultiServerPage() {
 
     setInspectionMode(format);
     setInspectionNote(
-      `Inspeksi ${format}: ${totalRows} baris data • Geofence valid ${validGeofence}/${totalRows} • Total telat ${totalLateMins} menit • Kop MURINDA - Timesheet Absensi Security Dormitory Batang siap.`
+      `Inspeksi ${format} siap: ${totalRows} baris data • Radius valid ${validGeofence}/${totalRows} • Total telat ${totalLateMins} menit • Logo MURINDA (Biru Tua Pekat) & Timesheet Security Dormitory Batang terpasang.`
     );
     notify(
       "ok",
@@ -1630,9 +1699,9 @@ export default function AbsensiMultiServerPage() {
       return;
     }
 
-    const brandLogoSvg = `<svg width="136" height="28" viewBox="0 0 220 44" xmlns="http://www.w3.org/2000/svg"><text x="0" y="30" font-family="Arial Black, Arial, sans-serif" font-weight="900" font-size="28" fill="#111827" letter-spacing="1">MURINDA</text><path d="M148 26 L195 10 L176 28 L205 24 L156 36 Z" fill="#111827"/></svg>`;
+    const murindaLogoSvg = `<svg width="168" height="36" viewBox="0 0 260 54" xmlns="http://www.w3.org/2000/svg"><text x="0" y="38" font-family="Arial Black, Impact, sans-serif" font-weight="900" font-size="34" fill="#0B3B8C" letter-spacing="1.2">MURINDA</text><path d="M182 32 L242 10 L214 34 L252 29 L190 46 Z" fill="#DC2626"/><path d="M174 36 L232 16 L208 36 Z" fill="#082A63"/></svg>`;
 
-    const sheetHtml = `<!DOCTYPE html><html><head><meta charset="utf-8"/><title>Timesheet Absensi Security Dormitory Batang</title><style>body{font-family:Arial,sans-serif;color:#111827;padding:18px}.top{display:flex;align-items:center;gap:18px;border-bottom:2px solid #0f172a;padding-bottom:10px;margin-bottom:12px}.title{font-size:20px;font-weight:800;margin:0}.meta{margin-bottom:14px;font-size:12px;line-height:1.7}.meta td{border:none;padding:2px 10px 2px 0}.grid{width:100%;border-collapse:collapse;font-size:11px}.grid th{background:#0b1220;color:#fff;padding:7px 8px;border:1px solid #334155;text-align:left}.grid td{padding:6px 8px;border:1px solid #cbd5e1}</style></head><body><div class="top"><div>${brandLogoSvg}</div><h1 class="title">Timesheet Absensi Security Dormitory Batang</h1></div><table class="meta"><tr><td><b>Month</b></td><td>${meta.monthLabel}</td></tr><tr><td><b>Anggota</b></td><td>${meta.memberName}</td></tr><tr><td><b>Kode</b></td><td>${meta.memberCode}</td></tr></table><table class="grid"><thead><tr>${headers
+    const sheetHtml = `<!DOCTYPE html><html><head><meta charset="utf-8"/><title>Timesheet Absensi Security Dormitory Batang</title><style>body{font-family:Arial,sans-serif;color:#082A63;padding:18px}.top{display:flex;align-items:center;gap:18px;border-bottom:3px solid #0B3B8C;padding-bottom:10px;margin-bottom:12px}.title{font-size:20px;font-weight:900;color:#082A63;margin:0}.meta{margin-bottom:14px;font-size:12px;line-height:1.7;color:#082A63}.meta td{border:none;padding:2px 10px 2px 0}.grid{width:100%;border-collapse:collapse;font-size:11px}.grid th{background:#082A63;color:#ffffff;padding:7px 8px;border:1px solid #0B3B8C;text-align:left}.grid td{padding:6px 8px;border:1px solid #94a3b8;color:#0f172a}</style></head><body><div class="top"><div>${murindaLogoSvg}</div><h1 class="title">Timesheet Absensi Security Dormitory Batang</h1></div><table class="meta"><tr><td><b>Month</b></td><td>${meta.monthLabel}</td></tr><tr><td><b>Anggota</b></td><td>${meta.memberName}</td></tr><tr><td><b>Kode</b></td><td>${meta.memberCode}</td></tr></table><table class="grid"><thead><tr>${headers
       .map((h) => `<th>${h}</th>`)
       .join("")}</tr></thead><tbody>${rows
       .map((r) => `<tr>${r.map((c) => `<td>${c}</td>`).join("")}</tr>`)
@@ -2452,7 +2521,9 @@ export default function AbsensiMultiServerPage() {
                       <span>
                         {r.full_name} ({r.emp_code})
                       </span>
-                      <span>Shift {r.shift_time}</span>
+                      <span>
+                        {r.shift_label} • {r.shift_time}
+                      </span>
                     </div>
                   ))}
                 </div>
@@ -2481,10 +2552,10 @@ export default function AbsensiMultiServerPage() {
 
               <div className="p-2 rounded-xl bg-slate-50 border border-slate-200 space-y-1.5">
                 <div className="flex items-center justify-between">
-                  <span className="text-[10px] font-extrabold text-slate-700 uppercase">
+                  <span className="text-[10px] font-extrabold text-[#082A63] uppercase">
                     Inspeksi Laporan (MURINDA • Security Dormitory Batang)
                   </span>
-                  <span className="text-[9px] font-bold text-emerald-700 bg-emerald-100 px-1.5 py-0.5 rounded">
+                  <span className="text-[9px] font-bold text-[#0B3B8C] bg-blue-100 px-1.5 py-0.5 rounded">
                     ADMIN INSPEKSI
                   </span>
                 </div>
@@ -2492,21 +2563,21 @@ export default function AbsensiMultiServerPage() {
                   <button
                     type="button"
                     onClick={() => runInspection("XLSX")}
-                    className="py-1.5 rounded-lg bg-teal-700 text-white text-[10px] font-bold"
+                    className="py-1.5 rounded-lg bg-[#082A63] text-white text-[10px] font-bold"
                   >
                     Inspeksi XLSX
                   </button>
                   <button
                     type="button"
                     onClick={() => runInspection("PDF")}
-                    className="py-1.5 rounded-lg bg-indigo-700 text-white text-[10px] font-bold"
+                    className="py-1.5 rounded-lg bg-[#0B3B8C] text-white text-[10px] font-bold"
                   >
                     Inspeksi PDF
                   </button>
                 </div>
                 {inspectionMode !== "NONE" && (
-                  <div className="p-2 rounded-lg bg-white border border-slate-200 text-[10px] text-slate-700 space-y-1">
-                    <div className="font-extrabold text-slate-900">
+                  <div className="p-2 rounded-lg bg-white border border-blue-200 text-[10px] text-slate-700 space-y-1">
+                    <div className="font-extrabold text-[#082A63]">
                       MURINDA — Timesheet Absensi Security Dormitory Batang
                     </div>
                     <div>{inspectionNote}</div>
