@@ -1,28 +1,51 @@
 import { NextRequest, NextResponse } from "next/server";
-import { Pool } from "pg";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const globalForPg = globalThis as unknown as { pgPool?: Pool };
+export interface EmployeeRecord {
+  id: number;
+  emp_code: string;
+  full_name: string;
+  role: "ADMIN" | "MANAGER" | "STAFF";
+  department: string;
+  pin_code: string;
+  shift_start_time: string;
+}
 
-function getPool(): Pool | null {
-  const connStr = process.env.DATABASE_URL;
-  if (!connStr) return null;
-  if (!globalForPg.pgPool) {
-    globalForPg.pgPool = new Pool({
-      connectionString: connStr,
-      ssl: { rejectUnauthorized: false },
-    });
-  }
-  return globalForPg.pgPool;
+export interface LocationRecord {
+  id: number;
+  name: string;
+  latitude: number;
+  longitude: number;
+  radius_meters: number;
+}
+
+export interface PunchRecord {
+  id?: number;
+  client_uuid: string;
+  employee_id: number;
+  emp_code?: string | null;
+  full_name?: string | null;
+  entry_type: "CLOCK_IN" | "CLOCK_OUT";
+  punched_at: string;
+  is_offline_sync?: boolean;
+  qr_code?: string | null;
+  mode?: string;
+  notes?: string;
+  latitude?: number | null;
+  longitude?: number | null;
+  distance_meters?: number | null;
+  is_within_geofence?: boolean;
+  selfie_data?: string | null;
+  face_detected?: boolean;
 }
 
 const DEFAULT_LAT = -6.9148609;
 const DEFAULT_LNG = 109.744683;
-const DEFAULT_RADIUS = 150;
+const DEFAULT_RADIUS = 2000;
 
-const SEED_EMPLOYEES = [
+const INITIAL_EMPLOYEES: EmployeeRecord[] = [
   {
     id: 1,
     emp_code: "ADM-001",
@@ -52,8 +75,81 @@ const SEED_EMPLOYEES = [
   },
 ];
 
-async function ensureSchema(pool: Pool) {
-  await pool.query(`
+const INITIAL_LOCATIONS: LocationRecord[] = [
+  {
+    id: 1,
+    name: "Kantor Utama",
+    latitude: DEFAULT_LAT,
+    longitude: DEFAULT_LNG,
+    radius_meters: DEFAULT_RADIUS,
+  },
+];
+
+const globalStore = globalThis as unknown as {
+  __absensiStore?: {
+    employees: EmployeeRecord[];
+    locations: LocationRecord[];
+    entries: PunchRecord[];
+    initialized: boolean;
+  };
+};
+
+function getStore() {
+  if (!globalStore.__absensiStore) {
+    globalStore.__absensiStore = {
+      employees: [...INITIAL_EMPLOYEES],
+      locations: [...INITIAL_LOCATIONS],
+      entries: [],
+      initialized: false,
+    };
+  }
+  return globalStore.__absensiStore;
+}
+
+function getNeonHttpUrl(): string | null {
+  const conn = process.env.DATABASE_URL || process.env.POSTGRES_URL || "";
+  if (!conn) return null;
+  try {
+    const u = new URL(conn);
+    const host = u.hostname;
+    const db = u.pathname.replace(/^\//, "") || "neondb";
+    return `https://${host}/sql?database=${encodeURIComponent(db)}`;
+  } catch {
+    return null;
+  }
+}
+
+async function runNeonSql(
+  query: string,
+  params: unknown[] = []
+): Promise<{ ok: boolean; rows: Record<string, unknown>[] }> {
+  const endpoint = getNeonHttpUrl();
+  const conn = process.env.DATABASE_URL || process.env.POSTGRES_URL || "";
+  if (!endpoint || !conn) return { ok: false, rows: [] };
+
+  try {
+    const res = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Neon-Connection-String": conn,
+        "Neon-Raw-Text-Output": "false",
+      },
+      body: JSON.stringify({ query, params }),
+      cache: "no-store",
+    });
+    if (!res.ok) return { ok: false, rows: [] };
+    const data = await res.json();
+    const rows = Array.isArray(data?.rows) ? data.rows : [];
+    return { ok: true, rows };
+  } catch {
+    return { ok: false, rows: [] };
+  }
+}
+
+async function ensureNeonTables(): Promise<boolean> {
+  const store = getStore();
+  const check = await runNeonSql(`
     CREATE TABLE IF NOT EXISTS employees (
       id SERIAL PRIMARY KEY,
       emp_code VARCHAR(32) UNIQUE NOT NULL,
@@ -64,8 +160,9 @@ async function ensureSchema(pool: Pool) {
       shift_start_time VARCHAR(16) NOT NULL DEFAULT '07.00'
     );
   `);
+  if (!check.ok) return false;
 
-  await pool.query(`
+  await runNeonSql(`
     CREATE TABLE IF NOT EXISTS locations (
       id SERIAL PRIMARY KEY,
       name VARCHAR(120) NOT NULL DEFAULT 'Kantor Utama',
@@ -75,7 +172,7 @@ async function ensureSchema(pool: Pool) {
     );
   `);
 
-  await pool.query(`
+  await runNeonSql(`
     CREATE TABLE IF NOT EXISTS time_entries (
       id SERIAL PRIMARY KEY,
       client_uuid VARCHAR(100) UNIQUE NOT NULL,
@@ -97,106 +194,138 @@ async function ensureSchema(pool: Pool) {
     );
   `);
 
-  for (const emp of SEED_EMPLOYEES) {
-    await pool.query(
-      `
-      INSERT INTO employees (emp_code, full_name, role, department, pin_code, shift_start_time)
-      VALUES ($1, $2, $3, $4, $5, $6)
-      ON CONFLICT (emp_code) DO NOTHING;
-      `,
-      [
-        emp.emp_code,
-        emp.full_name,
-        emp.role,
-        emp.department,
-        emp.pin_code,
-        emp.shift_start_time,
-      ]
-    );
+  if (!store.initialized) {
+    for (const emp of INITIAL_EMPLOYEES) {
+      await runNeonSql(
+        `
+        INSERT INTO employees (emp_code, full_name, role, department, pin_code, shift_start_time)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        ON CONFLICT (emp_code) DO NOTHING;
+        `,
+        [
+          emp.emp_code,
+          emp.full_name,
+          emp.role,
+          emp.department,
+          emp.pin_code,
+          emp.shift_start_time,
+        ]
+      );
+    }
+
+    const locCount = await runNeonSql(`SELECT COUNT(*)::int AS cnt FROM locations;`);
+    if (Number(locCount.rows[0]?.cnt ?? 0) === 0) {
+      await runNeonSql(
+        `INSERT INTO locations (name, latitude, longitude, radius_meters) VALUES ($1, $2, $3, $4);`,
+        ["Kantor Utama", DEFAULT_LAT, DEFAULT_LNG, DEFAULT_RADIUS]
+      );
+    }
+    store.initialized = true;
   }
 
-  const locRes = await pool.query(`SELECT COUNT(*)::int AS cnt FROM locations;`);
-  if ((locRes.rows[0]?.cnt ?? 0) === 0) {
-    await pool.query(
-      `
-      INSERT INTO locations (name, latitude, longitude, radius_meters)
-      VALUES ($1, $2, $3, $4);
-      `,
-      ["Kantor Utama", DEFAULT_LAT, DEFAULT_LNG, DEFAULT_RADIUS]
-    );
-  }
+  return true;
 }
 
 export async function GET() {
-  const pool = getPool();
-  if (!pool) {
-    return NextResponse.json({
-      ok: true,
-      serverTime: new Date().toISOString(),
-      employees: SEED_EMPLOYEES,
-      locations: [
-        {
-          id: 1,
-          name: "Kantor Utama",
-          latitude: DEFAULT_LAT,
-          longitude: DEFAULT_LNG,
-          radius_meters: DEFAULT_RADIUS,
-        },
-      ],
-      entries: [],
-      dbConnected: false,
-    });
-  }
+  const store = getStore();
+  const dbReady = await ensureNeonTables();
 
-  try {
-    await ensureSchema(pool);
+  if (dbReady) {
     const [empRes, locRes, entryRes] = await Promise.all([
-      pool.query(`SELECT * FROM employees ORDER BY id ASC;`),
-      pool.query(`SELECT * FROM locations ORDER BY id ASC LIMIT 1;`),
-      pool.query(`SELECT * FROM time_entries ORDER BY punched_at DESC LIMIT 300;`),
+      runNeonSql(`SELECT * FROM employees ORDER BY id ASC;`),
+      runNeonSql(`SELECT * FROM locations ORDER BY id ASC LIMIT 1;`),
+      runNeonSql(`SELECT * FROM time_entries ORDER BY punched_at DESC LIMIT 300;`),
     ]);
 
-    return NextResponse.json({
-      ok: true,
-      serverTime: new Date().toISOString(),
-      employees: empRes.rows,
-      locations: locRes.rows.length > 0 ? locRes.rows : [
+    if (empRes.ok && empRes.rows.length > 0) {
+      store.employees = empRes.rows.map((r, idx) => ({
+        id: Number(r.id) || idx + 1,
+        emp_code: String(r.emp_code || `EMP-${idx + 1}`),
+        full_name: String(r.full_name || "Karyawan"),
+        role:
+          String(r.role || "STAFF").toUpperCase() === "ADMIN"
+            ? "ADMIN"
+            : String(r.role || "STAFF").toUpperCase() === "MANAGER"
+            ? "MANAGER"
+            : "STAFF",
+        department: String(r.department || "Operasional"),
+        pin_code: String(r.pin_code || "1111"),
+        shift_start_time: String(r.shift_start_time || "07.00"),
+      }));
+    }
+
+    if (locRes.ok && locRes.rows.length > 0) {
+      const l = locRes.rows[0];
+      store.locations = [
         {
-          id: 1,
-          name: "Kantor Utama",
-          latitude: DEFAULT_LAT,
-          longitude: DEFAULT_LNG,
-          radius_meters: DEFAULT_RADIUS,
+          id: Number(l.id) || 1,
+          name: String(l.name || "Kantor Utama"),
+          latitude: Number(l.latitude) || DEFAULT_LAT,
+          longitude: Number(l.longitude) || DEFAULT_LNG,
+          radius_meters: Math.max(10, Number(l.radius_meters) || DEFAULT_RADIUS),
         },
-      ],
-      entries: entryRes.rows,
-      dbConnected: true,
-    });
-  } catch (err) {
-    console.error("GET /api/absensi error:", err);
-    return NextResponse.json(
-      { ok: false, error: "Gagal membaca database Neon" },
-      { status: 500 }
-    );
+      ];
+    }
+
+    if (entryRes.ok) {
+      store.entries = entryRes.rows.map((item, idx) => ({
+        id: Number(item.id) || idx + 1,
+        client_uuid: String(item.client_uuid || `db-${idx + 1}`),
+        employee_id: Number(item.employee_id) || 3,
+        emp_code: item.emp_code ? String(item.emp_code) : null,
+        full_name: item.full_name ? String(item.full_name) : null,
+        entry_type:
+          String(item.entry_type || "CLOCK_IN").toUpperCase() === "CLOCK_OUT"
+            ? "CLOCK_OUT"
+            : "CLOCK_IN",
+        punched_at: item.punched_at
+          ? new Date(String(item.punched_at)).toISOString()
+          : new Date().toISOString(),
+        is_offline_sync: Boolean(item.is_offline_sync),
+        qr_code: item.qr_code ? String(item.qr_code) : null,
+        mode: String(item.mode || "BARCODE + WAJAH"),
+        notes: String(item.notes || ""),
+        latitude:
+          item.latitude !== null && item.latitude !== undefined
+            ? Number(item.latitude)
+            : null,
+        longitude:
+          item.longitude !== null && item.longitude !== undefined
+            ? Number(item.longitude)
+            : null,
+        distance_meters:
+          item.distance_meters !== null && item.distance_meters !== undefined
+            ? Number(item.distance_meters)
+            : 0,
+        is_within_geofence:
+          item.is_within_geofence !== undefined
+            ? Boolean(item.is_within_geofence)
+            : true,
+        selfie_data: item.selfie_data ? String(item.selfie_data) : null,
+        face_detected: Boolean(item.face_detected),
+      }));
+    }
   }
+
+  return NextResponse.json({
+    ok: true,
+    serverTime: new Date().toISOString(),
+    employees: store.employees,
+    locations: store.locations,
+    entries: store.entries,
+    dbConnected: dbReady,
+  });
 }
 
 export async function POST(req: NextRequest) {
-  const pool = getPool();
-  if (!pool) {
-    return NextResponse.json(
-      { ok: false, error: "DATABASE_URL belum dikonfigurasi di Vercel" },
-      { status: 500 }
-    );
-  }
-
   try {
-    await ensureSchema(pool);
+    const store = getStore();
+    const dbReady = await ensureNeonTables();
     const body = await req.json();
     const action = String(body?.action || "SUBMIT_PUNCH").toUpperCase();
 
     if (action === "SUBMIT_PUNCH" || action === "SYNC_PUNCHES") {
-      const punches = Array.isArray(body?.punches)
+      const punches: PunchRecord[] = Array.isArray(body?.punches)
         ? body.punches
         : body?.punch
         ? [body.punch]
@@ -205,79 +334,111 @@ export async function POST(req: NextRequest) {
       let syncedCount = 0;
       for (const p of punches) {
         if (!p?.client_uuid) continue;
-        const empId = Number(p.employee_id) || 3;
-        const entryType =
-          String(p.entry_type || "CLOCK_IN").toUpperCase() === "CLOCK_OUT"
-            ? "CLOCK_OUT"
-            : "CLOCK_IN";
-        const punchedAt = p.punched_at
-          ? new Date(p.punched_at).toISOString()
-          : new Date().toISOString();
-
-        await pool.query(
-          `
-          INSERT INTO time_entries (
-            client_uuid, employee_id, emp_code, full_name, entry_type,
-            punched_at, is_offline_sync, qr_code, mode, notes,
-            latitude, longitude, distance_meters, is_within_geofence,
-            selfie_data, face_detected
-          )
-          VALUES (
-            $1, $2, $3, $4, $5,
-            $6::timestamptz, $7, $8, $9, $10,
-            $11, $12, $13, $14,
-            $15, $16
-          )
-          ON CONFLICT (client_uuid) DO UPDATE SET
-            entry_type = EXCLUDED.entry_type,
-            punched_at = EXCLUDED.punched_at,
-            is_offline_sync = EXCLUDED.is_offline_sync,
-            qr_code = EXCLUDED.qr_code,
-            mode = EXCLUDED.mode,
-            latitude = EXCLUDED.latitude,
-            longitude = EXCLUDED.longitude,
-            distance_meters = EXCLUDED.distance_meters,
-            is_within_geofence = EXCLUDED.is_within_geofence,
-            selfie_data = COALESCE(EXCLUDED.selfie_data, time_entries.selfie_data),
-            face_detected = EXCLUDED.face_detected;
-          `,
-          [
-            String(p.client_uuid),
-            empId,
-            p.emp_code ? String(p.emp_code) : null,
-            p.full_name ? String(p.full_name) : null,
-            entryType,
-            punchedAt,
-            Boolean(p.is_offline_sync),
-            p.qr_code ? String(p.qr_code) : null,
-            p.mode ? String(p.mode) : "BARCODE + WAJAH",
-            p.notes ? String(p.notes) : "",
+        const normalized: PunchRecord = {
+          client_uuid: String(p.client_uuid),
+          employee_id: Number(p.employee_id) || 3,
+          emp_code: p.emp_code ? String(p.emp_code) : null,
+          full_name: p.full_name ? String(p.full_name) : null,
+          entry_type:
+            String(p.entry_type || "CLOCK_IN").toUpperCase() === "CLOCK_OUT"
+              ? "CLOCK_OUT"
+              : "CLOCK_IN",
+          punched_at: p.punched_at
+            ? new Date(p.punched_at).toISOString()
+            : new Date().toISOString(),
+          is_offline_sync: Boolean(p.is_offline_sync),
+          qr_code: p.qr_code ? String(p.qr_code) : null,
+          mode: String(p.mode || "BARCODE + WAJAH"),
+          notes: String(p.notes || ""),
+          latitude:
             p.latitude !== undefined && p.latitude !== null
               ? Number(p.latitude)
               : null,
+          longitude:
             p.longitude !== undefined && p.longitude !== null
               ? Number(p.longitude)
               : null,
+          distance_meters:
             p.distance_meters !== undefined && p.distance_meters !== null
               ? Number(p.distance_meters)
               : 0,
+          is_within_geofence:
             p.is_within_geofence !== undefined
               ? Boolean(p.is_within_geofence)
               : true,
-            p.selfie_data ? String(p.selfie_data) : null,
-            Boolean(p.face_detected),
-          ]
+          selfie_data: p.selfie_data ? String(p.selfie_data) : null,
+          face_detected: Boolean(p.face_detected),
+        };
+
+        const idxExisting = store.entries.findIndex(
+          (x) => x.client_uuid === normalized.client_uuid
         );
+        if (idxExisting >= 0) {
+          store.entries[idxExisting] = {
+            ...store.entries[idxExisting],
+            ...normalized,
+          };
+        } else {
+          store.entries.unshift(normalized);
+        }
+
+        if (dbReady) {
+          await runNeonSql(
+            `
+            INSERT INTO time_entries (
+              client_uuid, employee_id, emp_code, full_name, entry_type,
+              punched_at, is_offline_sync, qr_code, mode, notes,
+              latitude, longitude, distance_meters, is_within_geofence,
+              selfie_data, face_detected
+            )
+            VALUES (
+              $1, $2, $3, $4, $5,
+              $6::timestamptz, $7, $8, $9, $10,
+              $11, $12, $13, $14,
+              $15, $16
+            )
+            ON CONFLICT (client_uuid) DO UPDATE SET
+              entry_type = EXCLUDED.entry_type,
+              punched_at = EXCLUDED.punched_at,
+              is_offline_sync = EXCLUDED.is_offline_sync,
+              qr_code = EXCLUDED.qr_code,
+              mode = EXCLUDED.mode,
+              latitude = EXCLUDED.latitude,
+              longitude = EXCLUDED.longitude,
+              distance_meters = EXCLUDED.distance_meters,
+              is_within_geofence = EXCLUDED.is_within_geofence,
+              selfie_data = COALESCE(EXCLUDED.selfie_data, time_entries.selfie_data),
+              face_detected = EXCLUDED.face_detected;
+            `,
+            [
+              normalized.client_uuid,
+              normalized.employee_id,
+              normalized.emp_code,
+              normalized.full_name,
+              normalized.entry_type,
+              normalized.punched_at,
+              normalized.is_offline_sync,
+              normalized.qr_code,
+              normalized.mode,
+              normalized.notes,
+              normalized.latitude,
+              normalized.longitude,
+              normalized.distance_meters,
+              normalized.is_within_geofence,
+              normalized.selfie_data,
+              normalized.face_detected,
+            ]
+          );
+        }
+
         syncedCount++;
       }
 
-      const entryRes = await pool.query(
-        `SELECT * FROM time_entries ORDER BY punched_at DESC LIMIT 300;`
-      );
       return NextResponse.json({
         ok: true,
         syncedCount,
-        entries: entryRes.rows,
+        entries: store.entries,
+        dbConnected: dbReady,
       });
     }
 
@@ -286,95 +447,138 @@ export async function POST(req: NextRequest) {
       const nextIso = p.punched_at
         ? new Date(p.punched_at).toISOString()
         : new Date().toISOString();
-      const nextType =
+      const nextType: "CLOCK_IN" | "CLOCK_OUT" =
         String(p.entry_type || "CLOCK_IN").toUpperCase() === "CLOCK_OUT"
           ? "CLOCK_OUT"
           : "CLOCK_IN";
+      const nextNotes = String(p.notes || "");
 
-      if (p.client_uuid) {
-        await pool.query(
-          `
-          UPDATE time_entries
-          SET entry_type = $1, punched_at = $2::timestamptz, notes = $3
-          WHERE client_uuid = $4;
-          `,
-          [nextType, nextIso, String(p.notes || ""), String(p.client_uuid)]
-        );
-      } else if (p.id) {
-        await pool.query(
-          `
-          UPDATE time_entries
-          SET entry_type = $1, punched_at = $2::timestamptz, notes = $3
-          WHERE id = $4;
-          `,
-          [nextType, nextIso, String(p.notes || ""), Number(p.id)]
-        );
+      store.entries = store.entries.map((x) =>
+        x.client_uuid === p.client_uuid || (p.id && x.id === Number(p.id))
+          ? { ...x, entry_type: nextType, punched_at: nextIso, notes: nextNotes }
+          : x
+      );
+
+      if (dbReady) {
+        if (p.client_uuid) {
+          await runNeonSql(
+            `UPDATE time_entries SET entry_type = $1, punched_at = $2::timestamptz, notes = $3 WHERE client_uuid = $4;`,
+            [nextType, nextIso, nextNotes, String(p.client_uuid)]
+          );
+        } else if (p.id) {
+          await runNeonSql(
+            `UPDATE time_entries SET entry_type = $1, punched_at = $2::timestamptz, notes = $3 WHERE id = $4;`,
+            [nextType, nextIso, nextNotes, Number(p.id)]
+          );
+        }
       }
       return NextResponse.json({ ok: true });
     }
 
     if (action === "DELETE_ENTRY") {
       const p = body?.payload || {};
-      if (p.client_uuid) {
-        await pool.query(`DELETE FROM time_entries WHERE client_uuid = $1;`, [
-          String(p.client_uuid),
-        ]);
-      } else if (p.id) {
-        await pool.query(`DELETE FROM time_entries WHERE id = $1;`, [
-          Number(p.id),
-        ]);
+      store.entries = store.entries.filter(
+        (x) =>
+          x.client_uuid !== p.client_uuid && (!p.id || x.id !== Number(p.id))
+      );
+
+      if (dbReady) {
+        if (p.client_uuid) {
+          await runNeonSql(`DELETE FROM time_entries WHERE client_uuid = $1;`, [
+            String(p.client_uuid),
+          ]);
+        } else if (p.id) {
+          await runNeonSql(`DELETE FROM time_entries WHERE id = $1;`, [
+            Number(p.id),
+          ]);
+        }
       }
       return NextResponse.json({ ok: true });
     }
 
     if (action === "SAVE_EMPLOYEE") {
       const p = body?.payload || {};
+      const empCode = String(p.emp_code || "").trim();
+      const fullName = String(p.full_name || "").trim();
+      const role: "ADMIN" | "MANAGER" | "STAFF" =
+        String(p.role || "STAFF").toUpperCase() === "ADMIN"
+          ? "ADMIN"
+          : String(p.role || "STAFF").toUpperCase() === "MANAGER"
+          ? "MANAGER"
+          : "STAFF";
+      const department = String(p.department || "Operasional").trim();
+      const pinCode = String(p.pin_code || "1111").trim();
+      const shiftTime = String(p.shift_start_time || "07.00").trim();
+
       if (p.id) {
-        await pool.query(
-          `
-          UPDATE employees
-          SET emp_code = $1, full_name = $2, role = $3, department = $4, pin_code = $5, shift_start_time = $6
-          WHERE id = $7;
-          `,
-          [
-            String(p.emp_code).trim(),
-            String(p.full_name).trim(),
-            String(p.role || "STAFF").toUpperCase(),
-            String(p.department || "Operasional").trim(),
-            String(p.pin_code || "1111").trim(),
-            String(p.shift_start_time || "07.00").trim(),
-            Number(p.id),
-          ]
+        store.employees = store.employees.map((e) =>
+          e.id === Number(p.id)
+            ? {
+                ...e,
+                emp_code: empCode,
+                full_name: fullName,
+                role,
+                department,
+                pin_code: pinCode,
+                shift_start_time: shiftTime,
+              }
+            : e
         );
+        if (dbReady) {
+          await runNeonSql(
+            `UPDATE employees SET emp_code = $1, full_name = $2, role = $3, department = $4, pin_code = $5, shift_start_time = $6 WHERE id = $7;`,
+            [empCode, fullName, role, department, pinCode, shiftTime, Number(p.id)]
+          );
+        }
       } else {
-        await pool.query(
-          `
-          INSERT INTO employees (emp_code, full_name, role, department, pin_code, shift_start_time)
-          VALUES ($1, $2, $3, $4, $5, $6)
-          ON CONFLICT (emp_code) DO UPDATE SET
-            full_name = EXCLUDED.full_name,
-            role = EXCLUDED.role,
-            department = EXCLUDED.department,
-            pin_code = EXCLUDED.pin_code,
-            shift_start_time = EXCLUDED.shift_start_time;
-          `,
-          [
-            String(p.emp_code).trim(),
-            String(p.full_name).trim(),
-            String(p.role || "STAFF").toUpperCase(),
-            String(p.department || "Operasional").trim(),
-            String(p.pin_code || "1111").trim(),
-            String(p.shift_start_time || "07.00").trim(),
-          ]
+        const exists = store.employees.findIndex(
+          (e) => e.emp_code.toLowerCase() === empCode.toLowerCase()
         );
+        if (exists >= 0) {
+          store.employees[exists] = {
+            ...store.employees[exists],
+            emp_code: empCode,
+            full_name: fullName,
+            role,
+            department,
+            pin_code: pinCode,
+            shift_start_time: shiftTime,
+          };
+        } else {
+          store.employees.push({
+            id: Date.now(),
+            emp_code: empCode,
+            full_name: fullName,
+            role,
+            department,
+            pin_code: pinCode,
+            shift_start_time: shiftTime,
+          });
+        }
+        if (dbReady) {
+          await runNeonSql(
+            `
+            INSERT INTO employees (emp_code, full_name, role, department, pin_code, shift_start_time)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT (emp_code) DO UPDATE SET
+              full_name = EXCLUDED.full_name,
+              role = EXCLUDED.role,
+              department = EXCLUDED.department,
+              pin_code = EXCLUDED.pin_code,
+              shift_start_time = EXCLUDED.shift_start_time;
+            `,
+            [empCode, fullName, role, department, pinCode, shiftTime]
+          );
+        }
       }
       return NextResponse.json({ ok: true });
     }
 
     if (action === "DELETE_EMPLOYEE") {
       const id = Number(body?.payload?.id);
-      if (id) {
-        await pool.query(`DELETE FROM employees WHERE id = $1;`, [id]);
+      store.employees = store.employees.filter((e) => e.id !== id);
+      if (dbReady && id) {
+        await runNeonSql(`DELETE FROM employees WHERE id = $1;`, [id]);
       }
       return NextResponse.json({ ok: true });
     }
@@ -386,24 +590,31 @@ export async function POST(req: NextRequest) {
       const rad = Math.max(10, Number(p.radius_meters) || DEFAULT_RADIUS);
       const name = String(p.name || "Kantor Utama");
 
-      const existing = await pool.query(`SELECT id FROM locations ORDER BY id ASC LIMIT 1;`);
-      if (existing.rows.length > 0) {
-        await pool.query(
-          `
-          UPDATE locations
-          SET name = $1, latitude = $2, longitude = $3, radius_meters = $4
-          WHERE id = $5;
-          `,
-          [name, lat, lng, rad, Number(existing.rows[0].id)]
+      store.locations = [
+        {
+          id: store.locations[0]?.id || 1,
+          name,
+          latitude: lat,
+          longitude: lng,
+          radius_meters: rad,
+        },
+      ];
+
+      if (dbReady) {
+        const existing = await runNeonSql(
+          `SELECT id FROM locations ORDER BY id ASC LIMIT 1;`
         );
-      } else {
-        await pool.query(
-          `
-          INSERT INTO locations (name, latitude, longitude, radius_meters)
-          VALUES ($1, $2, $3, $4);
-          `,
-          [name, lat, lng, rad]
-        );
+        if (existing.rows.length > 0) {
+          await runNeonSql(
+            `UPDATE locations SET name = $1, latitude = $2, longitude = $3, radius_meters = $4 WHERE id = $5;`,
+            [name, lat, lng, rad, Number(existing.rows[0].id)]
+          );
+        } else {
+          await runNeonSql(
+            `INSERT INTO locations (name, latitude, longitude, radius_meters) VALUES ($1, $2, $3, $4);`,
+            [name, lat, lng, rad]
+          );
+        }
       }
       return NextResponse.json({ ok: true });
     }
@@ -413,9 +624,9 @@ export async function POST(req: NextRequest) {
       { status: 400 }
     );
   } catch (err) {
-    console.error("POST /api/absensi error:", err);
+    console.error("POST /api/absen error:", err);
     return NextResponse.json(
-      { ok: false, error: "Gagal menyimpan data ke database Neon" },
+      { ok: false, error: "Gagal memproses data absen" },
       { status: 500 }
     );
   }
