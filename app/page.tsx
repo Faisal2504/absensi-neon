@@ -3,7 +3,7 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
 
 type RoleType = "ADMIN" | "MANAGER" | "STAFF";
-type IndoTzType = "Asia/Jakarta" | "Asia/Makassar" | "Asia/Jayapura";
+type ServerMode = "ADMIN" | "MANAGER" | "KARYAWAN";
 
 interface Employee {
   id: number;
@@ -38,6 +38,7 @@ interface TimeEntry {
   distance_meters?: number | null;
   is_within_geofence?: boolean;
   selfie_data?: string | null;
+  face_detected?: boolean;
   full_name?: string;
   emp_code?: string;
 }
@@ -51,9 +52,12 @@ interface FaceDetectorInstance {
 interface BarcodeDetectorInstance {
   detect: (
     video: HTMLVideoElement
-  ) => Promise<Array<{ rawValue?: string; format?: string }>>;
+  ) => Promise<Array<{ rawValue?: string; raw_value?: string }>>;
 }
 
+// Koordinat GPS kantor terkunci permanen
+const LOCKED_LAT = -6.9148609;
+const LOCKED_LNG = 109.744683;
 const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
 
 const SHIFT_OPTIONS = [
@@ -62,12 +66,12 @@ const SHIFT_OPTIONS = [
   { label: "Shift Malam (23.00)", time: "23.00" },
 ];
 
-const CACHE_KEY = "absensi_role_lock_cache_v1";
-const QUEUE_KEY = "absensi_role_lock_queue_v1";
-const ACTIVE_EMP_KEY = "absensi_role_lock_emp_id_v1";
-const STAFF_DEVICE_LOCK_KEY = "absensi_locked_staff_device_v1";
-const QR_CODE_KEY = "absensi_role_lock_qr_v1";
-const TZ_KEY = "absensi_role_lock_tz_v1";
+const CACHE_KEY = "absensi_v5_cache";
+const QUEUE_KEY = "absensi_v5_queue";
+const QR_CODE_KEY = "absensi_v5_qr";
+const DEVICE_LOCK_KEY = "absensi_v5_device_locked_karyawan";
+const STAFF_EMP_KEY = "absensi_v5_staff_emp_id";
+const AUTH_SERVER_KEY = "absensi_v5_auth_server";
 
 function normalizeShiftTime(raw?: string | null): string {
   const s = String(raw || "").trim();
@@ -93,29 +97,23 @@ function normalizeShiftTime(raw?: string | null): string {
   return s.replace(":", ".");
 }
 
-function getTzLabel(tz: IndoTzType): string {
-  if (tz === "Asia/Makassar") return "WITA";
-  if (tz === "Asia/Jayapura") return "WIT";
-  return "WIB";
-}
-
 const DEFAULT_EMPLOYEES: Employee[] = [
   {
     id: 1,
     emp_code: "ADM-001",
     full_name: "Admin Operasional",
     role: "ADMIN",
-    department: "Operasional",
+    department: "Administrator",
     pin_code: "0000",
     shift_start_time: "07.00",
   },
   {
     id: 2,
     emp_code: "MGR-001",
-    full_name: "Manager Kebun & Staf",
+    full_name: "Manager Operasional",
     role: "MANAGER",
     department: "Manajemen",
-    pin_code: "2222",
+    pin_code: "2026",
     shift_start_time: "07.00",
   },
   {
@@ -132,39 +130,46 @@ const DEFAULT_EMPLOYEES: Employee[] = [
 const DEFAULT_LOCATIONS: LocationItem[] = [
   {
     id: 1,
-    name: "Kantor Utama MPI-BTG",
-    latitude: -6.91,
-    longitude: 109.73,
+    name: "Kantor Utama Terkunci",
+    latitude: LOCKED_LAT,
+    longitude: LOCKED_LNG,
     radius_meters: 150,
   },
 ];
 
-function getDateStrInTz(iso: string | undefined, tz: IndoTzType): string {
-  return new Date(iso || new Date().toISOString()).toLocaleDateString("en-CA", {
-    timeZone: tz,
+function enforceLockedLocation(list: LocationItem[]): LocationItem[] {
+  const base = list && list.length > 0 ? list : DEFAULT_LOCATIONS;
+  return base.map((loc, idx) =>
+    idx === 0
+      ? {
+          ...loc,
+          latitude: LOCKED_LAT,
+          longitude: LOCKED_LNG,
+          radius_meters: Number(loc.radius_meters) || 150,
+        }
+      : loc
+  );
+}
+
+const getJakartaDateStr = (iso?: string) =>
+  new Date(iso || new Date().toISOString()).toLocaleDateString("en-CA", {
+    timeZone: "Asia/Jakarta",
   });
-}
 
-function formatTimeInTz(
-  iso: string | null | undefined,
-  tz: IndoTzType
-): string {
-  if (!iso) return "-";
-  return `${new Date(iso).toLocaleTimeString("id-ID", {
-    timeZone: tz,
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  })} ${getTzLabel(tz)}`;
-}
+const formatTimeWIB = (iso?: string | null) =>
+  !iso
+    ? "-"
+    : new Date(iso).toLocaleTimeString("id-ID", {
+        timeZone: "Asia/Jakarta",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+      });
 
-function formatDateTimeLocalInTz(
-  iso: string | null | undefined,
-  tz: IndoTzType
-): string {
+const formatDateTimeLocalWIB = (iso?: string | null) => {
   if (!iso) return "";
   return new Intl.DateTimeFormat("sv-SE", {
-    timeZone: tz,
+    timeZone: "Asia/Jakarta",
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
@@ -173,15 +178,11 @@ function formatDateTimeLocalInTz(
   })
     .format(new Date(iso))
     .replace(" ", "T");
-}
+};
 
-function calcLateMinutes(
-  punchedIso: string,
-  shiftStart = "07.00",
-  tz: IndoTzType = "Asia/Jakarta"
-) {
+function calcLateMinutes(punchedIso: string, shiftStart = "07.00") {
   const parts = new Intl.DateTimeFormat("en-GB", {
-    timeZone: tz,
+    timeZone: "Asia/Jakarta",
     hour: "2-digit",
     minute: "2-digit",
     hour12: false,
@@ -317,44 +318,65 @@ function parseScheduleLines(
   return parsed;
 }
 
-function getInitialState() {
+function getInitialBoot() {
   if (typeof window === "undefined") {
     return {
+      serverMode: "ADMIN" as ServerMode,
+      isDeviceLockedKaryawan: false,
+      isAuthenticatedPrivileged: false,
       qrCode: "ABSENSI-KANTOR-MPI-BTG",
-      empId: 1,
-      staffLocked: false,
-      tz: "Asia/Jakarta" as IndoTzType,
+      staffEmpId: 3,
       queue: [] as TimeEntry[],
       employees: DEFAULT_EMPLOYEES,
       locations: DEFAULT_LOCATIONS,
       entries: [] as TimeEntry[],
     };
   }
+
   let qrCode = "ABSENSI-KANTOR-MPI-BTG";
-  let empId = 1;
-  let staffLocked = false;
-  let tz: IndoTzType = "Asia/Jakarta";
+  let staffEmpId = 3;
   let queue: TimeEntry[] = [];
   let employees = DEFAULT_EMPLOYEES;
   let locations = DEFAULT_LOCATIONS;
   let entries: TimeEntry[] = [];
+  let isDeviceLockedKaryawan = false;
+  let serverMode: ServerMode = "ADMIN";
+  let isAuthenticatedPrivileged = false;
 
   try {
+    const params = new URLSearchParams(window.location.search);
+    const qServer = (params.get("server") || "").toLowerCase();
+
+    if (
+      qServer === "karyawan" ||
+      qServer === "staff" ||
+      localStorage.getItem(DEVICE_LOCK_KEY) === "1"
+    ) {
+      // Kunci HP karyawan secara permanen agar tidak bisa mengakses dasbor Manager maupun Admin
+      localStorage.setItem(DEVICE_LOCK_KEY, "1");
+      localStorage.removeItem(AUTH_SERVER_KEY);
+      isDeviceLockedKaryawan = true;
+      serverMode = "KARYAWAN";
+    } else if (qServer === "manager") {
+      serverMode = "MANAGER";
+    } else {
+      serverMode = "ADMIN";
+    }
+
+    const authSaved = localStorage.getItem(AUTH_SERVER_KEY);
+    if (!isDeviceLockedKaryawan && authSaved === serverMode) {
+      isAuthenticatedPrivileged = true;
+    }
+
     const savedQr = localStorage.getItem(QR_CODE_KEY);
     if (savedQr) qrCode = savedQr;
-    const savedEmp = localStorage.getItem(ACTIVE_EMP_KEY);
-    if (savedEmp && Number(savedEmp) > 0) empId = Number(savedEmp);
-    staffLocked = localStorage.getItem(STAFF_DEVICE_LOCK_KEY) === "1";
-    const savedTz = localStorage.getItem(TZ_KEY) as IndoTzType | null;
-    if (
-      savedTz === "Asia/Jakarta" ||
-      savedTz === "Asia/Makassar" ||
-      savedTz === "Asia/Jayapura"
-    ) {
-      tz = savedTz;
-    }
+
+    const savedStaff = localStorage.getItem(STAFF_EMP_KEY);
+    if (savedStaff && Number(savedStaff) > 0) staffEmpId = Number(savedStaff);
+
     const rawQ = localStorage.getItem(QUEUE_KEY);
     if (rawQ) queue = JSON.parse(rawQ);
+
     const rawC = localStorage.getItem(CACHE_KEY);
     if (rawC) {
       const c = JSON.parse(rawC);
@@ -365,7 +387,7 @@ function getInitialState() {
         }));
       }
       if (Array.isArray(c.locations) && c.locations.length > 0) {
-        locations = c.locations;
+        locations = enforceLockedLocation(c.locations);
       }
       if (Array.isArray(c.entries)) entries = c.entries;
     }
@@ -373,38 +395,51 @@ function getInitialState() {
     // Abaikan error storage
   }
 
-  return { qrCode, empId, staffLocked, tz, queue, employees, locations, entries };
+  return {
+    serverMode,
+    isDeviceLockedKaryawan,
+    isAuthenticatedPrivileged,
+    qrCode,
+    staffEmpId,
+    queue,
+    employees,
+    locations,
+    entries,
+  };
 }
 
-export default function AbsensiRoleDashboardPage() {
-  const init = useMemo(() => getInitialState(), []);
+export default function AbsensiMultiServerPage() {
+  const boot = useMemo(() => getInitialBoot(), []);
 
-  const [employees, setEmployees] = useState<Employee[]>(init.employees);
-  const [locations, setLocations] = useState<LocationItem[]>(init.locations);
-  const [serverEntries, setServerEntries] = useState<TimeEntry[]>(init.entries);
-  const [offlineQueue, setOfflineQueue] = useState<TimeEntry[]>(init.queue);
-  const [selectedEmpId, setSelectedEmpId] = useState<number>(init.empId);
-  const [isStaffDeviceLocked, setIsStaffDeviceLocked] = useState<boolean>(
-    init.staffLocked
+  const [serverMode, setServerMode] = useState<ServerMode>(boot.serverMode);
+  const [isDeviceLockedKaryawan, setIsDeviceLockedKaryawan] = useState<boolean>(
+    boot.isDeviceLockedKaryawan
   );
-  const [indoTz, setIndoTz] = useState<IndoTzType>(init.tz);
+  const [isPrivilegedAuthed, setIsPrivilegedAuthed] = useState<boolean>(
+    boot.isAuthenticatedPrivileged
+  );
+  const [pinEntry, setPinEntry] = useState("");
+
+  const [employees, setEmployees] = useState<Employee[]>(boot.employees);
+  const [locations, setLocations] = useState<LocationItem[]>(boot.locations);
+  const [serverEntries, setServerEntries] = useState<TimeEntry[]>(boot.entries);
+  const [offlineQueue, setOfflineQueue] = useState<TimeEntry[]>(boot.queue);
+  const [staffEmpId, setStaffEmpId] = useState<number>(boot.staffEmpId);
+
+  // Sinkronisasi Jam Indonesia (WIB / Asia/Jakarta) Otomatis
+  const [serverOffsetMs, setServerOffsetMs] = useState<number>(0);
   const [nowMs, setNowMs] = useState<number>(() => Date.now());
-  const [sessionModalOpen, setSessionModalOpen] = useState(false);
-  const [elevatePin, setElevatePin] = useState("");
-  const [elevateTargetRole, setElevateTargetRole] = useState<
-    "ADMIN" | "MANAGER"
-  >("ADMIN");
 
   const [isOnline, setIsOnline] = useState<boolean>(() =>
     typeof navigator !== "undefined" ? navigator.onLine : true
   );
   const [isSyncing, setIsSyncing] = useState(false);
 
-  // 1. Scan Barcode/QR + Selfie Pendeteksi Wajah + Manual Klik
+  // 1. Scanner Barcode/QR + Selfie Pendeteksi Wajah + Manual Klik
   const [selectedAction, setSelectedAction] = useState<"CLOCK_IN" | "CLOCK_OUT">(
     "CLOCK_IN"
   );
-  const [officeQrCode, setOfficeQrCode] = useState<string>(init.qrCode);
+  const [officeQrCode, setOfficeQrCode] = useState<string>(boot.qrCode);
   const [qrInput, setQrInput] = useState("");
   const [qrCameraOn, setQrCameraOn] = useState(false);
   const [gpsCoords, setGpsCoords] = useState<{
@@ -418,7 +453,7 @@ export default function AbsensiRoleDashboardPage() {
     "idle" | "scanning" | "detected" | "no_face" | "fallback"
   >("idle");
   const [faceText, setFaceText] = useState(
-    "Arahkan wajah ke kamera depan lalu ambil foto selfie."
+    "Arahkan wajah ke kamera depan lalu klik Ambil Foto Selfie."
   );
 
   // 2. Input Jadwal (.PDF / .XLSX / .CSV)
@@ -441,7 +476,7 @@ export default function AbsensiRoleDashboardPage() {
   const [editTimeLocal, setEditTimeLocal] = useState("");
   const [editNotes, setEditNotes] = useState("");
 
-  // 5. Panel Admin & Manager: Data Karyawan & Koordinat GPS
+  // 5. Panel Admin & Manager
   const [empForm, setEmpForm] = useState({
     id: 0,
     emp_code: "",
@@ -451,20 +486,9 @@ export default function AbsensiRoleDashboardPage() {
     pin_code: "1234",
     shift_start_time: "07.00",
   });
-
-  const [locForm, setLocForm] = useState<{
-    id: number;
-    name: string;
-    latitude: string;
-    longitude: string;
-    radius_meters: string;
-  }>({
-    id: init.locations[0]?.id || 1,
-    name: init.locations[0]?.name || "Kantor Utama MPI-BTG",
-    latitude: String(init.locations[0]?.latitude ?? "-6.91"),
-    longitude: String(init.locations[0]?.longitude ?? "109.73"),
-    radius_meters: String(init.locations[0]?.radius_meters ?? "150"),
-  });
+  const [radiusInput, setRadiusInput] = useState<string>(
+    String(boot.locations[0]?.radius_meters || 150)
+  );
 
   const [toast, setToast] = useState<{
     type: "ok" | "warn" | "err";
@@ -486,45 +510,55 @@ export default function AbsensiRoleDashboardPage() {
     []
   );
 
-  // Sinkronisasi jam waktu Indonesia otomatis setiap detik
+  // Sinkronisasi Jam Indonesia (WIB) setiap detik
   useEffect(() => {
-    const syncTimer = window.setInterval(() => {
-      setNowMs(Date.now());
+    const interval = window.setInterval(() => {
+      setNowMs(Date.now() + serverOffsetMs);
     }, 1000);
-    return () => clearInterval(syncTimer);
-  }, []);
+    return () => clearInterval(interval);
+  }, [serverOffsetMs]);
 
-  const activeEmployee = useMemo(
+  const syncedIsoNow = useMemo(() => new Date(nowMs).toISOString(), [nowMs]);
+
+  const indonesiaClockWIB = useMemo(
     () =>
-      employees.find((e) => Number(e.id) === Number(selectedEmpId)) ||
-      employees[0],
-    [employees, selectedEmpId]
+      new Intl.DateTimeFormat("id-ID", {
+        timeZone: "Asia/Jakarta",
+        weekday: "long",
+        day: "2-digit",
+        month: "short",
+        year: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+      }).format(new Date(nowMs)) + " WIB",
+    [nowMs]
   );
 
-  const activeRole: RoleType = isStaffDeviceLocked
-    ? "STAFF"
-    : activeEmployee?.role || "ADMIN";
+  const staffList = useMemo(
+    () => employees.filter((e) => e.role === "STAFF"),
+    [employees]
+  );
 
-  const isAdmin = activeRole === "ADMIN";
-  const isManager = activeRole === "MANAGER";
-  const hasFullAccessServer = !isStaffDeviceLocked && (isAdmin || isManager);
+  const activeUser = useMemo(() => {
+    if (isDeviceLockedKaryawan || serverMode === "KARYAWAN") {
+      return (
+        staffList.find((e) => Number(e.id) === Number(staffEmpId)) ||
+        staffList[0] ||
+        DEFAULT_EMPLOYEES[2]
+      );
+    }
+    if (serverMode === "MANAGER") {
+      return (
+        employees.find((e) => e.role === "MANAGER") || DEFAULT_EMPLOYEES[1]
+      );
+    }
+    return employees.find((e) => e.role === "ADMIN") || DEFAULT_EMPLOYEES[0];
+  }, [isDeviceLockedKaryawan, serverMode, staffList, staffEmpId, employees]);
 
-  const liveIndonesiaClock = useMemo(() => {
-    const timeStr = new Date(nowMs).toLocaleTimeString("id-ID", {
-      timeZone: indoTz,
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
-    });
-    const dateStr = new Date(nowMs).toLocaleDateString("id-ID", {
-      timeZone: indoTz,
-      weekday: "short",
-      day: "2-digit",
-      month: "short",
-      year: "numeric",
-    });
-    return `${dateStr} • ${timeStr} ${getTzLabel(indoTz)}`;
-  }, [nowMs, indoTz]);
+  const isKaryawanMode = isDeviceLockedKaryawan || serverMode === "KARYAWAN";
+  const isManagerServer = !isKaryawanMode && serverMode === "MANAGER";
+  const isAdminServer = !isKaryawanMode && serverMode === "ADMIN";
 
   const stopQrCam = useCallback(() => {
     if (qrRafRef.current !== null) {
@@ -571,7 +605,7 @@ export default function AbsensiRoleDashboardPage() {
           notify("ok", `${data.syncedCount || queue.length} data tersinkron.`);
         }
       } catch {
-        // Tetap di antrean lokal
+        // Tetap simpan lokal
       } finally {
         setIsSyncing(false);
       }
@@ -581,7 +615,8 @@ export default function AbsensiRoleDashboardPage() {
 
   const refreshServer = useCallback(async () => {
     if (!navigator.onLine) {
-      notify("warn", "Offline: memakai data tersimpan di perangkat.");
+      setNowMs(Date.now() + serverOffsetMs);
+      notify("warn", "Offline: jam WIB tersinkronisasi lokal.");
       return;
     }
     setIsSyncing(true);
@@ -591,40 +626,58 @@ export default function AbsensiRoleDashboardPage() {
       if (pending.length > 0) await syncOfflineQueue(pending);
 
       const res = await fetch("/api/bootstrap", { cache: "no-store" });
+      const headerDate = res.headers.get("date");
+      let offset = serverOffsetMs;
+      if (headerDate) {
+        const srvMs = new Date(headerDate).getTime();
+        if (!isNaN(srvMs)) {
+          offset = srvMs - Date.now();
+          setServerOffsetMs(offset);
+        }
+      }
+      setNowMs(Date.now() + offset);
+
       if (res.ok) {
         const data = await res.json();
         if (data.ok) {
-          if (Array.isArray(data.employees) && data.employees.length > 0) {
-            setEmployees(
-              data.employees.map((e: Employee) => ({
-                ...e,
-                shift_start_time: normalizeShiftTime(e.shift_start_time),
-              }))
-            );
-          }
-          if (Array.isArray(data.locations) && data.locations.length > 0) {
-            setLocations(data.locations);
-          }
-          if (Array.isArray(data.entries)) {
-            setServerEntries(data.entries);
-          }
+          const nextEmps: Employee[] =
+            Array.isArray(data.employees) && data.employees.length > 0
+              ? data.employees.map((e: Employee) => ({
+                  ...e,
+                  shift_start_time: normalizeShiftTime(e.shift_start_time),
+                }))
+              : DEFAULT_EMPLOYEES;
+          const nextLocs = enforceLockedLocation(
+            Array.isArray(data.locations) && data.locations.length > 0
+              ? data.locations
+              : DEFAULT_LOCATIONS
+          );
+          const nextEntries: TimeEntry[] = Array.isArray(data.entries)
+            ? data.entries
+            : [];
+
+          setEmployees(nextEmps);
+          setLocations(nextLocs);
+          setRadiusInput(String(nextLocs[0]?.radius_meters || 150));
+          setServerEntries(nextEntries);
           localStorage.setItem(
             CACHE_KEY,
             JSON.stringify({
-              employees: data.employees || DEFAULT_EMPLOYEES,
-              locations: data.locations || DEFAULT_LOCATIONS,
-              entries: data.entries || [],
+              employees: nextEmps,
+              locations: nextLocs,
+              entries: nextEntries,
             })
           );
-          notify("ok", "Jam Indonesia & server tersinkronisasi.");
+          notify("ok", "Jam WIB & data server tersinkronisasi otomatis.");
         }
       }
     } catch {
-      notify("warn", "Gagal terhubung ke server, memakai cache lokal.");
+      setNowMs(Date.now() + serverOffsetMs);
+      notify("warn", "Gagal sinkron server; memakai jam WIB perangkat.");
     } finally {
       setIsSyncing(false);
     }
-  }, [notify, syncOfflineQueue]);
+  }, [notify, syncOfflineQueue, serverOffsetMs]);
 
   useEffect(() => {
     const onOnline = () => {
@@ -638,10 +691,11 @@ export default function AbsensiRoleDashboardPage() {
     window.addEventListener("online", onOnline);
     window.addEventListener("offline", onOffline);
 
+    let watchId: number | null = null;
     const t = window.setTimeout(() => {
       void refreshServer();
       if ("geolocation" in navigator) {
-        navigator.geolocation.getCurrentPosition(
+        watchId = navigator.geolocation.watchPosition(
           (pos) => {
             setGpsCoords({
               lat: pos.coords.latitude,
@@ -649,15 +703,18 @@ export default function AbsensiRoleDashboardPage() {
             });
           },
           () => {
-            // Biarkan default
+            // Abaikan error GPS sementara
           },
-          { enableHighAccuracy: true, timeout: 8000, maximumAge: 15000 }
+          { enableHighAccuracy: true, timeout: 10000, maximumAge: 5000 }
         );
       }
     }, 0);
 
     return () => {
       clearTimeout(t);
+      if (watchId !== null && "geolocation" in navigator) {
+        navigator.geolocation.clearWatch(watchId);
+      }
       window.removeEventListener("online", onOnline);
       window.removeEventListener("offline", onOffline);
       stopQrCam();
@@ -665,42 +722,32 @@ export default function AbsensiRoleDashboardPage() {
     };
   }, [refreshServer, notify, stopQrCam, stopSelfieCam]);
 
-  const geofence = useMemo(() => {
-    if (!gpsCoords || locations.length === 0) return null;
-    let best = locations[0];
-    let minD = haversineMeters(
-      gpsCoords.lat,
-      gpsCoords.lng,
-      Number(best.latitude),
-      Number(best.longitude)
-    );
-    for (const loc of locations) {
-      const d = haversineMeters(
-        gpsCoords.lat,
-        gpsCoords.lng,
-        Number(loc.latitude),
-        Number(loc.longitude)
-      );
-      if (d < minD) {
-        minD = d;
-        best = loc;
-      }
-    }
-    return {
-      location: best,
-      distance: minD,
-      inside: minD <= Number(best.radius_meters || 150),
-    };
-  }, [gpsCoords, locations]);
-
-  const activeRadiusMeters = Number(
-    geofence?.location.radius_meters || locations[0]?.radius_meters || 150
+  // Koordinat kantor terkunci permanen pada -6.9148609, 109.7446830
+  const activeRadiusMeters = useMemo(
+    () => Number(locations[0]?.radius_meters || 150),
+    [locations]
   );
 
+  const geofence = useMemo(() => {
+    if (!gpsCoords) return null;
+    const dist = haversineMeters(
+      gpsCoords.lat,
+      gpsCoords.lng,
+      LOCKED_LAT,
+      LOCKED_LNG
+    );
+    return {
+      distance: dist,
+      inside: dist <= activeRadiusMeters,
+    };
+  }, [gpsCoords, activeRadiusMeters]);
+
   const geofenceLabel = useMemo(() => {
-    if (!geofence) return "GPS: Jarak 46m (Aman)";
+    if (!geofence) {
+      return `Mendeteksi GPS... Titik Kantor Terkunci (${LOCKED_LAT}, ${LOCKED_LNG})`;
+    }
     return `GPS: Jarak ${geofence.distance}m (${
-      geofence.inside ? "Aman" : "Di Luar Radius"
+      geofence.inside ? "Aman • Di Dalam Radius" : "Di Luar Radius Kantor"
     })`;
   }, [geofence]);
 
@@ -713,38 +760,38 @@ export default function AbsensiRoleDashboardPage() {
     );
   }, [serverEntries, offlineQueue]);
 
-  // Cooldown 6 jam setelah absen masuk maupun keluar
-  const employeeCooldown = useMemo(() => {
-    if (!activeEmployee) {
+  // Kunci absen ganda selama 6 jam
+  const cooldownInfo = useMemo(() => {
+    if (!activeUser) {
       return {
         locked: false,
-        label: "",
+        remainingText: "",
         lastEntry: null as TimeEntry | null,
       };
     }
-    const empEntries = allEntries
-      .filter((e) => Number(e.employee_id) === Number(activeEmployee.id))
+    const mine = allEntries
+      .filter((e) => Number(e.employee_id) === Number(activeUser.id))
       .sort(
         (a, b) =>
           new Date(b.punched_at).getTime() - new Date(a.punched_at).getTime()
       );
-    const lastEntry = empEntries[0] || null;
-    if (!lastEntry) {
-      return { locked: false, label: "", lastEntry: null };
+    const last = mine[0] || null;
+    if (!last) {
+      return { locked: false, remainingText: "", lastEntry: null };
     }
-    const elapsed = nowMs - new Date(lastEntry.punched_at).getTime();
-    if (elapsed >= 0 && elapsed < SIX_HOURS_MS) {
-      const totalMins = Math.ceil((SIX_HOURS_MS - elapsed) / 60000);
-      const hrs = Math.floor(totalMins / 60);
-      const mins = totalMins % 60;
+    const diff = nowMs - new Date(last.punched_at).getTime();
+    if (diff >= 0 && diff < SIX_HOURS_MS) {
+      const remMins = Math.ceil((SIX_HOURS_MS - diff) / 60000);
+      const h = Math.floor(remMins / 60);
+      const m = remMins % 60;
       return {
         locked: true,
-        label: hrs > 0 ? `${hrs} jam ${mins} menit` : `${mins} menit`,
-        lastEntry,
+        remainingText: h > 0 ? `${h} jam ${m} menit` : `${m} menit`,
+        lastEntry: last,
       };
     }
-    return { locked: false, label: "", lastEntry };
-  }, [activeEmployee, allEntries, nowMs]);
+    return { locked: false, remainingText: "", lastEntry: last };
+  }, [activeUser, allEntries, nowMs]);
 
   const startScannerCamera = async () => {
     try {
@@ -774,7 +821,9 @@ export default function AbsensiRoleDashboardPage() {
           if (!qrVideoRef.current || !qrVideoRef.current.srcObject) return;
           try {
             const codes = await detector.detect(qrVideoRef.current);
-            const raw = codes[0]?.rawValue?.trim();
+            const raw = (codes[0]?.rawValue || codes[0]?.raw_value || "")
+              .trim()
+              .toUpperCase();
             if (raw) {
               setQrInput(raw);
               stopQrCam();
@@ -790,12 +839,12 @@ export default function AbsensiRoleDashboardPage() {
       } else {
         notify(
           "warn",
-          "Kamera aktif. Masukkan kode secara manual bila scanner otomatis tidak didukung."
+          "Kamera scanner aktif. Ketik kode manual jika tidak terbaca otomatis."
         );
       }
     } catch {
       setQrCameraOn(false);
-      notify("warn", "Kamera scanner terkendala. Gunakan input manual.");
+      notify("warn", "Kamera terkendala. Masukkan kode barcode/QR manual.");
     }
   };
 
@@ -890,8 +939,8 @@ export default function AbsensiRoleDashboardPage() {
 
     if (FD && !detected) {
       setFaceStatus("no_face");
-      setFaceText("Wajah tidak terdeteksi. Posisikan wajah tepat di kamera.");
-      notify("err", "Wajah belum terdeteksi! Arahkan wajah ke kamera.");
+      setFaceText("Wajah tidak terdeteksi. Arahkan wajah ke kamera.");
+      notify("err", "Wajah belum terdeteksi!");
       return;
     }
 
@@ -904,7 +953,7 @@ export default function AbsensiRoleDashboardPage() {
     const dataUrl = c.toDataURL("image/jpeg", 0.65);
     setCapturedSelfie(dataUrl);
     setFaceStatus(FD ? "detected" : "fallback");
-    setFaceText("Selfie wajah siap digunakan untuk absen.");
+    setFaceText("Selfie wajah tersimpan.");
     stopSelfieCam();
     notify("ok", "Selfie wajah berhasil diambil.");
   };
@@ -913,18 +962,16 @@ export default function AbsensiRoleDashboardPage() {
     typeOverride?: "CLOCK_IN" | "CLOCK_OUT",
     manualCodeOverride?: string
   ) => {
-    if (!activeEmployee) return;
-    const currentMs = Date.now();
-    setNowMs(currentMs);
+    if (!activeUser) return;
+    const syncedNow = Date.now() + serverOffsetMs;
+    setNowMs(syncedNow);
 
-    if (employeeCooldown.locked) {
+    if (cooldownInfo.locked) {
       notify(
         "err",
         `Sudah absen ${
-          employeeCooldown.lastEntry?.entry_type === "CLOCK_IN"
-            ? "MASUK"
-            : "KELUAR"
-        }. Absen ganda dikunci; kembali normal dalam ${employeeCooldown.label} (6 jam).`
+          cooldownInfo.lastEntry?.entry_type === "CLOCK_IN" ? "MASUK" : "KELUAR"
+        }. Absen normal lagi setelah 6 jam (sisa ${cooldownInfo.remainingText}).`
       );
       return;
     }
@@ -935,49 +982,58 @@ export default function AbsensiRoleDashboardPage() {
     if (enteredCode !== officeQrCode.trim().toUpperCase()) {
       notify(
         "err",
-        `Kode Barcode/QR tidak valid! Gunakan kode resmi (${officeQrCode}).`
+        `Kode Barcode/QR salah! Gunakan QR resmi (${officeQrCode}).`
       );
       return;
     }
 
-    if (geofence && !geofence.inside) {
-      notify(
-        "err",
-        `Di luar radius kantor (${geofence.distance}m > ${geofence.location.radius_meters}m).`
-      );
-      return;
+    // Validasi ketat untuk Karyawan: wajib di titik koordinat (-6.9148609, 109.7446830) & wajib selfie wajah
+    if (isKaryawanMode) {
+      if (!gpsCoords) {
+        notify(
+          "err",
+          "GPS wajib aktif agar sistem memverifikasi lokasi kantor (-6.9148609, 109.7446830)."
+        );
+        return;
+      }
+      if (geofence && !geofence.inside) {
+        notify(
+          "err",
+          `Ditolak! Anda berada ${geofence.distance}m dari kantor (maks ${activeRadiusMeters}m). Tidak bisa absen di tempat lain.`
+        );
+        return;
+      }
+      if (!capturedSelfie) {
+        notify(
+          "err",
+          "Wajib ambil foto selfie pendeteksi wajah sebelum absen."
+        );
+        return;
+      }
     }
 
-    // Karyawan di perangkat terkunci wajib selfie pendeteksi wajah
-    if (isStaffDeviceLocked && !capturedSelfie) {
-      notify(
-        "err",
-        "Wajib ambil foto selfie pendeteksi wajah sebelum klik MASUK atau KELUAR."
-      );
-      return;
-    }
-
-    const punchedAtIso = new Date(currentMs).toISOString();
+    const punchedAtIso = new Date(syncedNow).toISOString();
     const uuid =
       typeof crypto !== "undefined" && crypto.randomUUID
         ? crypto.randomUUID()
-        : `${currentMs}-${Math.random().toString(36).slice(2)}`;
+        : `${syncedNow}-${Math.random().toString(36).slice(2)}`;
 
     const newPunch: TimeEntry = {
       client_uuid: uuid,
-      employee_id: Number(activeEmployee.id),
+      employee_id: Number(activeUser.id),
       entry_type: entryType,
       punched_at: punchedAtIso,
       is_offline_sync: !navigator.onLine,
       qr_code: enteredCode,
-      mode: capturedSelfie ? "BARCODE + WAJAH + KLIK" : "BARCODE + KLIK",
-      latitude: gpsCoords?.lat ?? null,
-      longitude: gpsCoords?.lng ?? null,
-      distance_meters: geofence?.distance ?? 46,
+      mode: capturedSelfie ? "BARCODE + WAJAH" : "BARCODE + GPS",
+      latitude: gpsCoords?.lat ?? LOCKED_LAT,
+      longitude: gpsCoords?.lng ?? LOCKED_LNG,
+      distance_meters: geofence?.distance ?? 0,
       is_within_geofence: geofence ? geofence.inside : true,
       selfie_data: capturedSelfie,
-      full_name: activeEmployee.full_name,
-      emp_code: activeEmployee.emp_code,
+      face_detected: Boolean(capturedSelfie && faceStatus !== "no_face"),
+      full_name: activeUser.full_name,
+      emp_code: activeUser.emp_code,
     };
 
     const nextQueue = [newPunch, ...offlineQueue];
@@ -986,7 +1042,7 @@ export default function AbsensiRoleDashboardPage() {
     setQrInput("");
     setCapturedSelfie(null);
     setFaceStatus("idle");
-    setFaceText("Arahkan wajah ke kamera depan lalu ambil foto selfie.");
+    setFaceText("Arahkan wajah ke kamera depan lalu klik Ambil Foto Selfie.");
 
     if (navigator.onLine) {
       await syncOfflineQueue(nextQueue);
@@ -995,56 +1051,48 @@ export default function AbsensiRoleDashboardPage() {
     notify(
       "ok",
       entryType === "CLOCK_IN"
-        ? `Absen MASUK tercatat (${formatTimeInTz(punchedAtIso, indoTz)}).`
-        : `Absen KELUAR tercatat (${formatTimeInTz(punchedAtIso, indoTz)}).`
+        ? "Absen MASUK tercatat sesuai jam WIB!"
+        : "Absen KELUAR tercatat sesuai jam WIB!"
     );
   };
 
-  // Switch ke mode perangkat karyawan terkunci (karyawan tidak bisa akses Admin/Manager dari HP)
-  const lockDeviceToEmployee = (staffEmp: Employee) => {
+  // Kunci perangkat HP karyawan secara permanen
+  const lockDeviceToKaryawan = () => {
     stopQrCam();
     stopSelfieCam();
-    setSelectedEmpId(Number(staffEmp.id));
-    setIsStaffDeviceLocked(true);
-    localStorage.setItem(ACTIVE_EMP_KEY, String(staffEmp.id));
-    localStorage.setItem(STAFF_DEVICE_LOCK_KEY, "1");
-    setSessionModalOpen(false);
+    localStorage.setItem(DEVICE_LOCK_KEY, "1");
+    localStorage.removeItem(AUTH_SERVER_KEY);
+    setIsDeviceLockedKaryawan(true);
+    setIsPrivilegedAuthed(false);
+    setServerMode("KARYAWAN");
+    if (typeof window !== "undefined") {
+      const url = new URL(window.location.href);
+      url.searchParams.set("server", "karyawan");
+      window.history.replaceState({}, "", url.toString());
+    }
     notify(
       "ok",
-      `Perangkat dikunci ke Mode Karyawan (${staffEmp.full_name}). Dashboard Admin & Manager disembunyikan.`
+      "Perangkat dikunci ke Server Karyawan (Mode Terbatas). Akses Manager & Admin diblokir."
     );
   };
 
-  // Buka akses server Admin / Manager menggunakan PIN khusus
-  const unlockPrivilegedServer = () => {
-    const candidate = employees.find(
-      (e) =>
-        e.role === elevateTargetRole &&
-        (e.pin_code === elevatePin.trim() ||
-          (elevateTargetRole === "ADMIN" && elevatePin.trim() === "0000") ||
-          (elevateTargetRole === "MANAGER" && elevatePin.trim() === "2222"))
-    );
-    if (!candidate) {
-      notify(
-        "err",
-        `PIN ${elevateTargetRole} tidak valid! (Default PIN Admin: 0000, Manager: 2222)`
-      );
-      return;
+  const verifyPrivilegedLogin = () => {
+    const expectedPin = activeUser?.pin_code || (isManagerServer ? "2026" : "0000");
+    if (pinEntry.trim() === expectedPin) {
+      localStorage.setItem(AUTH_SERVER_KEY, serverMode);
+      setIsPrivilegedAuthed(true);
+      setPinEntry("");
+      notify("ok", `Login ${serverMode} berhasil.`);
+    } else {
+      notify("err", `PIN ${serverMode} salah.`);
     }
-    setSelectedEmpId(Number(candidate.id));
-    setIsStaffDeviceLocked(false);
-    setElevatePin("");
-    localStorage.setItem(ACTIVE_EMP_KEY, String(candidate.id));
-    localStorage.setItem(STAFF_DEVICE_LOCK_KEY, "0");
-    setSessionModalOpen(false);
-    notify("ok", `Masuk ke Server ${candidate.role} (${candidate.full_name}).`);
   };
 
-  const todayStr = getDateStrInTz(undefined, indoTz);
+  const todayStr = getJakartaDateStr(syncedIsoNow);
 
   const summaryToday = useMemo(() => {
     const todayEntries = allEntries.filter(
-      (e) => getDateStrInTz(e.punched_at, indoTz) === todayStr
+      (e) => getJakartaDateStr(e.punched_at) === todayStr
     );
     const inIds = new Set<number>();
     const outIds = new Set<number>();
@@ -1057,11 +1105,7 @@ export default function AbsensiRoleDashboardPage() {
       if (item.entry_type === "CLOCK_IN") {
         inIds.add(Number(item.employee_id));
         if (
-          calcLateMinutes(
-            item.punched_at,
-            emp?.shift_start_time || "07.00",
-            indoTz
-          ) > 0
+          calcLateMinutes(item.punched_at, emp?.shift_start_time || "07.00") > 0
         ) {
           lateCount++;
         }
@@ -1075,7 +1119,7 @@ export default function AbsensiRoleDashboardPage() {
       terlambat: lateCount,
       keluar: outIds.size,
     };
-  }, [allEntries, todayStr, employees, indoTz]);
+  }, [allEntries, todayStr, employees]);
 
   const filteredEntries = useMemo(() => {
     const limitDays =
@@ -1083,20 +1127,16 @@ export default function AbsensiRoleDashboardPage() {
     const minMs = nowMs - limitDays * 86400000;
     return allEntries.filter((e) => {
       if (reportFilter === "Harian") {
-        return getDateStrInTz(e.punched_at, indoTz) === todayStr;
+        return getJakartaDateStr(e.punched_at) === todayStr;
       }
       return new Date(e.punched_at).getTime() >= minMs;
     });
-  }, [allEntries, reportFilter, todayStr, nowMs, indoTz]);
+  }, [allEntries, reportFilter, todayStr, nowMs]);
 
-  const handleScheduleUpload = async (
-    e: React.ChangeEvent<HTMLInputElement>
-  ) => {
-    if (!hasFullAccessServer) return;
+  const handleScheduleFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
     setScheduleFileName(file.name);
-
     try {
       const isPdf =
         file.type === "application/pdf" ||
@@ -1112,11 +1152,12 @@ export default function AbsensiRoleDashboardPage() {
         parsed = parseScheduleLines(extractLinesFromPdfBytes(bytes));
       } else {
         const text = await file.text();
-        const csvLines = text
-          .split(/\r?\n/)
-          .map((l) => l.trim())
-          .filter(Boolean);
-        parsed = parseScheduleLines(csvLines);
+        parsed = parseScheduleLines(
+          text
+            .split(/\r?\n/)
+            .map((l) => l.trim())
+            .filter(Boolean)
+        );
       }
 
       setSchedulePreview(parsed);
@@ -1127,14 +1168,14 @@ export default function AbsensiRoleDashboardPage() {
               r.emp_code.toLowerCase() === emp.emp_code.toLowerCase() ||
               r.full_name.toLowerCase() === emp.full_name.toLowerCase()
           );
-          if (!match) return emp;
-          return {
-            ...emp,
-            shift_start_time: normalizeShiftTime(match.shift_time),
-          };
+          return match
+            ? { ...emp, shift_start_time: normalizeShiftTime(match.shift_time) }
+            : emp;
         });
         setEmployees(updated);
-        notify("ok", `${parsed.length} jadwal dari ${file.name} diterapkan.`);
+        notify("ok", `${parsed.length} jadwal dimuat dari ${file.name}.`);
+      } else {
+        notify("warn", `File ${file.name} dibaca tanpa baris jadwal cocok.`);
       }
     } catch {
       notify("err", `Gagal memproses ${file.name}.`);
@@ -1143,8 +1184,8 @@ export default function AbsensiRoleDashboardPage() {
     }
   };
 
-  const exportReport = (format: "XLSX" | "PDF" | "CSV") => {
-    if (!hasFullAccessServer) return;
+  const exportReport = (format: "XLSX" | "CSV" | "PDF") => {
+    if (isKaryawanMode) return;
     if (format === "PDF") {
       window.print();
       return;
@@ -1162,19 +1203,18 @@ export default function AbsensiRoleDashboardPage() {
       const emp = employees.find(
         (e) => Number(e.id) === Number(item.employee_id)
       );
-      const lateM = calcLateMinutes(
+      const lateMins = calcLateMinutes(
         item.punched_at,
-        emp?.shift_start_time || "07.00",
-        indoTz
+        emp?.shift_start_time || "07.00"
       );
       return [
-        getDateStrInTz(item.punched_at, indoTz),
+        getJakartaDateStr(item.punched_at),
         item.full_name || emp?.full_name || "Karyawan",
         item.entry_type === "CLOCK_IN" ? "MASUK" : "KELUAR",
-        formatTimeInTz(item.punched_at, indoTz),
-        lateM > 0 ? `${lateM}m` : "0m",
+        formatTimeWIB(item.punched_at),
+        lateMins > 0 ? `${lateMins}m` : "0m",
         item.is_within_geofence === false ? "LUAR RADIUS" : "HADIR",
-        item.mode || "BARCODE + KLIK",
+        item.mode || "BARCODE + GPS",
       ];
     });
 
@@ -1209,26 +1249,22 @@ export default function AbsensiRoleDashboardPage() {
   };
 
   const startEditEntry = (item: TimeEntry) => {
-    if (!hasFullAccessServer) return;
+    if (isKaryawanMode) return;
     setEditingUuid(item.client_uuid);
     setEditId(item.id);
     setEditType(item.entry_type);
-    setEditTimeLocal(formatDateTimeLocalInTz(item.punched_at, indoTz));
+    setEditTimeLocal(formatDateTimeLocalWIB(item.punched_at));
     setEditNotes(item.notes || "");
   };
 
   const commitEditEntry = async () => {
-    if (!hasFullAccessServer || !editingUuid) return;
-    const offset =
-      indoTz === "Asia/Jakarta"
-        ? "+07:00"
-        : indoTz === "Asia/Makassar"
-        ? "+08:00"
-        : "+09:00";
+    if (isKaryawanMode || !editingUuid) return;
     const d = editTimeLocal
-      ? new Date(`${editTimeLocal}:00${offset}`)
-      : new Date();
-    const nextIso = isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString();
+      ? new Date(`${editTimeLocal}:00+07:00`)
+      : new Date(nowMs);
+    const nextIso = isNaN(d.getTime())
+      ? new Date(nowMs).toISOString()
+      : d.toISOString();
 
     setServerEntries((prev) =>
       prev.map((x) =>
@@ -1263,16 +1299,17 @@ export default function AbsensiRoleDashboardPage() {
             },
           }),
         });
+        await refreshServer();
       } catch {
-        // Pertahankan perubahan
+        // Pertahankan lokal
       }
     }
     setEditingUuid(null);
-    notify("ok", "Data absen diperbarui.");
+    notify("ok", "Waktu & data absen diperbarui.");
   };
 
   const removeEntry = async (item: TimeEntry) => {
-    if (!hasFullAccessServer) return;
+    if (isKaryawanMode) return;
     setServerEntries((prev) =>
       prev.filter(
         (x) =>
@@ -1294,6 +1331,7 @@ export default function AbsensiRoleDashboardPage() {
             payload: { id: item.id, client_uuid: item.client_uuid },
           }),
         });
+        await refreshServer();
       } catch {
         // Abaikan error
       }
@@ -1302,9 +1340,8 @@ export default function AbsensiRoleDashboardPage() {
   };
 
   const saveEmployee = async () => {
-    if (!hasFullAccessServer) return;
-    if (!empForm.emp_code.trim() || !empForm.full_name.trim()) {
-      notify("err", "Isi ID dan Nama Lengkap.");
+    if (isKaryawanMode || !empForm.emp_code.trim() || !empForm.full_name.trim()) {
+      notify("err", "Isi ID dan Nama Lengkap karyawan.");
       return;
     }
     const payload = {
@@ -1316,23 +1353,38 @@ export default function AbsensiRoleDashboardPage() {
       pin_code: empForm.pin_code.trim() || "1234",
       shift_start_time: normalizeShiftTime(empForm.shift_start_time),
     };
+    if (navigator.onLine) {
+      try {
+        const res = await fetch("/api/manage", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "SAVE_EMPLOYEE", payload }),
+        });
+        const data = await res.json();
+        if (data.ok) {
+          await refreshServer();
+          setEmpForm({
+            id: 0,
+            emp_code: "",
+            full_name: "",
+            role: "STAFF",
+            department: "Operasional",
+            pin_code: "1234",
+            shift_start_time: "07.00",
+          });
+          notify("ok", "Data karyawan disimpan.");
+          return;
+        }
+      } catch {
+        // Fallback lokal
+      }
+    }
     setEmployees((prev) => {
       if (empForm.id) {
         return prev.map((e) => (e.id === empForm.id ? { ...e, ...payload } : e));
       }
       return [...prev, { ...payload, id: Date.now() }];
     });
-    if (navigator.onLine) {
-      try {
-        await fetch("/api/manage", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ action: "SAVE_EMPLOYEE", payload }),
-        });
-      } catch {
-        // Abaikan error
-      }
-    }
     setEmpForm({
       id: 0,
       emp_code: "",
@@ -1342,12 +1394,11 @@ export default function AbsensiRoleDashboardPage() {
       pin_code: "1234",
       shift_start_time: "07.00",
     });
-    notify("ok", "Data karyawan tersimpan.");
+    notify("ok", "Data karyawan diperbarui.");
   };
 
   const deleteEmployee = async (id: number) => {
-    if (!hasFullAccessServer) return;
-    setEmployees((prev) => prev.filter((e) => Number(e.id) !== Number(id)));
+    if (isKaryawanMode) return;
     if (navigator.onLine) {
       try {
         await fetch("/api/manage", {
@@ -1355,44 +1406,49 @@ export default function AbsensiRoleDashboardPage() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ action: "DELETE_EMPLOYEE", payload: { id } }),
         });
+        await refreshServer();
       } catch {
         // Abaikan error
       }
     }
-    notify("ok", "Karyawan dihapus.");
+    setEmployees((prev) => prev.filter((e) => e.id !== id));
+    notify("ok", "Anggota karyawan dihapus.");
   };
 
-  const saveLocation = async () => {
-    if (!hasFullAccessServer) return;
-    if (!locForm.name.trim() || !locForm.latitude || !locForm.longitude) {
-      notify("err", "Isi nama lokasi, latitude, dan longitude.");
-      return;
-    }
-    const payload = {
-      id: locForm.id || undefined,
-      name: locForm.name.trim(),
-      latitude: Number(locForm.latitude),
-      longitude: Number(locForm.longitude),
-      radius_meters: Number(locForm.radius_meters) || 150,
-    };
-    setLocations((prev) => {
-      if (locForm.id) {
-        return prev.map((l) => (l.id === locForm.id ? { ...l, ...payload } : l));
-      }
-      return [...prev, { ...payload, id: Date.now() }];
-    });
+  const saveLockedRadius = async () => {
+    if (isKaryawanMode) return;
+    const rad = Math.max(10, Number(radiusInput) || 150);
+    const updated = enforceLockedLocation(
+      locations.map((loc, idx) =>
+        idx === 0
+          ? {
+              ...loc,
+              latitude: LOCKED_LAT,
+              longitude: LOCKED_LNG,
+              radius_meters: rad,
+            }
+          : loc
+      )
+    );
+    setLocations(updated);
     if (navigator.onLine) {
       try {
         await fetch("/api/manage", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ action: "SAVE_LOCATION", payload }),
+          body: JSON.stringify({
+            action: "SAVE_LOCATION",
+            payload: updated[0],
+          }),
         });
       } catch {
-        // Abaikan error
+        // Tetap terkunci
       }
     }
-    notify("ok", "Koordinat GPS & radius diperbarui.");
+    notify(
+      "ok",
+      `Radius ${rad}m disimpan. Posisi asli terkunci (${LOCKED_LAT}, ${LOCKED_LNG}).`
+    );
   };
 
   const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(
@@ -1400,11 +1456,91 @@ export default function AbsensiRoleDashboardPage() {
   )}`;
 
   const myRecentEntries = useMemo(() => {
-    if (!activeEmployee) return [];
+    if (!activeUser) return [];
     return allEntries
-      .filter((e) => Number(e.employee_id) === Number(activeEmployee.id))
+      .filter((e) => Number(e.employee_id) === Number(activeUser.id))
       .slice(0, 5);
-  }, [allEntries, activeEmployee]);
+  }, [allEntries, activeUser]);
+
+  // Gerbang PIN untuk Server MANAGER & Server ADMIN (tidak pernah muncul di perangkat karyawan)
+  if (!isKaryawanMode && !isPrivilegedAuthed) {
+    return (
+      <div className="min-h-screen bg-[#ECEFF4] flex items-center justify-center p-4">
+        <div className="max-w-sm w-full bg-white rounded-2xl p-5 shadow space-y-3.5 border border-slate-200">
+          <div className="flex items-center justify-between">
+            <span className="text-xs font-extrabold uppercase text-slate-900">
+              {isManagerServer ? "Server Manager" : "Server Administrator"}
+            </span>
+            <span
+              className={`px-2 py-0.5 rounded text-[9px] font-extrabold ${
+                isManagerServer
+                  ? "bg-amber-100 text-amber-800"
+                  : "bg-indigo-100 text-indigo-800"
+              }`}
+            >
+              {serverMode}
+            </span>
+          </div>
+
+          <div className="text-[11px] font-mono text-emerald-700 bg-emerald-50 px-2.5 py-1.5 rounded-lg">
+            {indonesiaClockWIB}
+          </div>
+
+          {toast && (
+            <div className="px-3 py-2 rounded-lg bg-rose-600 text-white text-xs font-bold">
+              {toast.text}
+            </div>
+          )}
+
+          <p className="text-xs text-slate-500">
+            Masukkan PIN {serverMode} ({activeUser?.full_name}) untuk akses penuh
+            dasbor.
+          </p>
+
+          <input
+            type="password"
+            inputMode="numeric"
+            placeholder={
+              isManagerServer
+                ? "PIN Manager (default: 2026)"
+                : "PIN Admin (default: 0000)"
+            }
+            value={pinEntry}
+            onChange={(e) => setPinEntry(e.target.value)}
+            className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm text-center tracking-widest"
+          />
+
+          <button
+            type="button"
+            onClick={verifyPrivilegedLogin}
+            className="w-full py-2.5 rounded-lg bg-blue-600 text-white text-xs font-extrabold"
+          >
+            Buka Server {serverMode}
+          </button>
+
+          <div className="grid grid-cols-2 gap-1.5 pt-2 border-t border-slate-100">
+            <button
+              type="button"
+              onClick={() => {
+                setServerMode(isManagerServer ? "ADMIN" : "MANAGER");
+                setPinEntry("");
+              }}
+              className="py-1.5 rounded-lg bg-slate-100 text-slate-700 text-[11px] font-bold"
+            >
+              {isManagerServer ? "Ke Server Admin" : "Ke Server Manager"}
+            </button>
+            <button
+              type="button"
+              onClick={lockDeviceToKaryawan}
+              className="py-1.5 rounded-lg bg-sky-100 text-sky-800 text-[11px] font-bold"
+            >
+              Kunci HP Karyawan
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-[#ECEFF4] text-slate-900 p-2.5 sm:p-4">
@@ -1423,66 +1559,37 @@ export default function AbsensiRoleDashboardPage() {
           </div>
         )}
 
-        {/* Header Utama + Pembeda Server ADMIN / MANAGER / KARYAWAN + Jam Indonesia Otomatis */}
-        <header
-          className={`text-white rounded-2xl p-3.5 shadow space-y-2.5 ${
-            isStaffDeviceLocked
-              ? "bg-[#111827]"
-              : isManager
-              ? "bg-[#1E1B4B]"
-              : "bg-[#0B1220]"
-          }`}
-        >
+        {/* Header Utama + Jam Indonesia (WIB) Tersinkronisasi Otomatis */}
+        <header className="bg-[#0B1220] text-white rounded-2xl p-3.5 shadow space-y-2.5">
           <div className="flex items-start justify-between gap-2">
             <div>
               <h1 className="text-sm font-extrabold tracking-wide uppercase">
                 APLIKASI ABSENSI QR &amp; GPS
               </h1>
               <p className="text-[11px] text-slate-300 mt-0.5">
-                {activeEmployee?.full_name || "Admin Operasional"} (
-                {activeEmployee?.emp_code || "ADM-001"}) •{" "}
-                {isStaffDeviceLocked
-                  ? "SERVER KARYAWAN (TERBATAS)"
-                  : isManager
-                  ? "SERVER MANAGER (FULL AKSES)"
-                  : "SERVER ADMIN (FULL AKSES)"}
+                {activeUser?.full_name} ({activeUser?.emp_code}) •{" "}
+                {isKaryawanMode ? "KARYAWAN" : serverMode}
               </p>
             </div>
             <span
               className={`px-2 py-0.5 rounded text-[9px] font-extrabold uppercase shrink-0 ${
-                isStaffDeviceLocked
-                  ? "bg-sky-500 text-slate-950"
-                  : isManager
-                  ? "bg-violet-500 text-white"
-                  : "bg-amber-400 text-slate-950"
+                isAdminServer
+                  ? "bg-indigo-500 text-white"
+                  : isManagerServer
+                  ? "bg-amber-500 text-slate-950"
+                  : "bg-sky-600 text-white"
               }`}
             >
-              {isStaffDeviceLocked
-                ? "HP KARYAWAN LOCK"
-                : isManager
-                ? "MANAGER"
-                : "ADMIN"}
+              {isAdminServer
+                ? "SERVER ADMIN • FULL"
+                : isManagerServer
+                ? "SERVER MANAGER • FULL"
+                : "SERVER KARYAWAN • TERBATAS"}
             </span>
           </div>
 
-          {/* Jam Waktu Indonesia Tersinkronisasi Otomatis */}
-          <div className="flex items-center justify-between bg-white/10 rounded-lg px-2.5 py-1.5 text-[11px]">
-            <span className="font-bold text-emerald-300">
-              {liveIndonesiaClock}
-            </span>
-            <select
-              value={indoTz}
-              onChange={(e) => {
-                const nextTz = e.target.value as IndoTzType;
-                setIndoTz(nextTz);
-                localStorage.setItem(TZ_KEY, nextTz);
-              }}
-              className="bg-slate-900 text-white border border-white/20 rounded px-1.5 py-0.5 text-[10px] font-bold"
-            >
-              <option value="Asia/Jakarta">WIB</option>
-              <option value="Asia/Makassar">WITA</option>
-              <option value="Asia/Jayapura">WIT</option>
-            </select>
+          <div className="text-[11px] font-mono text-emerald-300 bg-white/5 px-2.5 py-1.5 rounded-lg">
+            {indonesiaClockWIB}
           </div>
 
           <div className="flex flex-wrap items-center gap-1.5">
@@ -1491,139 +1598,86 @@ export default function AbsensiRoleDashboardPage() {
             </span>
             <button
               type="button"
-              onClick={() => {
-                setNowMs(Date.now());
-                void refreshServer();
-              }}
+              onClick={() => void refreshServer()}
               disabled={isSyncing}
               className="px-2.5 py-1 rounded-md bg-blue-600 hover:bg-blue-700 text-white text-[10px] font-bold"
             >
-              {isSyncing ? "Sync..." : "Refresh Server"}
+              {isSyncing ? "Sinkron..." : "Refresh Server"}
             </button>
-            <button
-              type="button"
-              onClick={() => {
-                stopQrCam();
-                stopSelfieCam();
-                setSessionModalOpen(true);
-              }}
-              className="px-2.5 py-1 rounded-md bg-rose-600 hover:bg-rose-700 text-white text-[10px] font-bold"
-            >
-              {isStaffDeviceLocked ? "Sesi Karyawan" : "Keluar / Mode"}
-            </button>
+
+            {/* Tombol pembeda hanya muncul di Server Admin & Manager; HP Karyawan terkunci penuh */}
+            {!isKaryawanMode && (
+              <>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const nextMode: ServerMode = isAdminServer
+                      ? "MANAGER"
+                      : "ADMIN";
+                    localStorage.removeItem(AUTH_SERVER_KEY);
+                    setIsPrivilegedAuthed(false);
+                    setServerMode(nextMode);
+                  }}
+                  className="px-2.5 py-1 rounded-md bg-amber-500 text-slate-950 text-[10px] font-extrabold"
+                >
+                  {isAdminServer ? "Server Manager" : "Server Admin"}
+                </button>
+                <button
+                  type="button"
+                  onClick={lockDeviceToKaryawan}
+                  className="px-2.5 py-1 rounded-md bg-sky-600 text-white text-[10px] font-bold"
+                >
+                  Mode HP Karyawan
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    localStorage.removeItem(AUTH_SERVER_KEY);
+                    setIsPrivilegedAuthed(false);
+                  }}
+                  className="px-2.5 py-1 rounded-md bg-rose-600 text-white text-[10px] font-bold"
+                >
+                  Keluar
+                </button>
+              </>
+            )}
           </div>
         </header>
 
-        {/* Modal Sesi: Karyawan Terkunci di Mode Absen Saja; Admin/Manager Pakai PIN */}
-        {sessionModalOpen && (
-          <section className="bg-white rounded-2xl p-3.5 border border-slate-200 shadow-sm space-y-2.5">
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-extrabold text-slate-800">
-                {isStaffDeviceLocked
-                  ? "Mode Karyawan Terkunci di Perangkat Ini"
-                  : "Pilih Mode Server & Karyawan"}
-              </span>
-              <button
-                type="button"
-                onClick={() => setSessionModalOpen(false)}
-                className="text-[11px] font-bold px-2 py-0.5 rounded bg-slate-100"
-              >
-                Tutup
-              </button>
-            </div>
-
-            {/* Daftar Akun Karyawan (STAFF) */}
-            <div className="space-y-1.5">
-              <div className="text-[10px] font-bold text-slate-500 uppercase">
-                Akun Karyawan (Hanya Dashboard Absen)
-              </div>
-              {employees
-                .filter((e) => e.role === "STAFF")
-                .map((staff) => (
-                  <button
-                    key={staff.id}
-                    type="button"
-                    onClick={() => lockDeviceToEmployee(staff)}
-                    className={`w-full p-2.5 rounded-xl border text-left flex items-center justify-between text-xs ${
-                      isStaffDeviceLocked &&
-                      Number(staff.id) === Number(activeEmployee?.id)
-                        ? "border-sky-600 bg-sky-50 font-bold"
-                        : "border-slate-200 bg-slate-50"
-                    }`}
-                  >
-                    <span>
-                      {staff.full_name} ({staff.emp_code})
-                    </span>
-                    <span className="text-[10px] font-extrabold px-2 py-0.5 rounded bg-sky-100 text-sky-800">
-                      KUNCI KE HP KARYAWAN
-                    </span>
-                  </button>
-                ))}
-            </div>
-
-            {/* Buka Server ADMIN atau MANAGER dengan PIN */}
-            <div className="pt-2.5 border-t border-slate-200 space-y-2">
-              <div className="text-[10px] font-bold text-slate-600 uppercase">
-                Akses Server ADMIN / MANAGER (Wajib PIN)
-              </div>
-              <div className="grid grid-cols-2 gap-1.5">
-                <button
-                  type="button"
-                  onClick={() => setElevateTargetRole("ADMIN")}
-                  className={`py-1.5 rounded-lg text-[11px] font-bold border ${
-                    elevateTargetRole === "ADMIN"
-                      ? "bg-slate-900 text-white border-slate-900"
-                      : "bg-white text-slate-700"
-                  }`}
-                >
-                  Server ADMIN
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setElevateTargetRole("MANAGER")}
-                  className={`py-1.5 rounded-lg text-[11px] font-bold border ${
-                    elevateTargetRole === "MANAGER"
-                      ? "bg-violet-700 text-white border-violet-700"
-                      : "bg-white text-slate-700"
-                  }`}
-                >
-                  Server MANAGER
-                </button>
-              </div>
-              <div className="flex gap-1.5">
-                <input
-                  type="password"
-                  inputMode="numeric"
-                  placeholder={`PIN ${elevateTargetRole}`}
-                  value={elevatePin}
-                  onChange={(e) => setElevatePin(e.target.value)}
-                  className="flex-1 rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs"
-                />
-                <button
-                  type="button"
-                  onClick={unlockPrivilegedServer}
-                  className="px-3 py-1.5 rounded-lg bg-blue-600 text-white text-xs font-bold"
-                >
-                  Buka Server
-                </button>
-              </div>
-            </div>
+        {/* Pemilih Nama Karyawan di HP Karyawan (Hanya akun STAFF, tanpa akses Manager/Admin) */}
+        {isKaryawanMode && (
+          <section className="bg-white rounded-2xl p-3 border border-slate-200/80 shadow-sm space-y-1.5">
+            <label className="block text-[11px] font-extrabold text-slate-700">
+              Pilih Nama Karyawan
+            </label>
+            <select
+              value={activeUser?.id || ""}
+              onChange={(e) => {
+                const nextId = Number(e.target.value);
+                setStaffEmpId(nextId);
+                localStorage.setItem(STAFF_EMP_KEY, String(nextId));
+              }}
+              className="w-full rounded-lg border border-slate-300 px-2.5 py-2 text-xs font-bold bg-slate-50"
+            >
+              {staffList.map((emp) => (
+                <option key={emp.id} value={emp.id}>
+                  {emp.full_name} ({emp.emp_code}) • Shift{" "}
+                  {emp.shift_start_time || "07.00"}
+                </option>
+              ))}
+            </select>
           </section>
         )}
 
-        {/* Monitoring Kehadiran Hari Ini (Hanya Server ADMIN & MANAGER) */}
-        {hasFullAccessServer && (
-          <section
-            className={`bg-white rounded-2xl p-3.5 border-t-4 border border-slate-200/80 shadow-sm space-y-2.5 ${
-              isManager ? "border-t-violet-600" : "border-t-blue-600"
-            }`}
-          >
+        {/* Monitoring Kehadiran Hari Ini (Hanya Server MANAGER & ADMIN) */}
+        {!isKaryawanMode && (
+          <section className="bg-white rounded-2xl p-3.5 border-t-4 border-t-blue-600 border border-slate-200/80 shadow-sm space-y-2.5">
             <div className="flex items-center justify-between">
               <h2 className="text-xs font-extrabold text-slate-800">
                 Monitoring Kehadiran Hari Ini ({todayStr})
               </h2>
               <span className="px-2 py-0.5 rounded bg-emerald-100 text-emerald-700 text-[9px] font-extrabold uppercase">
-                {isManager ? "MANAGER LIVE" : "ADMIN LIVE"}
+                LIVE SERVER
               </span>
             </div>
             <div className="grid grid-cols-3 gap-2 text-center">
@@ -1655,84 +1709,85 @@ export default function AbsensiRoleDashboardPage() {
           </section>
         )}
 
-        {/* 1. Dashboard Absen: Scanner Barcode/QR + Selfie Pendeteksi Wajah + Manual Klik */}
+        {/* 1. Dasbor Absen: Scanner Barcode/QR + Selfie Pendeteksi Wajah + Manual Klik + GPS Terkunci */}
         <section className="bg-white rounded-2xl p-3.5 border-t-4 border-t-blue-500 border border-slate-200/80 shadow-sm space-y-2.5">
           <div className="flex items-center justify-between">
             <h2 className="text-xs font-extrabold text-slate-800">
-              1. Dashboard Absen (Barcode + Selfie Wajah + Klik)
+              1. Scan Barcode/QR &amp; GPS Realtime
             </h2>
-            {isStaffDeviceLocked && (
-              <span className="px-2 py-0.5 rounded bg-sky-100 text-sky-800 text-[9px] font-extrabold uppercase">
-                KARYAWAN ONLY
+            {isKaryawanMode && (
+              <span className="px-2 py-0.5 rounded bg-sky-100 text-sky-700 text-[9px] font-extrabold uppercase">
+                MODE TERBATAS
               </span>
             )}
           </div>
 
           <div className="text-[11px] text-slate-500">
-            Jadwal Masuk: {activeEmployee?.shift_start_time || "07.00"} •{" "}
-            {liveIndonesiaClock}
+            Jadwal Masuk: {activeUser?.shift_start_time || "07.00"}
           </div>
-          <div className="text-[11px] font-bold text-emerald-600">
+          <div className="text-[11px] font-bold text-emerald-700">
             {geofenceLabel}
           </div>
+          <div className="text-[10px] text-slate-500">
+            Koordinat Kantor Terkunci: Lat {LOCKED_LAT}, Lng {LOCKED_LNG}
+          </div>
 
-          {employeeCooldown.locked && (
-            <div className="p-2.5 rounded-xl bg-amber-50 border border-amber-300 text-[11px] font-bold text-amber-900">
+          {cooldownInfo.locked && (
+            <div className="p-2 rounded-xl bg-amber-50 border border-amber-300 text-[11px] font-bold text-amber-900">
               Sudah absen{" "}
-              {employeeCooldown.lastEntry?.entry_type === "CLOCK_IN"
+              {cooldownInfo.lastEntry?.entry_type === "CLOCK_IN"
                 ? "MASUK"
-                : "KELUAR"}{" "}
-              pukul {formatTimeInTz(employeeCooldown.lastEntry?.punched_at, indoTz)}.
-              Absen ganda dikunci; kembali normal dalam {employeeCooldown.label}
-              (6 jam).
+                : "KELUAR"}
+              . Absen normal lagi setelah 6 jam (sisa{" "}
+              {cooldownInfo.remainingText}).
             </div>
           )}
 
-          {/* Manual Klik MASUK / KELUAR */}
+          {/* Manual Klik MASUK & KELUAR */}
           <div className="grid grid-cols-2 gap-2">
             <button
               type="button"
-              disabled={employeeCooldown.locked}
+              disabled={cooldownInfo.locked}
               onClick={() => {
                 setSelectedAction("CLOCK_IN");
                 void submitAttendance("CLOCK_IN");
               }}
               className={`py-2 rounded-lg text-xs font-extrabold border disabled:opacity-45 ${
-                selectedAction === "CLOCK_IN" && !employeeCooldown.locked
+                selectedAction === "CLOCK_IN" && !cooldownInfo.locked
                   ? "bg-blue-600 text-white border-blue-600"
                   : "bg-white text-slate-700 border-slate-300"
               }`}
             >
-              MASUK (KLIK)
+              MASUK
             </button>
             <button
               type="button"
-              disabled={employeeCooldown.locked}
+              disabled={cooldownInfo.locked}
               onClick={() => {
                 setSelectedAction("CLOCK_OUT");
                 void submitAttendance("CLOCK_OUT");
               }}
               className={`py-2 rounded-lg text-xs font-extrabold border disabled:opacity-45 ${
-                selectedAction === "CLOCK_OUT" && !employeeCooldown.locked
+                selectedAction === "CLOCK_OUT" && !cooldownInfo.locked
                   ? "bg-blue-600 text-white border-blue-600"
                   : "bg-white text-slate-700 border-slate-300"
               }`}
             >
-              KELUAR (KLIK)
+              KELUAR
             </button>
           </div>
 
-          {/* Scanner Barcode & QR */}
+          {/* Scanner Barcode / QR */}
           <button
             type="button"
-            disabled={employeeCooldown.locked}
+            disabled={cooldownInfo.locked}
             onClick={() =>
               qrCameraOn ? stopQrCam() : void startScannerCamera()
             }
             className="w-full py-2.5 rounded-lg bg-emerald-700 hover:bg-emerald-800 disabled:opacity-45 text-white text-xs font-bold"
           >
             {qrCameraOn
-              ? "Tutup Scanner Barcode / QR"
+              ? "Tutup Scanner Barcode/QR"
               : "Buka Scanner Barcode / QR"}
           </button>
 
@@ -1750,15 +1805,15 @@ export default function AbsensiRoleDashboardPage() {
           <div className="flex gap-1.5">
             <input
               type="text"
-              disabled={employeeCooldown.locked}
-              placeholder="Input Kode Barcode / QR manual"
+              disabled={cooldownInfo.locked}
+              placeholder="Input Kode Barcode/QR manual jika kamera terkendala"
               value={qrInput}
               onChange={(e) => setQrInput(e.target.value)}
               className="flex-1 rounded-lg border border-slate-300 px-2.5 py-2 text-xs disabled:bg-slate-100"
             />
             <button
               type="button"
-              disabled={employeeCooldown.locked}
+              disabled={cooldownInfo.locked}
               onClick={() => void submitAttendance(selectedAction, qrInput)}
               className="px-3.5 py-2 rounded-lg bg-slate-900 disabled:opacity-45 text-white text-xs font-bold"
             >
@@ -1771,11 +1826,11 @@ export default function AbsensiRoleDashboardPage() {
             <div className="flex items-center justify-between">
               <span className="text-[11px] font-extrabold text-slate-700">
                 Selfie Pendeteksi Wajah{" "}
-                {isStaffDeviceLocked ? "(Wajib)" : "(Opsional)"}
+                {isKaryawanMode ? "(Wajib Karyawan)" : "(Opsional)"}
               </span>
               {capturedSelfie && (
                 <span className="text-[10px] font-bold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded">
-                  Wajah Tersimpan
+                  Siap
                 </span>
               )}
             </div>
@@ -1807,7 +1862,7 @@ export default function AbsensiRoleDashboardPage() {
                     onClick={() => void takeSelfiePhoto()}
                     className="py-2 rounded-lg bg-blue-600 text-white text-xs font-bold"
                   >
-                    Ambil Selfie Wajah
+                    Ambil Foto Selfie
                   </button>
                   <button
                     type="button"
@@ -1823,7 +1878,7 @@ export default function AbsensiRoleDashboardPage() {
             {!selfieCameraOn && (
               <button
                 type="button"
-                disabled={employeeCooldown.locked}
+                disabled={cooldownInfo.locked}
                 onClick={() => void openSelfieCamera()}
                 className="w-full py-2 rounded-lg bg-slate-800 hover:bg-slate-900 disabled:opacity-45 text-white text-xs font-bold"
               >
@@ -1834,26 +1889,26 @@ export default function AbsensiRoleDashboardPage() {
             )}
 
             {capturedSelfie && !selfieCameraOn && (
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2.5">
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img
                   src={capturedSelfie}
                   alt="Selfie Wajah"
-                  className="w-11 h-11 rounded-lg object-cover border border-emerald-500"
+                  className="w-12 h-12 rounded-lg object-cover border border-emerald-500"
                 />
                 <span className="text-[11px] text-emerald-800 font-semibold">
-                  Selfie siap. Klik MASUK atau KELUAR.
+                  Selfie tersimpan. Klik MASUK atau KELUAR.
                 </span>
               </div>
             )}
             <canvas ref={selfieCanvasRef} className="hidden" />
           </div>
 
-          {/* Ringkasan Absen Pribadi di Mode Karyawan */}
-          {isStaffDeviceLocked && (
+          {/* Riwayat Masuk/Keluar Singkat Khusus HP Karyawan */}
+          {isKaryawanMode && (
             <div className="pt-2 border-t border-slate-100 space-y-1">
               <div className="text-[10px] font-bold text-slate-500 uppercase">
-                Riwayat Absen Saya
+                Riwayat Absen Saya (WIB)
               </div>
               {myRecentEntries.length === 0 ? (
                 <div className="text-[11px] text-slate-400">
@@ -1869,7 +1924,7 @@ export default function AbsensiRoleDashboardPage() {
                       {row.entry_type === "CLOCK_IN" ? "MASUK" : "KELUAR"}
                     </span>
                     <span className="text-slate-600">
-                      {formatTimeInTz(row.punched_at, indoTz)}
+                      {formatTimeWIB(row.punched_at)} WIB
                     </span>
                   </div>
                 ))
@@ -1878,8 +1933,8 @@ export default function AbsensiRoleDashboardPage() {
           )}
         </section>
 
-        {/* Fitur Full Akses: Hanya Tampil di Server ADMIN & MANAGER (Tidak Bisa Diakses dari HP Karyawan) */}
-        {hasFullAccessServer && (
+        {/* Fitur Full Akses Hanya untuk Server MANAGER & Server ADMIN */}
+        {!isKaryawanMode && (
           <>
             {/* 2. Input Jadwal (.PDF / .XLSX / .CSV) */}
             <section className="bg-white rounded-2xl p-3.5 border border-slate-200/80 shadow-sm space-y-2">
@@ -1901,7 +1956,7 @@ export default function AbsensiRoleDashboardPage() {
                   ref={scheduleInputRef}
                   type="file"
                   accept=".pdf,.xlsx,.xls,.csv,.txt"
-                  onChange={(e) => void handleScheduleUpload(e)}
+                  onChange={(e) => void handleScheduleFile(e)}
                   className="hidden"
                 />
               </div>
@@ -2047,8 +2102,7 @@ export default function AbsensiRoleDashboardPage() {
                         );
                         const lateM = calcLateMinutes(
                           item.punched_at,
-                          emp?.shift_start_time || "07.00",
-                          indoTz
+                          emp?.shift_start_time || "07.00"
                         );
                         return (
                           <tr
@@ -2056,7 +2110,7 @@ export default function AbsensiRoleDashboardPage() {
                             className="border-t border-slate-100"
                           >
                             <td className="p-1.5 whitespace-nowrap">
-                              {getDateStrInTz(item.punched_at, indoTz)}
+                              {getJakartaDateStr(item.punched_at)}
                             </td>
                             <td className="p-1.5 font-semibold whitespace-nowrap">
                               {item.full_name || emp?.full_name || "Karyawan"}
@@ -2067,7 +2121,7 @@ export default function AbsensiRoleDashboardPage() {
                                 : "KELUAR"}
                             </td>
                             <td className="p-1.5 whitespace-nowrap">
-                              {formatTimeInTz(item.punched_at, indoTz)}
+                              {formatTimeWIB(item.punched_at)}
                             </td>
                             <td className="p-1.5 whitespace-nowrap">
                               {lateM > 0 ? `${lateM}m` : "0m"}
@@ -2078,7 +2132,7 @@ export default function AbsensiRoleDashboardPage() {
                                 : "HADIR"}
                             </td>
                             <td className="p-1.5 whitespace-nowrap">
-                              {item.mode || "BARCODE + KLIK"}
+                              {item.mode || "BARCODE + GPS"}
                             </td>
                             <td className="p-1.5 whitespace-nowrap space-x-1">
                               <button
@@ -2137,7 +2191,8 @@ export default function AbsensiRoleDashboardPage() {
                   {officeQrCode}
                 </div>
                 <div className="text-[10px] text-slate-400">
-                  Radius GPS: Maks. {activeRadiusMeters} meter
+                  GPS Terkunci: {LOCKED_LAT}, {LOCKED_LNG} • Radius{" "}
+                  {activeRadiusMeters}m
                 </div>
               </div>
 
@@ -2161,10 +2216,11 @@ export default function AbsensiRoleDashboardPage() {
               </div>
             </section>
 
-            {/* 5. Panel Admin & Manager: Data Karyawan & Koordinat GPS */}
+            {/* 5. Panel Admin & Manager: Data Karyawan & Koordinat Terkunci */}
             <section className="bg-white rounded-2xl p-3.5 border border-slate-200/80 shadow-sm space-y-2.5">
               <h2 className="text-xs font-extrabold text-slate-800">
-                5. Panel {isManager ? "Manager" : "Admin"}: Data Karyawan
+                5. Panel {isAdminServer ? "Admin" : "Manager"}: Data Karyawan
+                &amp; GPS Terkunci
               </h2>
               <div className="space-y-1.5">
                 <input
@@ -2198,7 +2254,7 @@ export default function AbsensiRoleDashboardPage() {
                   >
                     <option value="STAFF">STAFF</option>
                     <option value="MANAGER">MANAGER</option>
-                    {isAdmin && <option value="ADMIN">ADMIN</option>}
+                    {isAdminServer && <option value="ADMIN">ADMIN</option>}
                   </select>
                   <input
                     type="text"
@@ -2239,7 +2295,7 @@ export default function AbsensiRoleDashboardPage() {
                 {employees.map((emp) => (
                   <div
                     key={emp.id}
-                    className="p-2 rounded-lg bg-slate-50 border border-slate-200/70 flex items-center justify-between gap-1.5 text-xs"
+                    className="p-2 rounded-lg bg-slate-50 border border-slate-200/70 flex flex-wrap items-center justify-between gap-1.5 text-xs"
                   >
                     <div>
                       <span className="font-bold">{emp.full_name}</span> (
@@ -2266,7 +2322,7 @@ export default function AbsensiRoleDashboardPage() {
                       >
                         Edit
                       </button>
-                      {emp.role === "STAFF" && (
+                      {emp.role !== "ADMIN" && (
                         <button
                           type="button"
                           onClick={() => void deleteEmployee(emp.id)}
@@ -2280,75 +2336,38 @@ export default function AbsensiRoleDashboardPage() {
                 ))}
               </div>
 
-              {/* Koordinat Latitude, Longitude & Radius GPS */}
-              <div className="pt-2.5 border-t border-slate-200 space-y-1.5">
-                <div className="flex items-center justify-between">
-                  <span className="text-[11px] font-extrabold text-slate-800">
-                    Koordinat Latitude, Longitude &amp; Radius
-                  </span>
-                  {gpsCoords && (
-                    <button
-                      type="button"
-                      onClick={() =>
-                        setLocForm((p) => ({
-                          ...p,
-                          latitude: String(gpsCoords.lat),
-                          longitude: String(gpsCoords.lng),
-                        }))
-                      }
-                      className="text-[10px] font-bold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded"
-                    >
-                      Ambil GPS
-                    </button>
-                  )}
+              {/* Koordinat GPS Terkunci (-6.9148609, 109.7446830) */}
+              <div className="pt-2.5 border-t border-slate-100 space-y-1.5">
+                <div className="text-[11px] font-extrabold text-slate-700">
+                  Koordinat GPS Kantor Terkunci &amp; Radius
                 </div>
-                <input
-                  type="text"
-                  placeholder="Nama Lokasi"
-                  value={locForm.name}
-                  onChange={(e) =>
-                    setLocForm((p) => ({ ...p, name: e.target.value }))
-                  }
-                  className="w-full rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs"
-                />
                 <div className="grid grid-cols-3 gap-1.5">
                   <input
                     type="text"
-                    placeholder="Latitude"
-                    value={locForm.latitude}
-                    onChange={(e) =>
-                      setLocForm((p) => ({ ...p, latitude: e.target.value }))
-                    }
-                    className="rounded-lg border border-slate-300 px-2 py-1.5 text-xs"
+                    readOnly
+                    value={String(LOCKED_LAT)}
+                    className="rounded-lg border border-slate-200 bg-slate-100 text-slate-600 px-2 py-1.5 text-xs font-mono"
                   />
                   <input
                     type="text"
-                    placeholder="Longitude"
-                    value={locForm.longitude}
-                    onChange={(e) =>
-                      setLocForm((p) => ({ ...p, longitude: e.target.value }))
-                    }
-                    className="rounded-lg border border-slate-300 px-2 py-1.5 text-xs"
+                    readOnly
+                    value={String(LOCKED_LNG)}
+                    className="rounded-lg border border-slate-200 bg-slate-100 text-slate-600 px-2 py-1.5 text-xs font-mono"
                   />
                   <input
                     type="number"
-                    placeholder="Radius"
-                    value={locForm.radius_meters}
-                    onChange={(e) =>
-                      setLocForm((p) => ({
-                        ...p,
-                        radius_meters: e.target.value,
-                      }))
-                    }
+                    placeholder="Radius (m)"
+                    value={radiusInput}
+                    onChange={(e) => setRadiusInput(e.target.value)}
                     className="rounded-lg border border-slate-300 px-2 py-1.5 text-xs"
                   />
                 </div>
                 <button
                   type="button"
-                  onClick={() => void saveLocation()}
-                  className="w-full py-2 rounded-lg bg-emerald-700 text-white text-xs font-bold"
+                  onClick={() => void saveLockedRadius()}
+                  className="w-full py-1.5 rounded-lg bg-emerald-700 text-white text-xs font-bold"
                 >
-                  Simpan Koordinat &amp; Radius
+                  Simpan Radius (Koordinat Tetap Terkunci)
                 </button>
               </div>
             </section>
