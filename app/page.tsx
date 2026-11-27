@@ -57,44 +57,38 @@ interface BarcodeDetectorInstance {
 
 const DEFAULT_LAT = -6.9148609;
 const DEFAULT_LNG = 109.744683;
+const DEFAULT_RADIUS = 2000;
 const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
 
 const SHIFT_OPTIONS = [
+  { label: "Shift Fleksibel", time: "FLEKSIBEL" },
   { label: "Shift Pagi (07.00)", time: "07.00" },
   { label: "Shift Siang (15.00)", time: "15.00" },
   { label: "Shift Malam (23.00)", time: "23.00" },
 ];
 
-const CACHE_KEY = "absensi_v8_cache";
-const QUEUE_KEY = "absensi_v8_queue";
-const QR_CODE_KEY = "absensi_v8_qr";
-const LOC_KEY = "absensi_v8_custom_loc";
-const DEVICE_LOCK_KEY = "absensi_v8_device_locked_karyawan";
-const STAFF_EMP_KEY = "absensi_v8_staff_emp_id";
-const AUTH_SERVER_KEY = "absensi_v8_auth_server";
+const CACHE_KEY = "absensi_v11_cache";
+const QUEUE_KEY = "absensi_v11_queue";
+const QR_CODE_KEY = "absensi_v11_qr";
+const LOC_KEY = "absensi_v11_custom_loc";
+const DEVICE_LOCK_KEY = "absensi_v11_device_locked_karyawan";
+const STAFF_EMP_KEY = "absensi_v11_staff_emp_id";
+const AUTH_SERVER_KEY = "absensi_v11_auth_server";
 
 function normalizeShiftTime(raw?: string | null): string {
   const s = String(raw || "").trim();
-  if (!s) return "07.00";
-  if (
-    s.includes("15:00") ||
-    s.includes("15.00") ||
-    s.toLowerCase().includes("siang")
-  ) {
+  if (!s) return "FLEKSIBEL";
+  const lower = s.toLowerCase();
+  if (lower.includes("flex") || lower.includes("fleks") || lower.includes("bebas")) {
+    return "FLEKSIBEL";
+  }
+  if (s.includes("15:00") || s.includes("15.00") || lower.includes("siang")) {
     return "15.00";
   }
-  if (
-    s.includes("23:00") ||
-    s.includes("23.00") ||
-    s.toLowerCase().includes("malam")
-  ) {
+  if (s.includes("23:00") || s.includes("23.00") || lower.includes("malam")) {
     return "23.00";
   }
-  if (
-    s.includes("07:00") ||
-    s.includes("07.00") ||
-    s.toLowerCase().includes("pagi")
-  ) {
+  if (s.includes("07:00") || s.includes("07.00") || lower.includes("pagi")) {
     return "07.00";
   }
   return s.replace(":", ".");
@@ -120,7 +114,7 @@ const DEFAULT_EMPLOYEES: Employee[] = [
     role: "ADMIN",
     department: "Administrator",
     pin_code: "0000",
-    shift_start_time: "07.00",
+    shift_start_time: "FLEKSIBEL",
   },
   {
     id: 2,
@@ -129,7 +123,7 @@ const DEFAULT_EMPLOYEES: Employee[] = [
     role: "MANAGER",
     department: "Manajemen",
     pin_code: "2026",
-    shift_start_time: "07.00",
+    shift_start_time: "FLEKSIBEL",
   },
   {
     id: 3,
@@ -138,7 +132,7 @@ const DEFAULT_EMPLOYEES: Employee[] = [
     role: "STAFF",
     department: "Operasional",
     pin_code: "1111",
-    shift_start_time: "07.00",
+    shift_start_time: "FLEKSIBEL",
   },
 ];
 
@@ -148,7 +142,7 @@ const DEFAULT_LOCATIONS: LocationItem[] = [
     name: "Kantor Utama",
     latitude: DEFAULT_LAT,
     longitude: DEFAULT_LNG,
-    radius_meters: 150,
+    radius_meters: DEFAULT_RADIUS,
   },
 ];
 
@@ -181,7 +175,10 @@ const formatDateTimeLocalWIB = (iso?: string | null) => {
     .replace(" ", "T");
 };
 
-function calcLateMinutes(punchedIso: string, shiftStart = "07.00") {
+function calcLateMinutes(punchedIso: string, shiftStart = "FLEKSIBEL") {
+  const norm = normalizeShiftTime(shiftStart);
+  if (norm === "FLEKSIBEL") return 0;
+
   const parts = new Intl.DateTimeFormat("en-GB", {
     timeZone: "Asia/Jakarta",
     hour: "2-digit",
@@ -191,20 +188,12 @@ function calcLateMinutes(punchedIso: string, shiftStart = "07.00") {
     .format(new Date(punchedIso))
     .split(":");
   const actualMin = Number(parts[0]) * 60 + Number(parts[1]);
-  const [sh, sm] = normalizeShiftTime(shiftStart)
-    .replace(".", ":")
-    .split(":")
-    .map(Number);
+  const [sh, sm] = norm.replace(".", ":").split(":").map(Number);
   const startMin = (isNaN(sh) ? 7 : sh) * 60 + (isNaN(sm) ? 0 : sm);
   return Math.max(0, actualMin - startMin);
 }
 
-function haversineMeters(
-  lat1: number,
-  lon1: number,
-  lat2: number,
-  lon2: number
-) {
+function haversineMeters(lat1: number, lon1: number, lat2: number, lon2: number) {
   const R = 6371e3;
   const p1 = (lat1 * Math.PI) / 180;
   const p2 = (lat2 * Math.PI) / 180;
@@ -258,7 +247,7 @@ function parseScheduleLines(
     const timeMatch = line.match(
       /\b(07[:.]00|15[:.]00|23[:.]00|[012]?\d[:.]\d{2})\b/
     );
-    let shiftTime = "07.00";
+    let shiftTime = "FLEKSIBEL";
     if (timeMatch) {
       shiftTime = normalizeShiftTime(timeMatch[1]);
     } else if (lower.includes("siang")) {
@@ -267,6 +256,8 @@ function parseScheduleLines(
       shiftTime = "23.00";
     } else if (lower.includes("pagi")) {
       shiftTime = "07.00";
+    } else if (lower.includes("flex") || lower.includes("fleks")) {
+      shiftTime = "FLEKSIBEL";
     }
 
     const codeMatch = line.match(/\b([A-Z]{2,5}[-_]\d{1,5})\b/i);
@@ -281,12 +272,11 @@ function parseScheduleLines(
         .filter(Boolean);
     }
 
-    let empCode = codeMatch ? codeMatch[1].toUpperCase() : "";
+    const empCode = codeMatch ? codeMatch[1].toUpperCase() : "";
     let fullName = "";
 
     if (cols.length >= 2) {
       if (!empCode && /^[A-Z0-9_-]{2,12}$/i.test(cols[0])) {
-        empCode = cols[0].toUpperCase();
         fullName = cols[1];
       } else {
         fullName = cols[0];
@@ -294,14 +284,14 @@ function parseScheduleLines(
     } else {
       fullName = line
         .replace(/\b([A-Z]{2,5}[-_]\d{1,5})\b/gi, " ")
-        .replace(/shift\s*(pagi|siang|malam)/gi, " ")
+        .replace(/shift\s*(pagi|siang|malam|fleksibel|flexible)/gi, " ")
         .replace(/\b([012]?\d[:.]\d{2})\b/g, " ")
         .replace(/\s+/g, " ")
         .trim();
     }
 
     fullName = fullName
-      .replace(/shift\s*(pagi|siang|malam)/gi, " ")
+      .replace(/shift\s*(pagi|siang|malam|fleksibel|flexible)/gi, " ")
       .replace(/\b([012]?\d[:.]\d{2})\b/g, " ")
       .replace(/\s+/g, " ")
       .trim();
@@ -317,6 +307,28 @@ function parseScheduleLines(
   }
 
   return parsed;
+}
+
+function parseSavedLocation(raw: string | null): LocationItem | null {
+  if (!raw) return null;
+  try {
+    const p = JSON.parse(raw);
+    const lat = Number(p.latitude);
+    const lng = Number(p.longitude);
+    const rad = Math.max(10, Number(p.radius_meters) || DEFAULT_RADIUS);
+    if (!isNaN(lat) && !isNaN(lng) && lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180) {
+      return {
+        id: Number(p.id) || 1,
+        name: String(p.name || "Kantor Utama"),
+        latitude: lat,
+        longitude: lng,
+        radius_meters: rad,
+      };
+    }
+  } catch {
+    // Abaikan
+  }
+  return null;
 }
 
 function getInitialBoot() {
@@ -390,7 +402,13 @@ function getInitialBoot() {
         }));
       }
       if (Array.isArray(c.locations) && c.locations.length > 0) {
-        locations = c.locations;
+        locations = c.locations.map((l: LocationItem) => ({
+          id: Number(l.id) || 1,
+          name: String(l.name || "Kantor Utama"),
+          latitude: Number(l.latitude) || DEFAULT_LAT,
+          longitude: Number(l.longitude) || DEFAULT_LNG,
+          radius_meters: Math.max(10, Number(l.radius_meters) || DEFAULT_RADIUS),
+        }));
       }
       if (Array.isArray(c.entries)) {
         entries = c.entries.map((item: TimeEntry) => ({
@@ -403,28 +421,9 @@ function getInitialBoot() {
       }
     }
 
-    const savedCustomLoc = localStorage.getItem(LOC_KEY);
-    if (savedCustomLoc) {
-      const parsedLoc = JSON.parse(savedCustomLoc);
-      if (
-        typeof parsedLoc.latitude === "number" &&
-        !isNaN(parsedLoc.latitude) &&
-        typeof parsedLoc.longitude === "number" &&
-        !isNaN(parsedLoc.longitude)
-      ) {
-        locations = [
-          {
-            id: locations[0]?.id || 1,
-            name: parsedLoc.name || locations[0]?.name || "Kantor Utama",
-            latitude: parsedLoc.latitude,
-            longitude: parsedLoc.longitude,
-            radius_meters:
-              Number(parsedLoc.radius_meters) ||
-              locations[0]?.radius_meters ||
-              150,
-          },
-        ];
-      }
+    const customLoc = parseSavedLocation(localStorage.getItem(LOC_KEY));
+    if (customLoc) {
+      locations = [customLoc];
     }
   } catch {
     // Abaikan error storage
@@ -460,10 +459,10 @@ export default function AbsensiMultiServerPage() {
   const [serverEntries, setServerEntries] = useState<TimeEntry[]>(boot.entries);
   const [offlineQueue, setOfflineQueue] = useState<TimeEntry[]>(boot.queue);
   const [staffEmpId, setStaffEmpId] = useState<number>(boot.staffEmpId);
+  const [dbConnected, setDbConnected] = useState<boolean>(true);
 
   const [serverOffsetMs, setServerOffsetMs] = useState<number>(0);
   const [nowMs, setNowMs] = useState<number>(() => Date.now());
-
   const [isOnline, setIsOnline] = useState<boolean>(() =>
     typeof navigator !== "undefined" ? navigator.onLine : true
   );
@@ -475,10 +474,9 @@ export default function AbsensiMultiServerPage() {
   const [officeQrCode, setOfficeQrCode] = useState<string>(boot.qrCode);
   const [qrInput, setQrInput] = useState("");
   const [qrCameraOn, setQrCameraOn] = useState(false);
-  const [gpsCoords, setGpsCoords] = useState<{
-    lat: number;
-    lng: number;
-  } | null>(null);
+  const [gpsCoords, setGpsCoords] = useState<{ lat: number; lng: number } | null>(
+    null
+  );
   const [gpsStatusText, setGpsStatusText] = useState<string>(
     "Menunggu pembacaan GPS perangkat..."
   );
@@ -517,7 +515,7 @@ export default function AbsensiMultiServerPage() {
     role: "STAFF" as RoleType,
     department: "Operasional",
     pin_code: "1234",
-    shift_start_time: "07.00",
+    shift_start_time: "FLEKSIBEL",
   });
   const [latInput, setLatInput] = useState<string>(
     String(boot.locations[0]?.latitude ?? DEFAULT_LAT)
@@ -526,7 +524,7 @@ export default function AbsensiMultiServerPage() {
     String(boot.locations[0]?.longitude ?? DEFAULT_LNG)
   );
   const [radiusInput, setRadiusInput] = useState<string>(
-    String(boot.locations[0]?.radius_meters ?? 150)
+    String(boot.locations[0]?.radius_meters ?? DEFAULT_RADIUS)
   );
 
   const [toast, setToast] = useState<{
@@ -541,14 +539,12 @@ export default function AbsensiMultiServerPage() {
   const faceRafRef = useRef<number | null>(null);
   const scheduleInputRef = useRef<HTMLInputElement | null>(null);
   const offsetRef = useRef<number>(0);
+  const syncInFlightRef = useRef<boolean>(false);
 
-  const notify = useCallback(
-    (type: "ok" | "warn" | "err", text: string) => {
-      setToast({ type, text });
-      setTimeout(() => setToast(null), 4000);
-    },
-    []
-  );
+  const notify = useCallback((type: "ok" | "warn" | "err", text: string) => {
+    setToast({ type, text });
+    setTimeout(() => setToast(null), 4500);
+  }, []);
 
   useEffect(() => {
     offsetRef.current = serverOffsetMs;
@@ -633,19 +629,34 @@ export default function AbsensiMultiServerPage() {
 
   const syncOfflineQueue = useCallback(
     async (queue: TimeEntry[], silent = false) => {
-      if (!navigator.onLine || queue.length === 0) return;
+      if (!navigator.onLine || queue.length === 0 || syncInFlightRef.current) {
+        return;
+      }
+      syncInFlightRef.current = true;
       setIsSyncing(true);
       try {
-        const res = await fetch("/api/sync", {
+        const res = await fetch("/api/absen", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ punches: queue }),
+          body: JSON.stringify({ action: "SUBMIT_PUNCH", punches: queue }),
+          cache: "no-store",
         });
         if (!res.ok) return;
         const data = await res.json();
         if (data?.ok) {
-          localStorage.removeItem(QUEUE_KEY);
-          setOfflineQueue([]);
+          const syncedSet = new Set<string>(
+            Array.isArray(data.syncedUuids)
+              ? data.syncedUuids.map(String)
+              : queue.map((q) => q.client_uuid)
+          );
+          setOfflineQueue((prev) => {
+            const remaining = prev.filter((q) => !syncedSet.has(q.client_uuid));
+            localStorage.setItem(QUEUE_KEY, JSON.stringify(remaining));
+            return remaining;
+          });
+          if (Array.isArray(data.entries)) {
+            setServerEntries(data.entries);
+          }
           if (!silent) {
             notify("ok", `${data.syncedCount || queue.length} data tersinkron.`);
           }
@@ -653,6 +664,7 @@ export default function AbsensiMultiServerPage() {
       } catch {
         // Tetap di antrean lokal
       } finally {
+        syncInFlightRef.current = false;
         setIsSyncing(false);
       }
     },
@@ -672,7 +684,7 @@ export default function AbsensiMultiServerPage() {
         const pending: TimeEntry[] = rawQ ? JSON.parse(rawQ) : [];
         if (pending.length > 0) await syncOfflineQueue(pending, true);
 
-        const res = await fetch("/api/bootstrap", { cache: "no-store" });
+        const res = await fetch("/api/absen", { cache: "no-store" });
         const headerDate = res.headers.get("date");
         let nextOffset = offsetRef.current;
         if (headerDate) {
@@ -687,6 +699,7 @@ export default function AbsensiMultiServerPage() {
         if (res.ok) {
           const data = await res.json();
           if (data?.ok) {
+            setDbConnected(Boolean(data.dbConnected));
             setEmployees((prevEmps) => {
               const nextEmps: Employee[] =
                 Array.isArray(data.employees) && data.employees.length > 0
@@ -697,44 +710,29 @@ export default function AbsensiMultiServerPage() {
                     }))
                   : prevEmps;
 
+              const customLoc = parseSavedLocation(localStorage.getItem(LOC_KEY));
               let nextLocs: LocationItem[] =
                 Array.isArray(data.locations) && data.locations.length > 0
-                  ? data.locations
+                  ? data.locations.map((l: LocationItem) => ({
+                      id: Number(l.id) || 1,
+                      name: String(l.name || "Kantor Utama"),
+                      latitude: Number(l.latitude) || DEFAULT_LAT,
+                      longitude: Number(l.longitude) || DEFAULT_LNG,
+                      radius_meters: Math.max(
+                        10,
+                        Number(l.radius_meters) || DEFAULT_RADIUS
+                      ),
+                    }))
                   : DEFAULT_LOCATIONS;
 
-              try {
-                const savedCustom = localStorage.getItem(LOC_KEY);
-                if (savedCustom) {
-                  const cLoc = JSON.parse(savedCustom);
-                  if (
-                    typeof cLoc.latitude === "number" &&
-                    !isNaN(cLoc.latitude) &&
-                    typeof cLoc.longitude === "number" &&
-                    !isNaN(cLoc.longitude)
-                  ) {
-                    nextLocs = [
-                      {
-                        id: nextLocs[0]?.id || 1,
-                        name:
-                          cLoc.name || nextLocs[0]?.name || "Kantor Utama",
-                        latitude: cLoc.latitude,
-                        longitude: cLoc.longitude,
-                        radius_meters:
-                          Number(cLoc.radius_meters) ||
-                          nextLocs[0]?.radius_meters ||
-                          150,
-                      },
-                    ];
-                  }
-                }
-              } catch {
-                // Abaikan
+              if (customLoc) {
+                nextLocs = [customLoc];
               }
 
               setLocations(nextLocs);
               setLatInput(String(nextLocs[0]?.latitude ?? DEFAULT_LAT));
               setLngInput(String(nextLocs[0]?.longitude ?? DEFAULT_LNG));
-              setRadiusInput(String(nextLocs[0]?.radius_meters ?? 150));
+              setRadiusInput(String(nextLocs[0]?.radius_meters ?? DEFAULT_RADIUS));
 
               setServerEntries((prevEntries) => {
                 const nextEntries: TimeEntry[] = Array.isArray(data.entries)
@@ -762,7 +760,12 @@ export default function AbsensiMultiServerPage() {
             });
 
             if (!silent) {
-              notify("ok", "Jam WIB & data server tersinkronisasi.");
+              notify(
+                data.dbConnected ? "ok" : "warn",
+                data.dbConnected
+                  ? "Terhubung ke Database Neon & Jam WIB sinkron."
+                  : `Peringatan DB: ${data.dbError || "DATABASE_URL belum aktif"}`
+              );
             }
           }
         }
@@ -777,6 +780,24 @@ export default function AbsensiMultiServerPage() {
     },
     [notify, syncOfflineQueue]
   );
+
+  // Polling realtime setiap 2 detik di server Admin & Manager
+  useEffect(() => {
+    if (!isOnline || isKaryawanMode) return;
+    const poller = window.setInterval(() => {
+      void refreshServer(true);
+    }, 2000);
+    return () => clearInterval(poller);
+  }, [isOnline, isKaryawanMode, refreshServer]);
+
+  // Sinkronisasi cepat tiap 1,5 detik saat ada antrean offline
+  useEffect(() => {
+    if (!isOnline || offlineQueue.length === 0) return;
+    const timer = window.setInterval(() => {
+      void syncOfflineQueue(offlineQueue, true);
+    }, 1500);
+    return () => clearInterval(timer);
+  }, [isOnline, offlineQueue, syncOfflineQueue]);
 
   const requestCurrentGps = useCallback(() => {
     if (!("geolocation" in navigator)) {
@@ -803,16 +824,34 @@ export default function AbsensiMultiServerPage() {
   }, []);
 
   useEffect(() => {
+    const flushNow = () => {
+      const onlineNow = navigator.onLine;
+      setIsOnline(onlineNow);
+      if (onlineNow) {
+        void refreshServer(true);
+      }
+    };
+
     const onOnline = () => {
       setIsOnline(true);
       void refreshServer(true);
+      notify("ok", "Online — menyinkronkan data absen ke database...");
     };
     const onOffline = () => {
       setIsOnline(false);
       notify("warn", "Offline: absensi masuk antrean lokal.");
     };
+    const onVisibilityOrFocus = () => {
+      if (document.visibilityState === "visible") {
+        flushNow();
+      }
+    };
+
     window.addEventListener("online", onOnline);
     window.addEventListener("offline", onOffline);
+    window.addEventListener("focus", flushNow);
+    window.addEventListener("pageshow", flushNow);
+    document.addEventListener("visibilitychange", onVisibilityOrFocus);
 
     const t = window.setTimeout(() => {
       void refreshServer(true);
@@ -823,6 +862,9 @@ export default function AbsensiMultiServerPage() {
       clearTimeout(t);
       window.removeEventListener("online", onOnline);
       window.removeEventListener("offline", onOffline);
+      window.removeEventListener("focus", flushNow);
+      window.removeEventListener("pageshow", flushNow);
+      document.removeEventListener("visibilitychange", onVisibilityOrFocus);
       stopQrCam();
       stopSelfieCam();
     };
@@ -833,7 +875,7 @@ export default function AbsensiMultiServerPage() {
     return {
       latitude: Number(loc.latitude),
       longitude: Number(loc.longitude),
-      radius_meters: Math.max(10, Number(loc.radius_meters) || 150),
+      radius_meters: Math.max(10, Number(loc.radius_meters) || DEFAULT_RADIUS),
     };
   }, [locations]);
 
@@ -853,9 +895,9 @@ export default function AbsensiMultiServerPage() {
 
   const geofenceLabel = useMemo(() => {
     if (!geofence) {
-      return `${gpsStatusText} • Target (${targetLocation.latitude}, ${targetLocation.longitude})`;
+      return `${gpsStatusText} • Target (${targetLocation.latitude}, ${targetLocation.longitude}) • Radius ${targetLocation.radius_meters}m`;
     }
-    return `GPS: Jarak ${geofence.distance}m (${
+    return `GPS: Jarak ${geofence.distance}m / ${targetLocation.radius_meters}m (${
       geofence.inside ? "Aman • Di Dalam Radius" : "Di Luar Radius Kantor"
     })`;
   }, [geofence, gpsStatusText, targetLocation]);
@@ -1214,7 +1256,10 @@ export default function AbsensiMultiServerPage() {
       if (item.entry_type === "CLOCK_IN") {
         inIds.add(Number(item.employee_id));
         if (
-          calcLateMinutes(item.punched_at, emp?.shift_start_time || "07.00") > 0
+          calcLateMinutes(
+            item.punched_at,
+            emp?.shift_start_time || "FLEKSIBEL"
+          ) > 0
         ) {
           lateCount++;
         }
@@ -1314,7 +1359,7 @@ export default function AbsensiMultiServerPage() {
       );
       const lateMins = calcLateMinutes(
         item.punched_at,
-        emp?.shift_start_time || "07.00"
+        emp?.shift_start_time || "FLEKSIBEL"
       );
       return [
         getJakartaDateStr(item.punched_at),
@@ -1394,7 +1439,7 @@ export default function AbsensiMultiServerPage() {
 
     if (navigator.onLine) {
       try {
-        await fetch("/api/manage", {
+        await fetch("/api/absen", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -1432,7 +1477,7 @@ export default function AbsensiMultiServerPage() {
     });
     if (navigator.onLine) {
       try {
-        await fetch("/api/manage", {
+        await fetch("/api/absen", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -1468,7 +1513,7 @@ export default function AbsensiMultiServerPage() {
     };
     if (navigator.onLine) {
       try {
-        const res = await fetch("/api/manage", {
+        const res = await fetch("/api/absen", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ action: "SAVE_EMPLOYEE", payload }),
@@ -1484,7 +1529,7 @@ export default function AbsensiMultiServerPage() {
               role: "STAFF",
               department: "Operasional",
               pin_code: "1234",
-              shift_start_time: "07.00",
+              shift_start_time: "FLEKSIBEL",
             });
             notify("ok", "Data karyawan disimpan.");
             return;
@@ -1507,7 +1552,7 @@ export default function AbsensiMultiServerPage() {
       role: "STAFF",
       department: "Operasional",
       pin_code: "1234",
-      shift_start_time: "07.00",
+      shift_start_time: "FLEKSIBEL",
     });
     notify("ok", "Data karyawan diperbarui.");
   };
@@ -1516,7 +1561,7 @@ export default function AbsensiMultiServerPage() {
     if (isKaryawanMode) return;
     if (navigator.onLine) {
       try {
-        await fetch("/api/manage", {
+        await fetch("/api/absen", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ action: "DELETE_EMPLOYEE", payload: { id } }),
@@ -1555,7 +1600,7 @@ export default function AbsensiMultiServerPage() {
     if (isKaryawanMode) return;
     const parsedLat = Number(String(latInput).replace(",", "."));
     const parsedLng = Number(String(lngInput).replace(",", "."));
-    const parsedRadius = Math.max(10, Number(radiusInput) || 150);
+    const parsedRadius = Math.max(10, Number(radiusInput) || DEFAULT_RADIUS);
 
     if (
       isNaN(parsedLat) ||
@@ -1588,7 +1633,7 @@ export default function AbsensiMultiServerPage() {
 
     if (navigator.onLine) {
       try {
-        await fetch("/api/manage", {
+        await fetch("/api/absen", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -1746,8 +1791,13 @@ export default function AbsensiMultiServerPage() {
           </div>
 
           <div className="flex flex-wrap items-center gap-1.5">
-            <span className="px-2.5 py-1 rounded-md bg-emerald-600 text-white text-[10px] font-extrabold uppercase">
-              {isOnline ? "ONLINE" : "OFFLINE"} • ANTREAN: {offlineQueue.length}
+            <span
+              className={`px-2.5 py-1 rounded-md text-white text-[10px] font-extrabold uppercase ${
+                dbConnected ? "bg-emerald-600" : "bg-amber-600"
+              }`}
+            >
+              {isOnline ? (dbConnected ? "DB NEON AKTIF" : "MODE LOKAL") : "OFFLINE"} •
+              ANTREAN: {offlineQueue.length}
             </span>
             <button
               type="button"
@@ -1816,7 +1866,7 @@ export default function AbsensiMultiServerPage() {
               {staffList.map((emp) => (
                 <option key={emp.id} value={emp.id}>
                   {emp.full_name} ({emp.emp_code}) • Shift{" "}
-                  {emp.shift_start_time || "07.00"}
+                  {emp.shift_start_time || "FLEKSIBEL"}
                 </option>
               ))}
             </select>
@@ -1877,7 +1927,7 @@ export default function AbsensiMultiServerPage() {
           </div>
 
           <div className="text-[11px] text-slate-500">
-            Jadwal Masuk: {activeUser?.shift_start_time || "07.00"}
+            Jadwal Masuk: {activeUser?.shift_start_time || "FLEKSIBEL"}
           </div>
           <div className="text-[11px] font-bold text-emerald-700">
             {geofenceLabel}
@@ -2250,7 +2300,7 @@ export default function AbsensiMultiServerPage() {
                         );
                         const lateM = calcLateMinutes(
                           item.punched_at,
-                          emp?.shift_start_time || "07.00"
+                          emp?.shift_start_time || "FLEKSIBEL"
                         );
                         return (
                           <tr
@@ -2446,7 +2496,7 @@ export default function AbsensiMultiServerPage() {
                     <div>
                       <span className="font-bold">{emp.full_name}</span> (
                       {emp.emp_code}) • {emp.role} • Shift{" "}
-                      {emp.shift_start_time || "07.00"}
+                      {emp.shift_start_time || "FLEKSIBEL"}
                     </div>
                     <div className="flex gap-1">
                       <button
