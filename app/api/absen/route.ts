@@ -69,20 +69,18 @@ export async function PUT(req: Request) {
     await ensureLogTable();
     const body = await req.json();
     const id_log = String(body.id_log || '').trim();
-    const tanggal = String(body.tanggal || '').trim();
     const jenis = body.jenis === 'KELUAR' ? 'KELUAR' : 'MASUK';
     const waktu_scan = String(body.waktu_scan || '').trim();
     const telat_menit = Number(body.telat_menit || 0);
-    const status = String(body.status || 'Tepat Waktu').trim();
+    const status = String(body.status || '').trim();
 
-    if (!id_log) {
-      return NextResponse.json({ status: 'error', message: 'ID log wajib diisi' }, { status: 400 });
+    if (!id_log || !waktu_scan || !status) {
+      return NextResponse.json({ status: 'error', message: 'Data edit tidak lengkap!' }, { status: 400 });
     }
 
     await sql`
       UPDATE log_absensi
-      SET tanggal = ${tanggal},
-          jenis = ${jenis},
+      SET jenis = ${jenis},
           waktu_scan = ${waktu_scan},
           telat_menit = ${telat_menit},
           status = ${status}
@@ -100,7 +98,7 @@ export async function DELETE(req: Request) {
     const { searchParams } = new URL(req.url);
     const id_log = String(searchParams.get('id_log') || '').trim();
     if (!id_log) {
-      return NextResponse.json({ status: 'error', message: 'ID log wajib diisi' }, { status: 400 });
+      return NextResponse.json({ status: 'error', message: 'ID log wajib diisi!' }, { status: 400 });
     }
     await sql`DELETE FROM log_absensi WHERE id_log = ${id_log}`;
     return NextResponse.json({ status: 'ok' });
@@ -108,3 +106,5 @@ export async function DELETE(req: Request) {
     return NextResponse.json({ status: 'error', message: String(error) }, { status: 500 });
   }
 }
+
+
