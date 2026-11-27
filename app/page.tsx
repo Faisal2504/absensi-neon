@@ -38,7 +38,7 @@ interface AbsenRecord {
 
 const KANTOR_LAT = -6,9148609;
 const KANTOR_LNG = 109,7446830;
-const MAX_RADIUS = 15;
+const MAX_RADIUS = 150;
 
 async function getLocalDB() {
   return openDB('AbsensiNeonDB', 2, {
