@@ -59,7 +59,9 @@ export default function AllInAttendanceSystem() {
   const [online, setOnline] = useState(true);
   const [autoLive, setAutoLive] = useState(true);
   const [loading, setLoading] = useState(false);
+  const [busyPunch, setBusyPunch] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
+  const [lastSync, setLastSync] = useState<string>("-");
 
   const [settings, setSettings] = useState<SettingsData>({
     office_name: "Kantor Utama MPI-BTG",
@@ -103,7 +105,7 @@ export default function AllInAttendanceSystem() {
     if (d.ok) {
       localStorage.removeItem(Q_KEY);
       setQueue([]);
-      toast(`${q.length} absen offline tersinkron!`);
+      toast(`${q.length} absen offline tersinkron ke server!`);
     }
   }, [toast]);
 
@@ -114,13 +116,14 @@ export default function AllInAttendanceSystem() {
       const rawQ = localStorage.getItem(Q_KEY);
       const pending: AttendanceRow[] = rawQ ? JSON.parse(rawQ) : [];
       if (pending.length > 0) await syncOffline(pending);
-      const res = await fetch("/api/all-in", { cache: "no-store" });
+      const res = await fetch(`/api/all-in?t=${Date.now()}`, { cache: "no-store" });
       const d = await res.json();
       if (d.ok) {
         setSettings(d.settings);
-        setCfgForm(d.settings);
+        if (!silent) setCfgForm(d.settings);
         setEmployees(d.employees || []);
         setAttendance(d.attendance || []);
+        setLastSync(wibTime());
       }
     } finally {
       if (!silent) setLoading(false);
@@ -131,19 +134,25 @@ export default function AllInAttendanceSystem() {
     setOnline(navigator.onLine);
     const onOn = () => { setOnline(true); refreshServer(); };
     const onOff = () => setOnline(false);
+    const onFocus = () => refreshServer(true);
     window.addEventListener("online", onOn);
     window.addEventListener("offline", onOff);
+    window.addEventListener("focus", onFocus);
     const savedU = localStorage.getItem(U_KEY);
     if (savedU) setUser(JSON.parse(savedU));
     const savedQ = localStorage.getItem(Q_KEY);
     if (savedQ) setQueue(JSON.parse(savedQ));
     refreshServer();
-    return () => { window.removeEventListener("online", onOn); window.removeEventListener("offline", onOff); };
+    return () => {
+      window.removeEventListener("online", onOn);
+      window.removeEventListener("offline", onOff);
+      window.removeEventListener("focus", onFocus);
+    };
   }, [refreshServer]);
 
   useEffect(() => {
     if (!autoLive || !online) return;
-    const timer = setInterval(() => refreshServer(true), 10000);
+    const timer = setInterval(() => refreshServer(true), 3000);
     return () => clearInterval(timer);
   }, [autoLive, online, refreshServer]);
 
@@ -171,7 +180,49 @@ export default function AllInAttendanceSystem() {
     return distMeters(gps.lat, gps.lng, Number(settings.latitude), Number(settings.longitude));
   }, [gps, settings]);
 
-  const submitPunch = async (code: string) => {
+  const pushPunchToDb = async (targetEmp: { emp_code: string; full_name: string }, type: "MASUK" | "KELUAR", modeLabel: string) => {
+    if (busyPunch) return;
+    setBusyPunch(true);
+    const row: AttendanceRow = {
+      client_uuid: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      emp_code: targetEmp.emp_code,
+      full_name: targetEmp.full_name,
+      entry_type: type,
+      date_str: wibDate(),
+      time_str: wibTime(),
+      is_late: false,
+      late_minutes: 0,
+      distance_meters: distance ?? 0,
+      status_label: "VALID",
+      sync_mode: navigator.onLine ? modeLabel : "OFFLINE",
+      notes: "",
+    };
+    try {
+      if (navigator.onLine) {
+        const res = await fetch("/api/all-in", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "RECORD_PUNCH", payload: row }),
+        });
+        const d = await res.json();
+        if (d.ok) {
+          await refreshServer(true);
+          toast(`Tersimpan Real-Time: ${targetEmp.full_name} (${type} ${row.time_str})`);
+        } else {
+          toast(d.error || "Gagal menyimpan ke server");
+        }
+      } else {
+        const nextQ = [row, ...queue];
+        setQueue(nextQ);
+        localStorage.setItem(Q_KEY, JSON.stringify(nextQ));
+        toast(`Offline: ${targetEmp.full_name} (${type}) masuk antrean`);
+      }
+    } finally {
+      setBusyPunch(false);
+    }
+  };
+
+  const submitQrPunch = async (code: string) => {
     if (!user) return;
     if (code.trim().toUpperCase() !== settings.qr_code.trim().toUpperCase()) {
       toast(`QR salah! Gunakan QR resmi: ${settings.qr_code}`);
@@ -181,36 +232,9 @@ export default function AllInAttendanceSystem() {
       toast(`Di luar radius GPS (${distance}m > ${settings.radius_meters}m)`);
       return;
     }
-    const row: AttendanceRow = {
-      client_uuid: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-      emp_code: user.emp_code,
-      full_name: user.full_name,
-      entry_type: punchType,
-      date_str: wibDate(),
-      time_str: wibTime(),
-      is_late: false,
-      late_minutes: 0,
-      distance_meters: distance ?? 0,
-      status_label: "VALID",
-      sync_mode: navigator.onLine ? "ONLINE" : "OFFLINE",
-      notes: "",
-    };
     setQrInput("");
     stopScan();
-    if (navigator.onLine) {
-      await fetch("/api/all-in", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "RECORD_PUNCH", payload: row }),
-      });
-      await refreshServer();
-      toast(`Berhasil absen ${punchType}!`);
-    } else {
-      const nextQ = [row, ...queue];
-      setQueue(nextQ);
-      localStorage.setItem(Q_KEY, JSON.stringify(nextQ));
-      toast(`Tersimpan di antrean offline (${punchType})`);
-    }
+    await pushPunchToDb(user, punchType, "QR-GPS");
   };
 
   const startScan = async () => {
@@ -226,7 +250,7 @@ export default function AllInAttendanceSystem() {
           try {
             const codes = await detector.detect(videoRef.current);
             if (codes.length > 0 && codes[0].rawValue) {
-              submitPunch(codes[0].rawValue);
+              submitQrPunch(codes[0].rawValue);
               return;
             }
           } catch {}
@@ -321,7 +345,7 @@ export default function AllInAttendanceSystem() {
       <div style={{ minHeight: "100vh", background: "#f1f5f9", display: "flex", alignItems: "center", justifyContent: "center", padding: 16, fontFamily: "system-ui, sans-serif" }}>
         <form onSubmit={handleLogin} style={{ background: "#fff", padding: 24, borderRadius: 16, width: "100%", maxWidth: 380, boxShadow: "0 4px 16px rgba(0,0,0,0.08)" }}>
           <h2 style={{ margin: "0 0 4px", fontSize: 18 }}>APLIKASI ABSENSI QR & GPS</h2>
-          <p style={{ margin: "0 0 16px", fontSize: 12, color: "#64748b" }}>Login Admin atau Karyawan (Default Admin: ADM-001 / PIN: 0000)</p>
+          <p style={{ margin: "0 0 16px", fontSize: 12, color: "#64748b" }}>Login Admin (ADM-001 / 0000) atau ID Karyawan</p>
           {msg && <div style={{ background: "#fee2e2", color: "#b91c1c", padding: 8, borderRadius: 8, fontSize: 12, marginBottom: 10 }}>{msg}</div>}
           <input value={loginCode} onChange={(e) => setLoginCode(e.target.value)} placeholder="ID Karyawan (ADM-001)" style={{ width: "100%", padding: 10, borderRadius: 10, border: "1px solid #cbd5e1", marginBottom: 10 }} />
           <input type="password" value={loginPin} onChange={(e) => setLoginPin(e.target.value)} placeholder="PIN" style={{ width: "100%", padding: 10, borderRadius: 10, border: "1px solid #cbd5e1", marginBottom: 14 }} />
@@ -340,12 +364,13 @@ export default function AllInAttendanceSystem() {
         .top { background: #0f172a; color: #fff; padding: 16px; border-radius: 16px; margin-bottom: 12px; }
         .badge { display: inline-block; padding: 4px 10px; border-radius: 99px; font-size: 11px; font-weight: 700; }
         .btn { border: none; border-radius: 10px; padding: 9px 14px; font-size: 12px; font-weight: 700; cursor: pointer; }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
         .tabs { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-bottom: 12px; }
         .tab { background: #fff; border: 1px solid #cbd5e1; border-radius: 12px; padding: 10px 6px; font-size: 12px; font-weight: 700; cursor: pointer; }
         .tab.act { background: #1d4ed8; color: #fff; border-color: #1d4ed8; }
         .card { background: #fff; border-radius: 16px; padding: 16px; margin-bottom: 12px; box-shadow: 0 1px 4px rgba(0,0,0,0.05); }
         .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; text-align: center; }
-        .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
+        .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 10px; }
         .inp { width: 100%; padding: 9px 12px; border: 1px solid #cbd5e1; border-radius: 10px; font-size: 13px; background: #fff; }
         table { width: 100%; border-collapse: collapse; font-size: 12px; }
         th { background: #0f172a; color: #fff; text-align: left; padding: 9px 8px; white-space: nowrap; }
@@ -361,17 +386,17 @@ export default function AllInAttendanceSystem() {
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
           <div>
             <div style={{ fontWeight: 800, fontSize: 16 }}>APLIKASI ABSENSI QR & GPS</div>
-            <div style={{ fontSize: 12, color: "#94a3b8" }}>{user.full_name} ({user.emp_code}) • {user.role}</div>
+            <div style={{ fontSize: 12, color: "#94a3b8" }}>{user.full_name} ({user.emp_code}) • Sync: {lastSync} WIB</div>
           </div>
           <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
             <span className="badge" style={{ background: online ? "#16a34a" : "#d97706" }}>
               {online ? `ONLINE • ANTREAN: ${queue.length}` : `OFFLINE • ANTREAN: ${queue.length}`}
             </span>
             <button className="btn" style={{ background: autoLive ? "#059669" : "#475569", color: "#fff" }} onClick={() => setAutoLive(!autoLive)}>
-              {autoLive ? "LIVE 10d: ON" : "LIVE: OFF"}
+              {autoLive ? "LIVE 3d: ON" : "LIVE: OFF"}
             </button>
             <button className="btn" style={{ background: "#2563eb", color: "#fff" }} onClick={() => refreshServer()}>
-              {loading ? "Memuat..." : "Refresh Server"}
+              {loading ? "Sync..." : "Refresh Server"}
             </button>
             <button className="btn" style={{ background: "#dc2626", color: "#fff" }} onClick={() => { localStorage.removeItem(U_KEY); setUser(null); }}>
               Keluar
@@ -381,14 +406,39 @@ export default function AllInAttendanceSystem() {
       </div>
 
       <div className="tabs no-print">
-        <button className={`tab ${tab === "monitor" ? "act" : ""}`} onClick={() => setTab("monitor")}>Monitoring & Edit Absen</button>
-        <button className={`tab ${tab === "absen" ? "act" : ""}`} onClick={() => setTab("absen")}>Scan QR & Absen</button>
+        <button className={`tab ${tab === "monitor" ? "act" : ""}`} onClick={() => setTab("monitor")}>Monitoring & Absen Langsung</button>
+        <button className={`tab ${tab === "absen" ? "act" : ""}`} onClick={() => setTab("absen")}>Scan QR & GPS</button>
         {isAdmin && <button className={`tab ${tab === "karyawan" ? "act" : ""}`} onClick={() => setTab("karyawan")}>Edit Karyawan ({employees.length})</button>}
         {isAdmin && <button className={`tab ${tab === "sistem" ? "act" : ""}`} onClick={() => setTab("sistem")}>Edit Sistem, QR & GPS</button>}
       </div>
 
       {tab === "monitor" && (
         <>
+          <div className="card no-print" style={{ border: "2px solid #2563eb" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+              <strong>Absen Real-Time Saya ({user.full_name})</strong>
+              <span className="badge" style={{ background: "#dbeafe", color: "#1e40af" }}>LANGSUNG KE DATABASE</span>
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+              <button
+                className="btn"
+                disabled={busyPunch}
+                style={{ background: "#16a34a", color: "#fff", padding: 14, fontSize: 13 }}
+                onClick={() => pushPunchToDb(user, "MASUK", isAdmin ? "ADMIN-REALTIME" : "HP-REALTIME")}
+              >
+                + ABSEN MASUK SEKARANG
+              </button>
+              <button
+                className="btn"
+                disabled={busyPunch}
+                style={{ background: "#dc2626", color: "#fff", padding: 14, fontSize: 13 }}
+                onClick={() => pushPunchToDb(user, "KELUAR", isAdmin ? "ADMIN-REALTIME" : "HP-REALTIME")}
+              >
+                + ABSEN KELUAR SEKARANG
+              </button>
+            </div>
+          </div>
+
           <div className="card">
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
               <strong>Monitoring Kehadiran Hari Ini ({today})</strong>
@@ -410,24 +460,48 @@ export default function AllInAttendanceSystem() {
             </div>
 
             <div style={{ marginTop: 14 }}>
-              <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 8 }}>Status Realtime Semua Karyawan Hari Ini:</div>
+              <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 8 }}>
+                Status Realtime Semua Karyawan {isAdmin ? "(Klik Masuk/Keluar untuk absenkan langsung)" : ""}:
+              </div>
               <div className="grid2">
                 {employees.map((e) => {
                   const empLogs = todayRows.filter((r) => r.emp_code === e.emp_code);
                   const m = empLogs.find((r) => r.entry_type === "MASUK");
                   const k = empLogs.find((r) => r.entry_type === "KELUAR");
                   return (
-                    <div key={e.id} style={{ border: "1px solid #e2e8f0", borderRadius: 12, padding: 10, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                      <div>
-                        <div style={{ fontWeight: 700, fontSize: 13 }}>{e.full_name}</div>
-                        <div style={{ fontSize: 11, color: "#64748b" }}>{e.emp_code} • {e.department}</div>
-                      </div>
-                      <div style={{ textAlign: "right", fontSize: 11 }}>
-                        <div style={{ fontWeight: 700, color: m ? (m.is_late ? "#dc2626" : "#16a34a") : "#94a3b8" }}>
-                          {m ? `Masuk ${m.time_str}${m.is_late ? ` (Telat ${m.late_minutes}m)` : ""}` : "Belum Masuk"}
+                    <div key={e.id} style={{ border: "1px solid #e2e8f0", borderRadius: 12, padding: 10 }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                        <div>
+                          <div style={{ fontWeight: 700, fontSize: 13 }}>{e.full_name}</div>
+                          <div style={{ fontSize: 11, color: "#64748b" }}>{e.emp_code} • {e.department}</div>
                         </div>
-                        <div style={{ color: k ? "#2563eb" : "#94a3b8" }}>{k ? `Keluar ${k.time_str}` : "Belum Keluar"}</div>
+                        <div style={{ textAlign: "right", fontSize: 11 }}>
+                          <div style={{ fontWeight: 700, color: m ? (m.is_late ? "#dc2626" : "#16a34a") : "#94a3b8" }}>
+                            {m ? `Masuk ${m.time_str}${m.is_late ? ` (Telat ${m.late_minutes}m)` : ""}` : "Belum Masuk"}
+                          </div>
+                          <div style={{ color: k ? "#2563eb" : "#94a3b8" }}>{k ? `Keluar ${k.time_str}` : "Belum Keluar"}</div>
+                        </div>
                       </div>
+                      {isAdmin && (
+                        <div className="no-print" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginTop: 8, paddingTop: 8, borderTop: "1px dashed #e2e8f0" }}>
+                          <button
+                            className="btn"
+                            disabled={busyPunch}
+                            style={{ background: "#dcfce7", color: "#15803d", padding: "6px 8px", fontSize: 11 }}
+                            onClick={() => pushPunchToDb(e, "MASUK", "ADMIN-KLIK")}
+                          >
+                            + Masuk ({e.emp_code})
+                          </button>
+                          <button
+                            className="btn"
+                            disabled={busyPunch}
+                            style={{ background: "#fee2e2", color: "#b91c1c", padding: "6px 8px", fontSize: 11 }}
+                            onClick={() => pushPunchToDb(e, "KELUAR", "ADMIN-KLIK")}
+                          >
+                            + Keluar ({e.emp_code})
+                          </button>
+                        </div>
+                      )}
                     </div>
                   );
                 })}
@@ -441,7 +515,7 @@ export default function AllInAttendanceSystem() {
               <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
                 {isAdmin && (
                   <button className="btn" style={{ background: "#2563eb", color: "#fff" }} onClick={() => setEditAtt({ client_uuid: "", emp_code: employees[0]?.emp_code || "ADM-001", full_name: employees[0]?.full_name || "Admin", entry_type: "MASUK", date_str: today, time_str: "07:00", is_late: false, late_minutes: 0, distance_meters: 0, status_label: "VALID", sync_mode: "ADMIN", notes: "" })}>
-                    + Tambah Absen Manual
+                    + Input Jam Manual
                   </button>
                 )}
                 <button className="btn" style={{ background: "#059669", color: "#fff" }} onClick={exportExcel}>Download XLSX</button>
@@ -525,7 +599,7 @@ export default function AllInAttendanceSystem() {
             )}
             <div style={{ display: "flex", gap: 6 }}>
               <input className="inp" placeholder={`Input kode QR manual (${settings.qr_code})`} value={qrInput} onChange={(e) => setQrInput(e.target.value)} />
-              <button className="btn" style={{ background: "#0f172a", color: "#fff" }} onClick={() => submitPunch(qrInput)}>Kirim</button>
+              <button className="btn" style={{ background: "#0f172a", color: "#fff" }} onClick={() => submitQrPunch(qrInput)}>Kirim</button>
             </div>
           </div>
 
@@ -547,7 +621,7 @@ export default function AllInAttendanceSystem() {
           <div className="card">
             <strong>{empForm.id ? `Edit Karyawan (${empForm.emp_code})` : "Tambah Karyawan Baru"}</strong>
             <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 10 }}>
-              <input className="inp" placeholder="ID Karyawan (contoh: KRY-005)" value={empForm.emp_code} onChange={(e) => setEmpForm({ ...empForm, emp_code: e.target.value })} />
+              <input className="inp" placeholder="ID Karyawan (contoh: KRY-001)" value={empForm.emp_code} onChange={(e) => setEmpForm({ ...empForm, emp_code: e.target.value })} />
               <input className="inp" placeholder="Nama Lengkap" value={empForm.full_name} onChange={(e) => setEmpForm({ ...empForm, full_name: e.target.value })} />
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
                 <select className="inp" value={empForm.role} onChange={(e) => setEmpForm({ ...empForm, role: e.target.value })}>
