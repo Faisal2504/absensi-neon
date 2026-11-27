@@ -56,7 +56,7 @@ type BarcodeDetectorConstructor = new (options?: { formats?: string[] }) => Barc
 const KANTOR_LAT = -6.9148609;
 const KANTOR_LNG = 109.7446830;
 const MAX_RADIUS = 150;
-const OFFICIAL_QR_CODE = 'ABSENSI-KANTOR-MPI-BTG';
+const OFFICIAL_QR_CODE = 'KANTOR-UTAMA-01';
 
 async function getLocalDB() {
   return openDB('AbsensiNeonDB', 2, {
@@ -125,7 +125,16 @@ export default function AbsensiPage() {
   const [jadwalList, setJadwalList] = useState<JadwalItem[]>([]);
   const [logs, setLogs] = useState<AbsenRecord[]>([]);
   const [filterLaporan, setFilterLaporan] = useState<'Harian' | 'Mingguan' | 'Bulanan'>('Harian');
+  const [loadingSync, setLoadingSync] = useState(false);
 
+  // State Edit Absen Admin
+  const [editingLog, setEditingLog] = useState<AbsenRecord | null>(null);
+  const [editJenis, setEditJenis] = useState<'MASUK' | 'KELUAR'>('MASUK');
+  const [editWaktuScan, setEditWaktuScan] = useState('');
+  const [editTelatMenit, setEditTelatMenit] = useState(0);
+  const [editStatus, setEditStatus] = useState('');
+
+  // State Form Karyawan Admin
   const [formId, setFormId] = useState('');
   const [formNama, setFormNama] = useState('');
   const [formPin, setFormPin] = useState('1234');
@@ -185,53 +194,67 @@ export default function AbsensiPage() {
   }, []);
 
   useEffect(() => {
-    if (user) {
-      refreshAllData();
-      syncOfflineQueue();
-    }
+    if (!user) return;
+    refreshAllData();
+    syncOfflineQueue();
+
+    // Auto-refresh monitoring server setiap 20 detik saat online
+    const interval = window.setInterval(() => {
+      if (navigator.onLine) {
+        refreshAllData();
+      }
+    }, 20000);
+
+    return () => window.clearInterval(interval);
   }, [user]);
 
   async function refreshAllData() {
-    const db = await getLocalDB();
-    const qAll = await db.getAll('queue');
-    setQueueCount(qAll.length);
+    setLoadingSync(true);
+    try {
+      const db = await getLocalDB();
+      const qAll = await db.getAll('queue');
+      setQueueCount(qAll.length);
 
-    if (navigator.onLine) {
-      try {
-        const [resK, resJ, resA] = await Promise.all([
-          fetch('/api/karyawan').then((r) => r.json()),
-          fetch('/api/jadwal').then((r) => r.json()),
-          fetch('/api/absen').then((r) => r.json()),
-        ]);
-        if (resK.status === 'ok') {
-          setKaryawanList(resK.data);
-          const tx = db.transaction('users', 'readwrite');
-          await tx.store.clear();
-          for (const u of resK.data) await tx.store.put(u);
-          await tx.done;
+      if (navigator.onLine) {
+        try {
+          const [resK, resJ, resA] = await Promise.all([
+            fetch('/api/karyawan').then((r) => r.json()),
+            fetch('/api/jadwal').then((r) => r.json()),
+            fetch('/api/absen').then((r) => r.json()),
+          ]);
+          if (resK.status === 'ok') {
+            setKaryawanList(resK.data);
+            const tx = db.transaction('users', 'readwrite');
+            await tx.store.clear();
+            for (const u of resK.data) await tx.store.put(u);
+            await tx.done;
+          }
+          if (resJ.status === 'ok') {
+            setJadwalList(resJ.data);
+            const tx = db.transaction('jadwal', 'readwrite');
+            for (const j of resJ.data) await tx.store.put(j);
+            await tx.done;
+          }
+          if (resA.status === 'ok') {
+            setLogs(resA.data);
+            const tx = db.transaction('logs', 'readwrite');
+            await tx.store.clear();
+            for (const l of resA.data) await tx.store.put(l);
+            await tx.done;
+          }
+          return;
+        } catch {
+          // Fallback ke IndexedDB saat jaringan tidak stabil
         }
-        if (resJ.status === 'ok') {
-          setJadwalList(resJ.data);
-          const tx = db.transaction('jadwal', 'readwrite');
-          for (const j of resJ.data) await tx.store.put(j);
-          await tx.done;
-        }
-        if (resA.status === 'ok') {
-          setLogs(resA.data);
-          const tx = db.transaction('logs', 'readwrite');
-          for (const l of resA.data) await tx.store.put(l);
-          await tx.done;
-        }
-        return;
-      } catch {
-        // Fallback ke IndexedDB saat jaringan tidak stabil
       }
-    }
 
-    setKaryawanList(await db.getAll('users'));
-    setJadwalList(await db.getAll('jadwal'));
-    const cachedLogs = await db.getAll('logs');
-    setLogs(cachedLogs.reverse());
+      setKaryawanList(await db.getAll('users'));
+      setJadwalList(await db.getAll('jadwal'));
+      const cachedLogs = await db.getAll('logs');
+      setLogs(cachedLogs.reverse());
+    } finally {
+      setLoadingSync(false);
+    }
   }
 
   async function syncOfflineQueue() {
@@ -257,7 +280,7 @@ export default function AbsensiPage() {
         await refreshAllData();
       }
     } catch {
-      // Tetap simpan di antrean sampai sinyal kembali normal
+      // Tetap simpan di antrean sampai sinyal normal
     }
   }
 
@@ -399,7 +422,8 @@ export default function AbsensiPage() {
       (j) => j.id_karyawan === user.id_karyawan && j.tanggal === tgl
     );
     const jamJadwal = jadwalHariIni?.jam_berangkat || '07:00';
-    const toleransi = jadwalHariIni?.toleransi_menit ?? 10;
+    // Toleransi 9 menit sehingga telat 10 menit langsung terdeteksi Terlambat
+    const toleransi = jadwalHariIni?.toleransi_menit ?? 9;
 
     let telatMenit = 0;
     let status = 'Tepat Waktu';
@@ -446,6 +470,7 @@ export default function AbsensiPage() {
 
         if (res.status === 'ok') {
           alert(`Absen ${jenisAbsen} berhasil dicatat (${waktuScan}) • ${status}`);
+          await refreshAllData();
           return;
         }
       } catch {
@@ -457,6 +482,55 @@ export default function AbsensiPage() {
     const qAll = await db.getAll('queue');
     setQueueCount(qAll.length);
     alert(`Mode Offline: Absen ${jenisAbsen} disimpan ke antrean (${waktuScan}) dan akan otomatis terkirim saat online.`);
+  }
+
+  function startEditLog(log: AbsenRecord) {
+    setEditingLog(log);
+    setEditJenis(log.jenis);
+    setEditWaktuScan(log.waktu_scan);
+    setEditTelatMenit(log.telat_menit);
+    setEditStatus(log.status);
+  }
+
+  async function handleSaveEditLog(e: React.FormEvent) {
+    e.preventDefault();
+    if (!editingLog) return;
+    if (!navigator.onLine) return alert('Edit absensi memerlukan koneksi internet.');
+
+    const res = await fetch('/api/absen', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        id_log: editingLog.id_log,
+        jenis: editJenis,
+        waktu_scan: editWaktuScan,
+        telat_menit: Number(editTelatMenit),
+        status: editStatus,
+      }),
+    }).then((r) => r.json());
+
+    if (res.status === 'ok') {
+      setEditingLog(null);
+      await refreshAllData();
+      alert('Data absensi berhasil diperbarui di server.');
+    } else {
+      alert(res.message || 'Gagal memperbarui data absensi.');
+    }
+  }
+
+  async function handleDeleteLog(log: AbsenRecord) {
+    if (!navigator.onLine) return alert('Hapus absensi memerlukan koneksi internet.');
+    if (!confirm(`Hapus riwayat absen ${log.nama} (${log.jenis} • ${log.waktu_scan})?`)) return;
+
+    const res = await fetch(`/api/absen?id_log=${encodeURIComponent(log.id_log)}`, {
+      method: 'DELETE',
+    }).then((r) => r.json());
+
+    if (res.status === 'ok') {
+      await refreshAllData();
+    } else {
+      alert(res.message || 'Gagal menghapus data absensi.');
+    }
   }
 
   async function handleDownloadQR() {
@@ -546,14 +620,16 @@ export default function AbsensiPage() {
       const wb = XLSX.read(buf);
       const sheet = wb.Sheets[wb.SheetNames[0]];
       const rawRows = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet);
-      const formatted: JadwalItem[] = rawRows.map((r) => ({
-        id_karyawan: String(r.id_karyawan || r.ID || '').trim().toUpperCase(),
-        nama: String(r.nama || r.Nama || '').trim(),
-        tanggal: String(r.tanggal || r.Tanggal || todayISO()).trim(),
-        jam_berangkat: String(r.jam_berangkat || r.Jam_Masuk || '07:00').trim(),
-        jam_pulang: String(r.jam_pulang || r.Jam_Pulang || '17:00').trim(),
-        toleransi_menit: Number(r.toleransi_menit || 10),
-      })).filter((item) => item.id_karyawan && item.tanggal);
+      const formatted: JadwalItem[] = rawRows
+        .map((r) => ({
+          id_karyawan: String(r.id_karyawan || r.ID || '').trim().toUpperCase(),
+          nama: String(r.nama || r.Nama || '').trim(),
+          tanggal: String(r.tanggal || r.Tanggal || todayISO()).trim(),
+          jam_berangkat: String(r.jam_berangkat || r.Jam_Masuk || '07:00').trim(),
+          jam_pulang: String(r.jam_pulang || r.Jam_Pulang || '17:00').trim(),
+          toleransi_menit: Number(r.toleransi_menit ?? 9),
+        }))
+        .filter((item) => item.id_karyawan && item.tanggal);
 
       if (formatted.length === 0) {
         alert('Format file tidak sesuai. Pastikan ada kolom: id_karyawan, nama, tanggal, jam_berangkat.');
@@ -610,23 +686,30 @@ export default function AbsensiPage() {
     }
   }
 
+  const todayStr = todayISO();
+  const logsHariIni = logs.filter((l) => l.tanggal === todayStr);
+  const jumlahMasukHariIni = logsHariIni.filter((l) => l.jenis === 'MASUK').length;
+  const jumlahTelatHariIni = logsHariIni.filter(
+    (l) => l.jenis === 'MASUK' && l.telat_menit > 0
+  ).length;
+  const jumlahKeluarHariIni = logsHariIni.filter((l) => l.jenis === 'KELUAR').length;
+
   const filteredLogs = logs.filter((l) => {
     if (user?.role !== 'admin' && l.id_karyawan !== user?.id_karyawan) return false;
     const tgl = l.tanggal;
-    const today = todayISO();
-    if (filterLaporan === 'Harian') return tgl === today;
+    if (filterLaporan === 'Harian') return tgl === todayStr;
     if (filterLaporan === 'Mingguan') {
-      const diff = (new Date(today).getTime() - new Date(tgl).getTime()) / (1000 * 3600 * 24);
+      const diff = (new Date(todayStr).getTime() - new Date(tgl).getTime()) / (1000 * 3600 * 24);
       return diff >= 0 && diff <= 7;
     }
-    return tgl.slice(0, 7) === today.slice(0, 7);
+    return tgl.slice(0, 7) === todayStr.slice(0, 7);
   });
 
   function exportXLSX() {
     const ws = XLSX.utils.json_to_sheet(filteredLogs);
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'Laporan_Absensi');
-    XLSX.writeFile(wb, `Laporan_Absensi_${filterLaporan}_${todayISO()}.xlsx`);
+    XLSX.writeFile(wb, `Laporan_Absensi_${filterLaporan}_${todayStr}.xlsx`);
   }
 
   function exportCSV() {
@@ -635,18 +718,19 @@ export default function AbsensiPage() {
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    a.download = `Laporan_Absensi_${filterLaporan}_${todayISO()}.csv`;
+    a.download = `Laporan_Absensi_${filterLaporan}_${todayStr}.csv`;
     a.click();
   }
 
   function exportPDF() {
     const doc = new jsPDF();
-    doc.text(`Laporan Absensi (${filterLaporan}) - ${todayISO()}`, 14, 16);
+    doc.text(`Laporan Absensi (${filterLaporan}) - ${todayStr}`, 14, 16);
     autoTable(doc, {
       startY: 22,
-      head: [['Tanggal', 'Nama', 'Jenis', 'Scan', 'Telat', 'Status', 'Mode']],
+      head: [['Tanggal', 'ID', 'Nama', 'Jenis', 'Scan', 'Telat', 'Status', 'Mode']],
       body: filteredLogs.map((l) => [
         l.tanggal,
+        l.id_karyawan,
         l.nama,
         l.jenis,
         l.waktu_scan,
@@ -655,7 +739,7 @@ export default function AbsensiPage() {
         l.mode_rekam,
       ]),
     });
-    doc.save(`Laporan_Absensi_${filterLaporan}_${todayISO()}.pdf`);
+    doc.save(`Laporan_Absensi_${filterLaporan}_${todayStr}.pdf`);
   }
 
   if (!user) {
@@ -709,7 +793,7 @@ export default function AbsensiPage() {
   }
 
   const todaySchedule = jadwalList.find(
-    (j) => j.id_karyawan === user.id_karyawan && j.tanggal === todayISO()
+    (j) => j.id_karyawan === user.id_karyawan && j.tanggal === todayStr
   );
   const gpsAman = jarakMeter !== null && jarakMeter <= MAX_RADIUS;
 
@@ -729,6 +813,16 @@ export default function AbsensiPage() {
           >
             {isOnline ? 'ONLINE' : 'OFFLINE'} • ANTREAN: {queueCount}
           </span>
+          <button
+            type="button"
+            onClick={() => {
+              syncOfflineQueue();
+              refreshAllData();
+            }}
+            className="bg-blue-600 hover:bg-blue-500 text-xs font-semibold px-3 py-1 rounded-full"
+          >
+            {loadingSync ? 'Menyegarkan...' : 'Refresh Server'}
+          </button>
           {installPrompt && (
             <button
               onClick={handleInstallPWA}
@@ -745,6 +839,34 @@ export default function AbsensiPage() {
           </button>
         </div>
       </div>
+
+      {/* Monitoring Live Khusus Admin */}
+      {user.role === 'admin' && (
+        <section className="bg-white rounded-2xl p-4 shadow space-y-3 border-t-4 border-indigo-600">
+          <div className="flex items-center justify-between">
+            <h2 className="font-bold text-slate-800 text-sm">
+              Monitoring Kehadiran Hari Ini ({todayStr})
+            </h2>
+            <span className="text-[10px] font-semibold bg-emerald-100 text-emerald-700 px-2 py-0.5 rounded-full">
+              LIVE SERVER
+            </span>
+          </div>
+          <div className="grid grid-cols-3 gap-2 text-center">
+            <div className="bg-blue-50 border border-blue-200 rounded-xl p-2.5">
+              <div className="text-lg font-extrabold text-blue-700">{jumlahMasukHariIni}</div>
+              <div className="text-[11px] font-medium text-slate-600">Absen Masuk</div>
+            </div>
+            <div className="bg-amber-50 border border-amber-200 rounded-xl p-2.5">
+              <div className="text-lg font-extrabold text-amber-700">{jumlahTelatHariIni}</div>
+              <div className="text-[11px] font-medium text-slate-600">Terlambat</div>
+            </div>
+            <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-2.5">
+              <div className="text-lg font-extrabold text-emerald-700">{jumlahKeluarHariIni}</div>
+              <div className="text-[11px] font-medium text-slate-600">Absen Keluar</div>
+            </div>
+          </div>
+        </section>
+      )}
 
       {/* 1. Scan QR & GPS Realtime */}
       <section className="bg-white rounded-2xl p-4 shadow space-y-3">
@@ -845,10 +967,10 @@ export default function AbsensiPage() {
         </section>
       )}
 
-      {/* 3. Laporan */}
+      {/* 3. Laporan & Kelola Absensi */}
       <section className="bg-white rounded-2xl p-4 shadow space-y-3">
         <div className="flex items-center justify-between">
-          <h2 className="font-bold text-slate-800 text-sm">3. Laporan:</h2>
+          <h2 className="font-bold text-slate-800 text-sm">3. Laporan &amp; Data Absensi:</h2>
           <select
             value={filterLaporan}
             onChange={(e) => setFilterLaporan(e.target.value as 'Harian' | 'Mingguan' | 'Bulanan')}
@@ -860,26 +982,98 @@ export default function AbsensiPage() {
           </select>
         </div>
 
-        <div className="flex gap-2">
+        <div className="flex gap-2 flex-wrap">
           <button
             onClick={exportXLSX}
             className="bg-emerald-700 text-white text-xs font-semibold px-3 py-1.5 rounded-lg"
           >
-            XLSX
+            Download XLSX
           </button>
           <button
             onClick={exportPDF}
             className="bg-red-600 text-white text-xs font-semibold px-3 py-1.5 rounded-lg"
           >
-            PDF
+            Download PDF
           </button>
           <button
             onClick={exportCSV}
             className="bg-slate-800 text-white text-xs font-semibold px-3 py-1.5 rounded-lg"
           >
-            CSV
+            Download CSV
           </button>
         </div>
+
+        {/* Form Edit Absen Khusus Admin */}
+        {user.role === 'admin' && editingLog && (
+          <form
+            onSubmit={handleSaveEditLog}
+            className="bg-amber-50 border border-amber-300 rounded-xl p-3 space-y-2.5"
+          >
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-bold text-amber-900">
+                Edit Absen: {editingLog.nama} ({editingLog.tanggal})
+              </span>
+              <button
+                type="button"
+                onClick={() => setEditingLog(null)}
+                className="text-xs text-red-600 font-semibold"
+              >
+                Batal
+              </button>
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <div>
+                <label className="block text-[10px] text-slate-600 mb-1">Jenis Absen</label>
+                <select
+                  value={editJenis}
+                  onChange={(e) => setEditJenis(e.target.value as 'MASUK' | 'KELUAR')}
+                  className="w-full border border-slate-300 rounded-lg px-2 py-1.5 text-xs bg-white"
+                >
+                  <option value="MASUK">MASUK</option>
+                  <option value="KELUAR">KELUAR</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-[10px] text-slate-600 mb-1">Waktu Scan (HH:MM)</label>
+                <input
+                  type="text"
+                  value={editWaktuScan}
+                  onChange={(e) => setEditWaktuScan(e.target.value)}
+                  placeholder="07:00"
+                  className="w-full border border-slate-300 rounded-lg px-2 py-1.5 text-xs bg-white"
+                />
+              </div>
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <div>
+                <label className="block text-[10px] text-slate-600 mb-1">Telat (Menit)</label>
+                <input
+                  type="number"
+                  min={0}
+                  value={editTelatMenit}
+                  onChange={(e) => setEditTelatMenit(Number(e.target.value))}
+                  className="w-full border border-slate-300 rounded-lg px-2 py-1.5 text-xs bg-white"
+                />
+              </div>
+              <div>
+                <label className="block text-[10px] text-slate-600 mb-1">Status</label>
+                <input
+                  type="text"
+                  value={editStatus}
+                  onChange={(e) => setEditStatus(e.target.value)}
+                  placeholder="Tepat Waktu / Izin"
+                  className="w-full border border-slate-300 rounded-lg px-2 py-1.5 text-xs bg-white"
+                />
+              </div>
+            </div>
+            <button
+              type="submit"
+              className="w-full bg-amber-600 hover:bg-amber-500 text-white font-semibold py-2 rounded-lg text-xs"
+            >
+              Simpan Perubahan Absen
+            </button>
+          </form>
+        )}
 
         <div className="overflow-x-auto">
           <table className="w-full text-left border-collapse text-[11px]">
@@ -892,12 +1086,13 @@ export default function AbsensiPage() {
                 <th className="p-2">Telat</th>
                 <th className="p-2">Status</th>
                 <th className="p-2">Mode</th>
+                {user.role === 'admin' && <th className="p-2">Aksi</th>}
               </tr>
             </thead>
             <tbody>
               {filteredLogs.length === 0 ? (
                 <tr>
-                  <td colSpan={7} className="p-3 text-center text-slate-400">
+                  <td colSpan={user.role === 'admin' ? 8 : 7} className="p-3 text-center text-slate-400">
                     Belum ada data absensi.
                   </td>
                 </tr>
@@ -911,6 +1106,24 @@ export default function AbsensiPage() {
                     <td className="p-2">{l.telat_menit}m</td>
                     <td className="p-2">{l.status}</td>
                     <td className="p-2">{l.mode_rekam}</td>
+                    {user.role === 'admin' && (
+                      <td className="p-2 flex gap-1">
+                        <button
+                          type="button"
+                          onClick={() => startEditLog(l)}
+                          className="bg-amber-500 text-white px-2 py-1 rounded text-[10px] font-semibold"
+                        >
+                          Edit
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleDeleteLog(l)}
+                          className="bg-red-600 text-white px-2 py-1 rounded text-[10px] font-semibold"
+                        >
+                          Hapus
+                        </button>
+                      </td>
+                    )}
                   </tr>
                 ))
               )}
@@ -919,13 +1132,11 @@ export default function AbsensiPage() {
         </div>
       </section>
 
-      {/* 4. Panel Admin: QR Kantor Utama & Data Karyawan */}
+      {/* 4. QR Code Resmi Kantor Utama & 5. Data Karyawan */}
       {user.role === 'admin' && (
         <>
           <section className="bg-white rounded-2xl p-4 shadow space-y-3 border-t-4 border-emerald-600">
-            <h2 className="font-bold text-slate-800 text-sm">
-              4. QR Code Resmi Kantor Utama
-            </h2>
+            <h2 className="font-bold text-slate-800 text-sm">4. QR Code Resmi Kantor Utama</h2>
             <p className="text-xs text-slate-600">
               Cetak atau tampilkan QR Code ini di lokasi kantor. Sistem mengunci pemindaian agar
               karyawan hanya bisa absen <strong>MASUK</strong> dan <strong>KELUAR</strong> memakai
@@ -1055,6 +1266,8 @@ export default function AbsensiPage() {
   );
 }
 
-    
+  
 
-        
+      
+            
+            
