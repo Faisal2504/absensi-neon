@@ -55,9 +55,8 @@ interface BarcodeDetectorInstance {
   ) => Promise<Array<{ rawValue?: string; raw_value?: string }>>;
 }
 
-// Koordinat GPS kantor terkunci permanen
-const LOCKED_LAT = -6.9148609;
-const LOCKED_LNG = 109.744683;
+const DEFAULT_LAT = -6.9148609;
+const DEFAULT_LNG = 109.744683;
 const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
 
 const SHIFT_OPTIONS = [
@@ -66,12 +65,13 @@ const SHIFT_OPTIONS = [
   { label: "Shift Malam (23.00)", time: "23.00" },
 ];
 
-const CACHE_KEY = "absensi_v5_cache";
-const QUEUE_KEY = "absensi_v5_queue";
-const QR_CODE_KEY = "absensi_v5_qr";
-const DEVICE_LOCK_KEY = "absensi_v5_device_locked_karyawan";
-const STAFF_EMP_KEY = "absensi_v5_staff_emp_id";
-const AUTH_SERVER_KEY = "absensi_v5_auth_server";
+const CACHE_KEY = "absensi_v6_cache";
+const QUEUE_KEY = "absensi_v6_queue";
+const QR_CODE_KEY = "absensi_v6_qr";
+const LOC_KEY = "absensi_v6_custom_loc";
+const DEVICE_LOCK_KEY = "absensi_v6_device_locked_karyawan";
+const STAFF_EMP_KEY = "absensi_v6_staff_emp_id";
+const AUTH_SERVER_KEY = "absensi_v6_auth_server";
 
 function normalizeShiftTime(raw?: string | null): string {
   const s = String(raw || "").trim();
@@ -130,26 +130,12 @@ const DEFAULT_EMPLOYEES: Employee[] = [
 const DEFAULT_LOCATIONS: LocationItem[] = [
   {
     id: 1,
-    name: "Kantor Utama Terkunci",
-    latitude: LOCKED_LAT,
-    longitude: LOCKED_LNG,
+    name: "Kantor Utama",
+    latitude: DEFAULT_LAT,
+    longitude: DEFAULT_LNG,
     radius_meters: 150,
   },
 ];
-
-function enforceLockedLocation(list: LocationItem[]): LocationItem[] {
-  const base = list && list.length > 0 ? list : DEFAULT_LOCATIONS;
-  return base.map((loc, idx) =>
-    idx === 0
-      ? {
-          ...loc,
-          latitude: LOCKED_LAT,
-          longitude: LOCKED_LNG,
-          radius_meters: Number(loc.radius_meters) || 150,
-        }
-      : loc
-  );
-}
 
 const getJakartaDateStr = (iso?: string) =>
   new Date(iso || new Date().toISOString()).toLocaleDateString("en-CA", {
@@ -352,7 +338,6 @@ function getInitialBoot() {
       qServer === "staff" ||
       localStorage.getItem(DEVICE_LOCK_KEY) === "1"
     ) {
-      // Kunci HP karyawan secara permanen agar tidak bisa mengakses dasbor Manager maupun Admin
       localStorage.setItem(DEVICE_LOCK_KEY, "1");
       localStorage.removeItem(AUTH_SERVER_KEY);
       isDeviceLockedKaryawan = true;
@@ -387,9 +372,33 @@ function getInitialBoot() {
         }));
       }
       if (Array.isArray(c.locations) && c.locations.length > 0) {
-        locations = enforceLockedLocation(c.locations);
+        locations = c.locations;
       }
       if (Array.isArray(c.entries)) entries = c.entries;
+    }
+
+    const savedCustomLoc = localStorage.getItem(LOC_KEY);
+    if (savedCustomLoc) {
+      const parsedLoc = JSON.parse(savedCustomLoc);
+      if (
+        typeof parsedLoc.latitude === "number" &&
+        !isNaN(parsedLoc.latitude) &&
+        typeof parsedLoc.longitude === "number" &&
+        !isNaN(parsedLoc.longitude)
+      ) {
+        locations = [
+          {
+            id: locations[0]?.id || 1,
+            name: parsedLoc.name || locations[0]?.name || "Kantor Utama",
+            latitude: parsedLoc.latitude,
+            longitude: parsedLoc.longitude,
+            radius_meters:
+              Number(parsedLoc.radius_meters) ||
+              locations[0]?.radius_meters ||
+              150,
+          },
+        ];
+      }
     }
   } catch {
     // Abaikan error storage
@@ -446,6 +455,9 @@ export default function AbsensiMultiServerPage() {
     lat: number;
     lng: number;
   } | null>(null);
+  const [gpsStatusText, setGpsStatusText] = useState<string>(
+    "Menunggu pembacaan GPS perangkat..."
+  );
 
   const [selfieCameraOn, setSelfieCameraOn] = useState(false);
   const [capturedSelfie, setCapturedSelfie] = useState<string | null>(null);
@@ -476,7 +488,7 @@ export default function AbsensiMultiServerPage() {
   const [editTimeLocal, setEditTimeLocal] = useState("");
   const [editNotes, setEditNotes] = useState("");
 
-  // 5. Panel Admin & Manager
+  // 5. Panel Admin & Manager: Karyawan + Koordinat GPS Bebas Diatur
   const [empForm, setEmpForm] = useState({
     id: 0,
     emp_code: "",
@@ -486,8 +498,14 @@ export default function AbsensiMultiServerPage() {
     pin_code: "1234",
     shift_start_time: "07.00",
   });
+  const [latInput, setLatInput] = useState<string>(
+    String(boot.locations[0]?.latitude ?? DEFAULT_LAT)
+  );
+  const [lngInput, setLngInput] = useState<string>(
+    String(boot.locations[0]?.longitude ?? DEFAULT_LNG)
+  );
   const [radiusInput, setRadiusInput] = useState<string>(
-    String(boot.locations[0]?.radius_meters || 150)
+    String(boot.locations[0]?.radius_meters ?? 150)
   );
 
   const [toast, setToast] = useState<{
@@ -647,18 +665,50 @@ export default function AbsensiMultiServerPage() {
                   shift_start_time: normalizeShiftTime(e.shift_start_time),
                 }))
               : DEFAULT_EMPLOYEES;
-          const nextLocs = enforceLockedLocation(
+
+          let nextLocs: LocationItem[] =
             Array.isArray(data.locations) && data.locations.length > 0
               ? data.locations
-              : DEFAULT_LOCATIONS
-          );
+              : DEFAULT_LOCATIONS;
+
+          // Jika ada koordinat custom tersimpan di perangkat/server, pertahankan agar tidak tertimpa nilai lama
+          try {
+            const savedCustom = localStorage.getItem(LOC_KEY);
+            if (savedCustom) {
+              const cLoc = JSON.parse(savedCustom);
+              if (
+                typeof cLoc.latitude === "number" &&
+                !isNaN(cLoc.latitude) &&
+                typeof cLoc.longitude === "number" &&
+                !isNaN(cLoc.longitude)
+              ) {
+                nextLocs = [
+                  {
+                    id: nextLocs[0]?.id || 1,
+                    name: cLoc.name || nextLocs[0]?.name || "Kantor Utama",
+                    latitude: cLoc.latitude,
+                    longitude: cLoc.longitude,
+                    radius_meters:
+                      Number(cLoc.radius_meters) ||
+                      nextLocs[0]?.radius_meters ||
+                      150,
+                  },
+                ];
+              }
+            }
+          } catch {
+            // Abaikan
+          }
+
           const nextEntries: TimeEntry[] = Array.isArray(data.entries)
             ? data.entries
             : [];
 
           setEmployees(nextEmps);
           setLocations(nextLocs);
-          setRadiusInput(String(nextLocs[0]?.radius_meters || 150));
+          setLatInput(String(nextLocs[0]?.latitude ?? DEFAULT_LAT));
+          setLngInput(String(nextLocs[0]?.longitude ?? DEFAULT_LNG));
+          setRadiusInput(String(nextLocs[0]?.radius_meters ?? 150));
           setServerEntries(nextEntries);
           localStorage.setItem(
             CACHE_KEY,
@@ -679,6 +729,30 @@ export default function AbsensiMultiServerPage() {
     }
   }, [notify, syncOfflineQueue, serverOffsetMs]);
 
+  const requestCurrentGps = useCallback(() => {
+    if (!("geolocation" in navigator)) {
+      setGpsStatusText("GPS browser tidak tersedia.");
+      return;
+    }
+    setGpsStatusText("Mengambil posisi GPS...");
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        const lat = Number(pos.coords.latitude.toFixed(7));
+        const lng = Number(pos.coords.longitude.toFixed(7));
+        setGpsCoords({ lat, lng });
+        setGpsStatusText(`GPS aktif: ${lat}, ${lng}`);
+      },
+      (err) => {
+        setGpsStatusText(
+          err.code === 1
+            ? "Izin lokasi ditolak. Aktifkan izin GPS di browser."
+            : "Sinyal GPS lemah. Coba ambil ulang GPS."
+        );
+      },
+      { enableHighAccuracy: false, timeout: 12000, maximumAge: 30000 }
+    );
+  }, []);
+
   useEffect(() => {
     const onOnline = () => {
       setIsOnline(true);
@@ -691,65 +765,51 @@ export default function AbsensiMultiServerPage() {
     window.addEventListener("online", onOnline);
     window.addEventListener("offline", onOffline);
 
-    let watchId: number | null = null;
     const t = window.setTimeout(() => {
       void refreshServer();
-      if ("geolocation" in navigator) {
-        watchId = navigator.geolocation.watchPosition(
-          (pos) => {
-            setGpsCoords({
-              lat: pos.coords.latitude,
-              lng: pos.coords.longitude,
-            });
-          },
-          () => {
-            // Abaikan error GPS sementara
-          },
-          { enableHighAccuracy: true, timeout: 10000, maximumAge: 5000 }
-        );
-      }
+      requestCurrentGps();
     }, 0);
 
     return () => {
       clearTimeout(t);
-      if (watchId !== null && "geolocation" in navigator) {
-        navigator.geolocation.clearWatch(watchId);
-      }
       window.removeEventListener("online", onOnline);
       window.removeEventListener("offline", onOffline);
       stopQrCam();
       stopSelfieCam();
     };
-  }, [refreshServer, notify, stopQrCam, stopSelfieCam]);
+  }, [refreshServer, requestCurrentGps, notify, stopQrCam, stopSelfieCam]);
 
-  // Koordinat kantor terkunci permanen pada -6.9148609, 109.7446830
-  const activeRadiusMeters = useMemo(
-    () => Number(locations[0]?.radius_meters || 150),
-    [locations]
-  );
+  const targetLocation = useMemo(() => {
+    const loc = locations[0] || DEFAULT_LOCATIONS[0];
+    return {
+      latitude: Number(loc.latitude),
+      longitude: Number(loc.longitude),
+      radius_meters: Math.max(10, Number(loc.radius_meters) || 150),
+    };
+  }, [locations]);
 
   const geofence = useMemo(() => {
     if (!gpsCoords) return null;
     const dist = haversineMeters(
       gpsCoords.lat,
       gpsCoords.lng,
-      LOCKED_LAT,
-      LOCKED_LNG
+      targetLocation.latitude,
+      targetLocation.longitude
     );
     return {
       distance: dist,
-      inside: dist <= activeRadiusMeters,
+      inside: dist <= targetLocation.radius_meters,
     };
-  }, [gpsCoords, activeRadiusMeters]);
+  }, [gpsCoords, targetLocation]);
 
   const geofenceLabel = useMemo(() => {
     if (!geofence) {
-      return `Mendeteksi GPS... Titik Kantor Terkunci (${LOCKED_LAT}, ${LOCKED_LNG})`;
+      return `${gpsStatusText} • Target (${targetLocation.latitude}, ${targetLocation.longitude})`;
     }
     return `GPS: Jarak ${geofence.distance}m (${
       geofence.inside ? "Aman • Di Dalam Radius" : "Di Luar Radius Kantor"
     })`;
-  }, [geofence]);
+  }, [geofence, gpsStatusText, targetLocation]);
 
   const allEntries = useMemo(() => {
     const seen = new Set(serverEntries.map((e) => e.client_uuid));
@@ -987,27 +1047,21 @@ export default function AbsensiMultiServerPage() {
       return;
     }
 
-    // Validasi ketat untuk Karyawan: wajib di titik koordinat (-6.9148609, 109.7446830) & wajib selfie wajah
+    // Validasi radius lokasi untuk Karyawan sesuai koordinat yang diatur di server
     if (isKaryawanMode) {
       if (!gpsCoords) {
-        notify(
-          "err",
-          "GPS wajib aktif agar sistem memverifikasi lokasi kantor (-6.9148609, 109.7446830)."
-        );
+        notify("err", "Aktifkan GPS lokasi untuk memverifikasi titik absen.");
         return;
       }
       if (geofence && !geofence.inside) {
         notify(
           "err",
-          `Ditolak! Anda berada ${geofence.distance}m dari kantor (maks ${activeRadiusMeters}m). Tidak bisa absen di tempat lain.`
+          `Di luar radius kantor (${geofence.distance}m > ${targetLocation.radius_meters}m).`
         );
         return;
       }
       if (!capturedSelfie) {
-        notify(
-          "err",
-          "Wajib ambil foto selfie pendeteksi wajah sebelum absen."
-        );
+        notify("err", "Wajib ambil foto selfie deteksi wajah sebelum absen.");
         return;
       }
     }
@@ -1026,8 +1080,8 @@ export default function AbsensiMultiServerPage() {
       is_offline_sync: !navigator.onLine,
       qr_code: enteredCode,
       mode: capturedSelfie ? "BARCODE + WAJAH" : "BARCODE + GPS",
-      latitude: gpsCoords?.lat ?? LOCKED_LAT,
-      longitude: gpsCoords?.lng ?? LOCKED_LNG,
+      latitude: gpsCoords?.lat ?? targetLocation.latitude,
+      longitude: gpsCoords?.lng ?? targetLocation.longitude,
       distance_meters: geofence?.distance ?? 0,
       is_within_geofence: geofence ? geofence.inside : true,
       selfie_data: capturedSelfie,
@@ -1056,7 +1110,6 @@ export default function AbsensiMultiServerPage() {
     );
   };
 
-  // Kunci perangkat HP karyawan secara permanen
   const lockDeviceToKaryawan = () => {
     stopQrCam();
     stopSelfieCam();
@@ -1077,7 +1130,8 @@ export default function AbsensiMultiServerPage() {
   };
 
   const verifyPrivilegedLogin = () => {
-    const expectedPin = activeUser?.pin_code || (isManagerServer ? "2026" : "0000");
+    const expectedPin =
+      activeUser?.pin_code || (isManagerServer ? "2026" : "0000");
     if (pinEntry.trim() === expectedPin) {
       localStorage.setItem(AUTH_SERVER_KEY, serverMode);
       setIsPrivilegedAuthed(true);
@@ -1340,7 +1394,11 @@ export default function AbsensiMultiServerPage() {
   };
 
   const saveEmployee = async () => {
-    if (isKaryawanMode || !empForm.emp_code.trim() || !empForm.full_name.trim()) {
+    if (
+      isKaryawanMode ||
+      !empForm.emp_code.trim() ||
+      !empForm.full_name.trim()
+    ) {
       notify("err", "Isi ID dan Nama Lengkap karyawan.");
       return;
     }
@@ -1415,22 +1473,62 @@ export default function AbsensiMultiServerPage() {
     notify("ok", "Anggota karyawan dihapus.");
   };
 
-  const saveLockedRadius = async () => {
-    if (isKaryawanMode) return;
-    const rad = Math.max(10, Number(radiusInput) || 150);
-    const updated = enforceLockedLocation(
-      locations.map((loc, idx) =>
-        idx === 0
-          ? {
-              ...loc,
-              latitude: LOCKED_LAT,
-              longitude: LOCKED_LNG,
-              radius_meters: rad,
-            }
-          : loc
-      )
+  const fillFromCurrentGps = () => {
+    if (!("geolocation" in navigator)) {
+      notify("err", "GPS tidak tersedia di perangkat ini.");
+      return;
+    }
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        const lat = Number(pos.coords.latitude.toFixed(7));
+        const lng = Number(pos.coords.longitude.toFixed(7));
+        setLatInput(String(lat));
+        setLngInput(String(lng));
+        setGpsCoords({ lat, lng });
+        notify("ok", `Koordinat terisi dari GPS: ${lat}, ${lng}`);
+      },
+      () => {
+        notify("err", "Gagal membaca GPS saat ini.");
+      },
+      { enableHighAccuracy: false, timeout: 12000, maximumAge: 30000 }
     );
-    setLocations(updated);
+  };
+
+  const saveCustomLocation = async () => {
+    if (isKaryawanMode) return;
+    const parsedLat = Number(String(latInput).replace(",", "."));
+    const parsedLng = Number(String(lngInput).replace(",", "."));
+    const parsedRadius = Math.max(10, Number(radiusInput) || 150);
+
+    if (
+      isNaN(parsedLat) ||
+      isNaN(parsedLng) ||
+      parsedLat < -90 ||
+      parsedLat > 90 ||
+      parsedLng < -180 ||
+      parsedLng > 180
+    ) {
+      notify(
+        "err",
+        "Masukkan Latitude (-90 s/d 90) dan Longitude (-180 s/d 180) yang valid."
+      );
+      return;
+    }
+
+    const locPayload: LocationItem = {
+      id: locations[0]?.id || 1,
+      name: locations[0]?.name || "Kantor Utama",
+      latitude: parsedLat,
+      longitude: parsedLng,
+      radius_meters: parsedRadius,
+    };
+
+    setLocations([locPayload]);
+    setLatInput(String(parsedLat));
+    setLngInput(String(parsedLng));
+    setRadiusInput(String(parsedRadius));
+    localStorage.setItem(LOC_KEY, JSON.stringify(locPayload));
+
     if (navigator.onLine) {
       try {
         await fetch("/api/manage", {
@@ -1438,16 +1536,16 @@ export default function AbsensiMultiServerPage() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             action: "SAVE_LOCATION",
-            payload: updated[0],
+            payload: locPayload,
           }),
         });
       } catch {
-        // Tetap terkunci
+        // Tetap tersimpan lokal
       }
     }
     notify(
       "ok",
-      `Radius ${rad}m disimpan. Posisi asli terkunci (${LOCKED_LAT}, ${LOCKED_LNG}).`
+      `Titik koordinat diperbarui: ${parsedLat}, ${parsedLng} (Radius ${parsedRadius}m)`
     );
   };
 
@@ -1462,7 +1560,6 @@ export default function AbsensiMultiServerPage() {
       .slice(0, 5);
   }, [allEntries, activeUser]);
 
-  // Gerbang PIN untuk Server MANAGER & Server ADMIN (tidak pernah muncul di perangkat karyawan)
   if (!isKaryawanMode && !isPrivilegedAuthed) {
     return (
       <div className="min-h-screen bg-[#ECEFF4] flex items-center justify-center p-4">
@@ -1598,14 +1695,16 @@ export default function AbsensiMultiServerPage() {
             </span>
             <button
               type="button"
-              onClick={() => void refreshServer()}
+              onClick={() => {
+                void refreshServer();
+                requestCurrentGps();
+              }}
               disabled={isSyncing}
               className="px-2.5 py-1 rounded-md bg-blue-600 hover:bg-blue-700 text-white text-[10px] font-bold"
             >
               {isSyncing ? "Sinkron..." : "Refresh Server"}
             </button>
 
-            {/* Tombol pembeda hanya muncul di Server Admin & Manager; HP Karyawan terkunci penuh */}
             {!isKaryawanMode && (
               <>
                 <button
@@ -1644,7 +1743,7 @@ export default function AbsensiMultiServerPage() {
           </div>
         </header>
 
-        {/* Pemilih Nama Karyawan di HP Karyawan (Hanya akun STAFF, tanpa akses Manager/Admin) */}
+        {/* Pemilih Nama Karyawan di HP Karyawan */}
         {isKaryawanMode && (
           <section className="bg-white rounded-2xl p-3 border border-slate-200/80 shadow-sm space-y-1.5">
             <label className="block text-[11px] font-extrabold text-slate-700">
@@ -1709,17 +1808,19 @@ export default function AbsensiMultiServerPage() {
           </section>
         )}
 
-        {/* 1. Dasbor Absen: Scanner Barcode/QR + Selfie Pendeteksi Wajah + Manual Klik + GPS Terkunci */}
+        {/* 1. Dasbor Absen: Scanner Barcode/QR + Selfie Pendeteksi Wajah + Manual Klik + GPS */}
         <section className="bg-white rounded-2xl p-3.5 border-t-4 border-t-blue-500 border border-slate-200/80 shadow-sm space-y-2.5">
           <div className="flex items-center justify-between">
             <h2 className="text-xs font-extrabold text-slate-800">
               1. Scan Barcode/QR &amp; GPS Realtime
             </h2>
-            {isKaryawanMode && (
-              <span className="px-2 py-0.5 rounded bg-sky-100 text-sky-700 text-[9px] font-extrabold uppercase">
-                MODE TERBATAS
-              </span>
-            )}
+            <button
+              type="button"
+              onClick={requestCurrentGps}
+              className="px-2 py-0.5 rounded bg-slate-100 hover:bg-slate-200 text-slate-700 text-[10px] font-bold"
+            >
+              Ambil GPS
+            </button>
           </div>
 
           <div className="text-[11px] text-slate-500">
@@ -1729,7 +1830,8 @@ export default function AbsensiMultiServerPage() {
             {geofenceLabel}
           </div>
           <div className="text-[10px] text-slate-500">
-            Koordinat Kantor Terkunci: Lat {LOCKED_LAT}, Lng {LOCKED_LNG}
+            Titik Kantor Aktif: Lat {targetLocation.latitude}, Lng{" "}
+            {targetLocation.longitude} • Radius {targetLocation.radius_meters}m
           </div>
 
           {cooldownInfo.locked && (
@@ -1904,7 +2006,6 @@ export default function AbsensiMultiServerPage() {
             <canvas ref={selfieCanvasRef} className="hidden" />
           </div>
 
-          {/* Riwayat Masuk/Keluar Singkat Khusus HP Karyawan */}
           {isKaryawanMode && (
             <div className="pt-2 border-t border-slate-100 space-y-1">
               <div className="text-[10px] font-bold text-slate-500 uppercase">
@@ -2191,8 +2292,8 @@ export default function AbsensiMultiServerPage() {
                   {officeQrCode}
                 </div>
                 <div className="text-[10px] text-slate-400">
-                  GPS Terkunci: {LOCKED_LAT}, {LOCKED_LNG} • Radius{" "}
-                  {activeRadiusMeters}m
+                  Titik: {targetLocation.latitude}, {targetLocation.longitude} •
+                  Radius {targetLocation.radius_meters}m
                 </div>
               </div>
 
@@ -2216,11 +2317,11 @@ export default function AbsensiMultiServerPage() {
               </div>
             </section>
 
-            {/* 5. Panel Admin & Manager: Data Karyawan & Koordinat Terkunci */}
+            {/* 5. Panel Admin & Manager: Data Karyawan & Pengaturan Koordinat Bebas */}
             <section className="bg-white rounded-2xl p-3.5 border border-slate-200/80 shadow-sm space-y-2.5">
               <h2 className="text-xs font-extrabold text-slate-800">
                 5. Panel {isAdminServer ? "Admin" : "Manager"}: Data Karyawan
-                &amp; GPS Terkunci
+                &amp; Koordinat
               </h2>
               <div className="space-y-1.5">
                 <input
@@ -2336,38 +2437,51 @@ export default function AbsensiMultiServerPage() {
                 ))}
               </div>
 
-              {/* Koordinat GPS Terkunci (-6.9148609, 109.7446830) */}
+              {/* Pengaturan Titik Koordinat & Radius (Bebas Diatur di Server) */}
               <div className="pt-2.5 border-t border-slate-100 space-y-1.5">
-                <div className="text-[11px] font-extrabold text-slate-700">
-                  Koordinat GPS Kantor Terkunci &amp; Radius
+                <div className="flex items-center justify-between">
+                  <span className="text-[11px] font-extrabold text-slate-700">
+                    Atur Titik Koordinat &amp; Radius
+                  </span>
+                  <button
+                    type="button"
+                    onClick={fillFromCurrentGps}
+                    className="px-2 py-0.5 rounded bg-slate-200 hover:bg-slate-300 text-slate-800 text-[10px] font-bold"
+                  >
+                    Isi dari GPS Saat Ini
+                  </button>
                 </div>
                 <div className="grid grid-cols-3 gap-1.5">
                   <input
                     type="text"
-                    readOnly
-                    value={String(LOCKED_LAT)}
-                    className="rounded-lg border border-slate-200 bg-slate-100 text-slate-600 px-2 py-1.5 text-xs font-mono"
+                    inputMode="decimal"
+                    placeholder="Latitude"
+                    value={latInput}
+                    onChange={(e) => setLatInput(e.target.value)}
+                    className="rounded-lg border border-slate-300 bg-white px-2 py-1.5 text-xs font-mono"
                   />
                   <input
                     type="text"
-                    readOnly
-                    value={String(LOCKED_LNG)}
-                    className="rounded-lg border border-slate-200 bg-slate-100 text-slate-600 px-2 py-1.5 text-xs font-mono"
+                    inputMode="decimal"
+                    placeholder="Longitude"
+                    value={lngInput}
+                    onChange={(e) => setLngInput(e.target.value)}
+                    className="rounded-lg border border-slate-300 bg-white px-2 py-1.5 text-xs font-mono"
                   />
                   <input
                     type="number"
                     placeholder="Radius (m)"
                     value={radiusInput}
                     onChange={(e) => setRadiusInput(e.target.value)}
-                    className="rounded-lg border border-slate-300 px-2 py-1.5 text-xs"
+                    className="rounded-lg border border-slate-300 bg-white px-2 py-1.5 text-xs"
                   />
                 </div>
                 <button
                   type="button"
-                  onClick={() => void saveLockedRadius()}
+                  onClick={() => void saveCustomLocation()}
                   className="w-full py-1.5 rounded-lg bg-emerald-700 text-white text-xs font-bold"
                 >
-                  Simpan Radius (Koordinat Tetap Terkunci)
+                  Simpan Titik Koordinat &amp; Radius
                 </button>
               </div>
             </section>
