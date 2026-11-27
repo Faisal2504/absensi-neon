@@ -18,8 +18,8 @@ async function ensureTables() {
       jam_berangkat VARCHAR(10) NOT NULL,
       jam_pulang VARCHAR(10) DEFAULT '17:00',
       toleransi_menit INT DEFAULT 10,
-      lat DOUBLE PRECISION DEFAULT -6.914744,
-      lng DOUBLE PRECISION DEFAULT 109.712890,
+      lat DOUBLE PRECISION DEFAULT -6.9148609,
+      lng DOUBLE PRECISION DEFAULT 109.7446830,
       radius_meter INT DEFAULT 150,
       PRIMARY KEY (id_karyawan, tanggal)
     )
@@ -42,12 +42,16 @@ async function ensureTables() {
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
   `;
-  await sql`
-    INSERT INTO karyawan (id_karyawan, nama, pin, role) VALUES
-    ('ADM-001', 'Administrator Utama', '9999', 'admin'),
-    ('KRY-001', 'Budi Santoso', '1234', 'karyawan')
-    ON CONFLICT (id_karyawan) DO NOTHING
-  `;
+
+  const existing = await sql`SELECT COUNT(*)::int AS total FROM karyawan`;
+  if ((existing[0]?.total ?? 0) === 0) {
+    await sql`
+      INSERT INTO karyawan (id_karyawan, nama, pin, role) VALUES
+      ('ADM-001', 'Admin Operasional', '9999', 'admin'),
+      ('KRY-001', 'Budi Santoso', '1234', 'karyawan')
+      ON CONFLICT (id_karyawan) DO NOTHING
+    `;
+  }
 }
 
 export async function GET() {
@@ -117,4 +121,7 @@ export async function DELETE(req: Request) {
   } catch (error: unknown) {
     return NextResponse.json({ status: 'error', message: String(error) }, { status: 500 });
   }
-                              }
+}
+
+      
+  
