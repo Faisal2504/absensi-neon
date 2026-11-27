@@ -5,6 +5,9 @@ import React, { useState, useEffect, useRef, useMemo, useCallback } from "react"
 type RoleType = "ADMIN" | "MANAGER" | "STAFF";
 type ServerMode = "ADMIN" | "MANAGER" | "KARYAWAN";
 type ShiftCode = "P" | "S" | "M" | "OFF";
+type DayKey = "Senin" | "Selasa" | "Rabu" | "Kamis" | "Jumat" | "Sabtu" | "Minggu";
+
+type WeeklyScheduleMap = Record<DayKey, ShiftCode>;
 
 interface Employee {
   id: number;
@@ -14,6 +17,7 @@ interface Employee {
   department: string;
   pin_code: string;
   shift_start_time?: string;
+  weekly_schedule?: WeeklyScheduleMap;
 }
 
 interface LocationItem {
@@ -50,6 +54,7 @@ interface ParsedScheduleItem {
   shift_code: ShiftCode;
   shift_label: string;
   shift_time: string;
+  weekly?: Partial<WeeklyScheduleMap>;
 }
 
 interface FaceDetectorInstance {
@@ -68,34 +73,96 @@ const DEFAULT_LAT = -6.9148609;
 const DEFAULT_LNG = 109.744683;
 const DEFAULT_RADIUS = 2000;
 const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
+const LATE_GRACE_MINUTES = 5;
+
+const DAYS_OF_WEEK: DayKey[] = [
+  "Senin",
+  "Selasa",
+  "Rabu",
+  "Kamis",
+  "Jumat",
+  "Sabtu",
+  "Minggu",
+];
+
+const SHIFT_PRESETS: Record<
+  ShiftCode,
+  { code: ShiftCode; name: string; start: string; end: string; rangeLabel: string }
+> = {
+  P: {
+    code: "P",
+    name: "Pagi",
+    start: "07.00",
+    end: "15.00",
+    rangeLabel: "07.00 - 15.00",
+  },
+  S: {
+    code: "S",
+    name: "Siang",
+    start: "15.00",
+    end: "23.00",
+    rangeLabel: "15.00 - 23.00",
+  },
+  M: {
+    code: "M",
+    name: "Malam",
+    start: "23.00",
+    end: "07.00",
+    rangeLabel: "23.00 - 07.00",
+  },
+  OFF: {
+    code: "OFF",
+    name: "Libur",
+    start: "OFF",
+    end: "OFF",
+    rangeLabel: "LIBUR (OFF)",
+  },
+};
 
 const SHIFT_OPTIONS = [
-  { label: "( P ) Pagi (07.00)", time: "07.00" },
-  { label: "( S ) Siang (15.00)", time: "15.00" },
-  { label: "( M ) Malam (23.00)", time: "23.00" },
-  { label: "( OFF ) Libur", time: "OFF" },
+  { label: "( P ) Pagi • 07.00 - 15.00", time: "07.00", code: "P" as ShiftCode },
+  { label: "( S ) Siang • 15.00 - 23.00", time: "15.00", code: "S" as ShiftCode },
+  { label: "( M ) Malam • 23.00 - 07.00", time: "23.00", code: "M" as ShiftCode },
+  { label: "( OFF ) Libur", time: "OFF", code: "OFF" as ShiftCode },
 ];
 
 const CACHE_KEY = "absensi_v11_cache";
 const QUEUE_KEY = "absensi_v11_queue";
 const QR_CODE_KEY = "absensi_v11_qr";
 const LOC_KEY = "absensi_v11_custom_loc";
+const WEEKLY_SCHED_KEY = "absensi_v11_weekly_sched";
 const DEVICE_LOCK_KEY = "absensi_v11_device_locked_karyawan";
 const STAFF_EMP_KEY = "absensi_v11_staff_emp_id";
 const AUTH_SERVER_KEY = "absensi_v11_auth_server";
 
+function buildDefaultWeeklySchedule(defaultCode: ShiftCode = "P"): WeeklyScheduleMap {
+  return {
+    Senin: defaultCode,
+    Selasa: defaultCode,
+    Rabu: defaultCode,
+    Kamis: defaultCode,
+    Jumat: defaultCode,
+    Sabtu: defaultCode,
+    Minggu: "OFF",
+  };
+}
+
+function shiftTimeToCode(raw?: string | null): ShiftCode {
+  const s = String(raw || "").trim().toUpperCase();
+  if (s === "OFF" || s.includes("LIBUR")) return "OFF";
+  if (s === "S" || s.includes("15.00") || s.includes("15:00") || s.includes("SIANG")) return "S";
+  if (s === "M" || s.includes("23.00") || s.includes("23:00") || s.includes("MALAM")) return "M";
+  return "P";
+}
+
 function shiftCodeToStartTime(code: ShiftCode): string {
-  if (code === "S") return "15.00";
-  if (code === "M") return "23.00";
-  if (code === "OFF") return "OFF";
-  return "07.00";
+  return SHIFT_PRESETS[code]?.start || "07.00";
 }
 
 function shiftCodeToLabel(code: ShiftCode): string {
-  if (code === "S") return "( S ) Siang";
-  if (code === "M") return "( M ) Malam";
-  if (code === "OFF") return "( OFF ) Libur";
-  return "( P ) Pagi";
+  if (code === "OFF") return "OFF (Libur)";
+  const p = SHIFT_PRESETS[code];
+  return `( ${code} ) ${p.name} • ${p.rangeLabel}`;
 }
 
 function normalizeShiftTime(raw?: string | null): string {
@@ -136,6 +203,37 @@ function normalizeEntryType(raw?: string | null): "CLOCK_IN" | "CLOCK_OUT" {
   return t === "CLOCK_OUT" || t === "OUT" ? "CLOCK_OUT" : "CLOCK_IN";
 }
 
+function getJakartaDayKey(iso?: string): DayKey {
+  const dayStr = new Date(iso || new Date().toISOString()).toLocaleDateString("id-ID", {
+    timeZone: "Asia/Jakarta",
+    weekday: "long",
+  });
+  const lower = dayStr.toLowerCase();
+  if (lower.includes("senin")) return "Senin";
+  if (lower.includes("selasa")) return "Selasa";
+  if (lower.includes("rabu")) return "Rabu";
+  if (lower.includes("kamis")) return "Kamis";
+  if (lower.includes("jumat") || lower.includes("jum'at")) return "Jumat";
+  if (lower.includes("sabtu")) return "Sabtu";
+  return "Minggu";
+}
+
+function getEmployeeShiftForIso(emp: Employee | undefined, iso: string): {
+  code: ShiftCode;
+  startTime: string;
+  rangeLabel: string;
+} {
+  const dayKey = getJakartaDayKey(iso);
+  const code: ShiftCode =
+    emp?.weekly_schedule?.[dayKey] || shiftTimeToCode(emp?.shift_start_time);
+  const preset = SHIFT_PRESETS[code];
+  return {
+    code,
+    startTime: preset.start,
+    rangeLabel: preset.rangeLabel,
+  };
+}
+
 const DEFAULT_EMPLOYEES: Employee[] = [
   {
     id: 1,
@@ -145,6 +243,7 @@ const DEFAULT_EMPLOYEES: Employee[] = [
     department: "Administrator",
     pin_code: "0000",
     shift_start_time: "07.00",
+    weekly_schedule: buildDefaultWeeklySchedule("P"),
   },
   {
     id: 2,
@@ -154,6 +253,7 @@ const DEFAULT_EMPLOYEES: Employee[] = [
     department: "Manajemen",
     pin_code: "2026",
     shift_start_time: "07.00",
+    weekly_schedule: buildDefaultWeeklySchedule("P"),
   },
   {
     id: 3,
@@ -163,6 +263,7 @@ const DEFAULT_EMPLOYEES: Employee[] = [
     department: "Operasional",
     pin_code: "1111",
     shift_start_time: "07.00",
+    weekly_schedule: buildDefaultWeeklySchedule("P"),
   },
 ];
 
@@ -239,11 +340,48 @@ function getEffectiveShiftStartMinutes(
   return sh * 60 + (isNaN(sm) ? 0 : sm);
 }
 
-function calcLateMinutes(punchedIso: string, shiftStart = "07.00"): number {
+function calcLateDetail(
+  punchedIso: string,
+  shiftStart = "07.00"
+): {
+  rawDiffMinutes: number;
+  lateMinutes: number;
+  isLate: boolean;
+  statusNote: string;
+} {
   const shiftMin = getEffectiveShiftStartMinutes(punchedIso, shiftStart);
-  if (shiftMin === null) return 0;
+  if (shiftMin === null) {
+    return {
+      rawDiffMinutes: 0,
+      lateMinutes: 0,
+      isLate: false,
+      statusNote: "Jadwal Libur (OFF)",
+    };
+  }
   const actualMin = getWibMinutesOfDay(punchedIso);
-  return Math.max(0, actualMin - shiftMin);
+  const diff = Math.max(0, actualMin - shiftMin);
+  if (diff > LATE_GRACE_MINUTES) {
+    return {
+      rawDiffMinutes: diff,
+      lateMinutes: diff,
+      isLate: true,
+      statusNote: `Terlambat ${diff} menit dari jam masuk ${shiftStart} (batas toleransi 5 menit terlewati)`,
+    };
+  }
+  if (diff > 0) {
+    return {
+      rawDiffMinutes: diff,
+      lateMinutes: 0,
+      isLate: false,
+      statusNote: `Tepat waktu (selisih ${diff} menit, masih dalam toleransi 5 menit)`,
+    };
+  }
+  return {
+    rawDiffMinutes: 0,
+    lateMinutes: 0,
+    isLate: false,
+    statusNote: "Tepat waktu",
+  };
 }
 
 function unlockAudioContext() {
@@ -263,48 +401,8 @@ function unlockAudioContext() {
   }
 }
 
-function playMelodicRestChime() {
+function speakIndonesian(text: string) {
   if (typeof window === "undefined") return;
-  try {
-    const AudioCtx =
-      window.AudioContext ||
-      (window as unknown as { webkitAudioContext?: typeof AudioContext })
-        .webkitAudioContext;
-    if (!AudioCtx) return;
-    const ctx = new AudioCtx();
-    if (ctx.state === "suspended") {
-      void ctx.resume();
-    }
-    const notes = [523.25, 659.25, 783.99, 1046.5];
-    notes.forEach((freq, i) => {
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.type = "sine";
-      osc.frequency.setValueAtTime(freq, ctx.currentTime + i * 0.14);
-      gain.gain.setValueAtTime(0.001, ctx.currentTime + i * 0.14);
-      gain.gain.exponentialRampToValueAtTime(
-        0.1,
-        ctx.currentTime + i * 0.14 + 0.04
-      );
-      gain.gain.exponentialRampToValueAtTime(
-        0.0001,
-        ctx.currentTime + i * 0.14 + 0.55
-      );
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-      osc.start(ctx.currentTime + i * 0.14);
-      osc.stop(ctx.currentTime + i * 0.14 + 0.6);
-    });
-  } catch {
-    // Abaikan jika audio diblokir
-  }
-}
-
-function speakIndonesian(text: string, opts?: { melodicRest?: boolean }) {
-  if (typeof window === "undefined") return;
-  if (opts?.melodicRest) {
-    playMelodicRestChime();
-  }
   try {
     if (!("speechSynthesis" in window)) return;
     const synth = window.speechSynthesis;
@@ -314,8 +412,8 @@ function speakIndonesian(text: string, opts?: { melodicRest?: boolean }) {
       const utter = new SpeechSynthesisUtterance(text);
       utter.lang = "id-ID";
       utter.volume = 1;
-      utter.rate = opts?.melodicRest ? 0.94 : 0.98;
-      utter.pitch = opts?.melodicRest ? 1.24 : 1.18;
+      utter.rate = 0.96;
+      utter.pitch = 1.15;
 
       const voices = synth.getVoices();
       const femaleIdVoice =
@@ -450,6 +548,16 @@ function parseScheduleLines(lines: string[]): ParsedScheduleItem[] {
     const shiftCode = detectShiftCodeFromText(line);
     const codeMatch = line.match(/\b([A-Z]{2,6}[-_]\d{1,6})\b/i);
 
+    const dayTokens = line.match(/\b(P|S|M|OFF)\b/gi);
+    const weekly: Partial<WeeklyScheduleMap> = {};
+    if (dayTokens && dayTokens.length >= 7) {
+      DAYS_OF_WEEK.forEach((d, idx) => {
+        const tok = (dayTokens[idx] || "P").toUpperCase();
+        weekly[d] =
+          tok === "OFF" ? "OFF" : tok === "S" ? "S" : tok === "M" ? "M" : "P";
+      });
+    }
+
     let cols = line
       .split(/[,;|]+/)
       .map((c) => c.trim())
@@ -492,6 +600,7 @@ function parseScheduleLines(lines: string[]): ParsedScheduleItem[] {
         shift_code: shiftCode,
         shift_label: shiftCodeToLabel(shiftCode),
         shift_time: shiftCodeToStartTime(shiftCode),
+        weekly: Object.keys(weekly).length > 0 ? weekly : undefined,
       });
     }
   }
@@ -526,6 +635,18 @@ function parseSavedLocation(raw: string | null): LocationItem | null {
     // Abaikan
   }
   return null;
+}
+
+function loadWeeklySchedulesMap(): Record<string, WeeklyScheduleMap> {
+  if (typeof window === "undefined") return {};
+  try {
+    const raw = localStorage.getItem(WEEKLY_SCHED_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
 }
 
 function getInitialBoot() {
@@ -588,15 +709,23 @@ function getInitialBoot() {
       if (Array.isArray(parsedQ)) queue = parsedQ;
     }
 
+    const weeklyMap = loadWeeklySchedulesMap();
     const rawC = localStorage.getItem(CACHE_KEY);
     if (rawC) {
       const c = JSON.parse(rawC);
       if (Array.isArray(c.employees) && c.employees.length > 0) {
-        employees = c.employees.map((e: Employee) => ({
-          ...e,
-          role: normalizeRole(e.role),
-          shift_start_time: normalizeShiftTime(e.shift_start_time),
-        }));
+        employees = c.employees.map((e: Employee) => {
+          const defCode = shiftTimeToCode(e.shift_start_time);
+          return {
+            ...e,
+            role: normalizeRole(e.role),
+            shift_start_time: normalizeShiftTime(e.shift_start_time),
+            weekly_schedule:
+              weeklyMap[e.emp_code] ||
+              e.weekly_schedule ||
+              buildDefaultWeeklySchedule(defCode),
+          };
+        });
       }
       if (Array.isArray(c.locations) && c.locations.length > 0) {
         locations = c.locations.map((l: LocationItem) => ({
@@ -687,11 +816,7 @@ export default function AbsensiMultiServerPage() {
     "Arahkan wajah ke kamera depan lalu klik Ambil Foto Selfie."
   );
 
-  const [lateBanner, setLateBanner] = useState<{
-    employeeName: string;
-    lateMinutes: number;
-    shiftLabel: string;
-  } | null>(null);
+  const [dismissedLateUuid, setDismissedLateUuid] = useState<string | null>(null);
 
   const [inspectionMode, setInspectionMode] = useState<
     "NONE" | "XLSX" | "PDF"
@@ -708,6 +833,9 @@ export default function AbsensiMultiServerPage() {
   const [reportFilter, setReportFilter] = useState<
     "Harian" | "Mingguan" | "Bulanan"
   >("Harian");
+  const [reportEmpFilter, setReportEmpFilter] = useState<string>("ALL");
+  const [selectedReportUuids, setSelectedReportUuids] = useState<string[]>([]);
+
   const [editingUuid, setEditingUuid] = useState<string | null>(null);
   const [editId, setEditId] = useState<number | undefined>(undefined);
   const [editType, setEditType] = useState<"CLOCK_IN" | "CLOCK_OUT">(
@@ -724,6 +852,7 @@ export default function AbsensiMultiServerPage() {
     department: "Operasional",
     pin_code: "1234",
     shift_start_time: "07.00",
+    weekly_schedule: buildDefaultWeeklySchedule("P"),
   });
   const [latInput, setLatInput] = useState<string>(
     String(boot.locations[0]?.latitude ?? DEFAULT_LAT)
@@ -802,6 +931,11 @@ export default function AbsensiMultiServerPage() {
     }
     return employees.find((e) => e.role === "ADMIN") || DEFAULT_EMPLOYEES[0];
   }, [isDeviceLockedKaryawan, serverMode, staffList, staffEmpId, employees]);
+
+  const activeUserTodayShift = useMemo(
+    () => getEmployeeShiftForIso(activeUser, syncedIsoNow),
+    [activeUser, syncedIsoNow]
+  );
 
   const isKaryawanMode = isDeviceLockedKaryawan || serverMode === "KARYAWAN";
   const isManagerServer = !isKaryawanMode && serverMode === "MANAGER";
@@ -908,14 +1042,27 @@ export default function AbsensiMultiServerPage() {
           const data = await res.json();
           if (data?.ok) {
             setDbConnected(Boolean(data.dbConnected));
+            const weeklyMap = loadWeeklySchedulesMap();
             setEmployees((prevEmps) => {
               const nextEmps: Employee[] =
                 Array.isArray(data.employees) && data.employees.length > 0
-                  ? data.employees.map((e: Employee) => ({
-                      ...e,
-                      role: normalizeRole(e.role),
-                      shift_start_time: normalizeShiftTime(e.shift_start_time),
-                    }))
+                  ? data.employees.map((e: Employee) => {
+                      const prevMatch = prevEmps.find(
+                        (pe) =>
+                          pe.emp_code === e.emp_code || Number(pe.id) === Number(e.id)
+                      );
+                      const defCode = shiftTimeToCode(e.shift_start_time);
+                      return {
+                        ...e,
+                        role: normalizeRole(e.role),
+                        shift_start_time: normalizeShiftTime(e.shift_start_time),
+                        weekly_schedule:
+                          weeklyMap[e.emp_code] ||
+                          prevMatch?.weekly_schedule ||
+                          e.weekly_schedule ||
+                          buildDefaultWeeklySchedule(defCode),
+                      };
+                    })
                   : prevEmps;
 
               const customLoc = parseSavedLocation(localStorage.getItem(LOC_KEY));
@@ -946,13 +1093,19 @@ export default function AbsensiMultiServerPage() {
 
               setServerEntries((prevEntries) => {
                 const nextEntries: TimeEntry[] = Array.isArray(data.entries)
-                  ? data.entries.map((item: TimeEntry) => ({
-                      ...item,
-                      entry_type: normalizeEntryType(item.entry_type),
-                      client_uuid:
-                        item.client_uuid ||
-                        `srv-${item.id || Math.random().toString(36).slice(2)}`,
-                    }))
+                  ? data.entries.map((item: TimeEntry) => {
+                      const prevE = prevEntries.find(
+                        (pe) => pe.client_uuid === item.client_uuid
+                      );
+                      return {
+                        ...item,
+                        entry_type: normalizeEntryType(item.entry_type),
+                        selfie_data: item.selfie_data || prevE?.selfie_data || null,
+                        client_uuid:
+                          item.client_uuid ||
+                          `srv-${item.id || Math.random().toString(36).slice(2)}`,
+                      };
+                    })
                   : prevEntries;
 
                 localStorage.setItem(
@@ -992,10 +1145,11 @@ export default function AbsensiMultiServerPage() {
   );
 
   useEffect(() => {
-    if (!isOnline || isKaryawanMode) return;
+    if (!isOnline) return;
+    const intervalMs = isKaryawanMode ? 4000 : 2000;
     const poller = window.setInterval(() => {
       void refreshServer(true);
-    }, 2000);
+    }, intervalMs);
     return () => clearInterval(poller);
   }, [isOnline, isKaryawanMode, refreshServer]);
 
@@ -1119,10 +1273,12 @@ export default function AbsensiMultiServerPage() {
     );
   }, [serverEntries, offlineQueue]);
 
+  // Cooldown hanya mencegah duplikasi jenis absen yang SAMA (MASUK -> MASUK atau KELUAR -> KELUAR) dalam 6 jam,
+  // sehingga karyawan dapat langsung membuka kamera depan & absen KELUAR kapan saja setelah absen MASUK.
   const cooldownInfo = useMemo(() => {
     if (!activeUser) {
       return {
-        locked: false,
+        lockedSameAction: false,
         remainingText: "",
         lastEntry: null as TimeEntry | null,
       };
@@ -1135,7 +1291,7 @@ export default function AbsensiMultiServerPage() {
       );
     const last = mine[0] || null;
     if (!last) {
-      return { locked: false, remainingText: "", lastEntry: null };
+      return { lockedSameAction: false, remainingText: "", lastEntry: null };
     }
     const diff = nowMs - new Date(last.punched_at).getTime();
     if (diff >= 0 && diff < SIX_HOURS_MS) {
@@ -1143,13 +1299,17 @@ export default function AbsensiMultiServerPage() {
       const h = Math.floor(remMins / 60);
       const m = remMins % 60;
       return {
-        locked: true,
+        lockedSameAction: true,
         remainingText: h > 0 ? `${h} jam ${m} menit` : `${m} menit`,
         lastEntry: last,
       };
     }
-    return { locked: false, remainingText: "", lastEntry: last };
+    return { lockedSameAction: false, remainingText: "", lastEntry: last };
   }, [activeUser, allEntries, nowMs]);
+
+  const isActionLocked = (actionType: "CLOCK_IN" | "CLOCK_OUT") =>
+    cooldownInfo.lockedSameAction &&
+    cooldownInfo.lastEntry?.entry_type === actionType;
 
   const startScannerCamera = async () => {
     try {
@@ -1219,14 +1379,14 @@ export default function AbsensiMultiServerPage() {
     if (!FD) {
       setFaceStatus("fallback");
       setFaceText(
-        "Deteksi wajah otomatis tidak tersedia di browser ini; klik Ambil Foto Selfie."
+        "Kamera depan aktif; klik Ambil Foto Selfie untuk menyimpan wajah."
       );
       return;
     }
 
     const detector = new FD({ fastMode: true, maxDetectedFaces: 1 });
     setFaceStatus("scanning");
-    setFaceText("Mendeteksi wajah...");
+    setFaceText("Mendeteksi wajah di kamera depan...");
 
     const loop = async () => {
       if (!selfieVideoRef.current || !selfieVideoRef.current.srcObject) return;
@@ -1249,19 +1409,32 @@ export default function AbsensiMultiServerPage() {
     faceRafRef.current = requestAnimationFrame(loop);
   }, []);
 
-  const openSelfieCamera = async () => {
+  const openSelfieCamera = async (forAction?: "CLOCK_IN" | "CLOCK_OUT") => {
     try {
+      if (forAction) setSelectedAction(forAction);
       stopQrCam();
+      stopSelfieCam();
       setCapturedSelfie(null);
       setSelfieCameraOn(true);
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          facingMode: "user",
-          width: { ideal: 480 },
-          height: { ideal: 480 },
-        },
-        audio: false,
-      });
+
+      let stream: MediaStream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: { ideal: "user" },
+            width: { ideal: 480 },
+            height: { ideal: 480 },
+          },
+          audio: false,
+        });
+      } catch {
+        // Fallback jika perangkat tidak mendukung constraint ideal
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: "user" },
+          audio: false,
+        });
+      }
+
       if (selfieVideoRef.current) {
         selfieVideoRef.current.srcObject = stream;
         await selfieVideoRef.current.play();
@@ -1269,7 +1442,7 @@ export default function AbsensiMultiServerPage() {
       runFaceLoop();
     } catch {
       setSelfieCameraOn(false);
-      notify("err", "Izinkan kamera depan untuk selfie pendeteksi wajah.");
+      notify("err", "Izinkan kamera depan untuk selfie absen masuk/keluar.");
     }
   };
 
@@ -1297,7 +1470,7 @@ export default function AbsensiMultiServerPage() {
 
     if (FD && !detected) {
       setFaceStatus("no_face");
-      setFaceText("Wajah tidak terdeteksi. Arahkan wajah ke kamera.");
+      setFaceText("Wajah tidak terdeteksi. Arahkan wajah ke kamera depan.");
       notify("err", "Wajah belum terdeteksi!");
       return;
     }
@@ -1311,9 +1484,18 @@ export default function AbsensiMultiServerPage() {
     const dataUrl = c.toDataURL("image/jpeg", 0.65);
     setCapturedSelfie(dataUrl);
     setFaceStatus(FD ? "detected" : "fallback");
-    setFaceText("Selfie wajah tersimpan.");
+    setFaceText(
+      `Selfie wajah ${
+        selectedAction === "CLOCK_OUT" ? "KELUAR" : "MASUK"
+      } tersimpan.`
+    );
     stopSelfieCam();
-    notify("ok", "Selfie wajah berhasil diambil.");
+    notify(
+      "ok",
+      `Selfie wajah ${
+        selectedAction === "CLOCK_OUT" ? "KELUAR" : "MASUK"
+      } berhasil diambil.`
+    );
   };
 
   const submitAttendance = async (
@@ -1325,17 +1507,18 @@ export default function AbsensiMultiServerPage() {
     const syncedNow = Date.now() + offsetRef.current;
     setNowMs(syncedNow);
 
-    if (cooldownInfo.locked) {
+    const entryType = typeOverride || selectedAction;
+
+    if (isActionLocked(entryType)) {
       notify(
         "err",
         `Sudah absen ${
-          cooldownInfo.lastEntry?.entry_type === "CLOCK_IN" ? "MASUK" : "KELUAR"
-        }. Absen normal lagi setelah 6 jam (sisa ${cooldownInfo.remainingText}).`
+          entryType === "CLOCK_IN" ? "MASUK" : "KELUAR"
+        }. Ulangi setelah 6 jam (sisa ${cooldownInfo.remainingText}).`
       );
       return;
     }
 
-    const entryType = typeOverride || selectedAction;
     const enteredCode = (manualCodeOverride ?? qrInput).trim().toUpperCase();
     const effectiveQr =
       enteredCode ||
@@ -1363,12 +1546,24 @@ export default function AbsensiMultiServerPage() {
         return;
       }
       if (!capturedSelfie) {
-        notify("err", "Wajib ambil foto selfie deteksi wajah sebelum absen.");
+        notify(
+          "err",
+          `Wajib ambil foto selfie kamera depan sebelum absen ${
+            entryType === "CLOCK_IN" ? "MASUK" : "KELUAR"
+          }.`
+        );
+        void openSelfieCamera(entryType);
         return;
       }
     }
 
     const punchedAtIso = new Date(syncedNow).toISOString();
+    const shiftToday = getEmployeeShiftForIso(activeUser, punchedAtIso);
+    const lateInfo =
+      entryType === "CLOCK_IN"
+        ? calcLateDetail(punchedAtIso, shiftToday.startTime)
+        : { rawDiffMinutes: 0, lateMinutes: 0, isLate: false, statusNote: "" };
+
     const uuid =
       typeof crypto !== "undefined" && crypto.randomUUID
         ? crypto.randomUUID()
@@ -1386,6 +1581,7 @@ export default function AbsensiMultiServerPage() {
         : enteredCode
         ? "BARCODE + GPS"
         : "MANUAL KLIK",
+      notes: lateInfo.isLate ? lateInfo.statusNote : "",
       latitude: gpsCoords?.lat ?? targetLocation.latitude,
       longitude: gpsCoords?.lng ?? targetLocation.longitude,
       distance_meters: geofence?.distance ?? 0,
@@ -1405,39 +1601,22 @@ export default function AbsensiMultiServerPage() {
     setFaceText("Arahkan wajah ke kamera depan lalu klik Ambil Foto Selfie.");
 
     if (entryType === "CLOCK_IN") {
-      const shiftVal = normalizeShiftTime(activeUser.shift_start_time);
-      const lateMins = calcLateMinutes(punchedAtIso, shiftVal);
-      if (lateMins > 0) {
-        const shiftDisp = shiftVal === "OFF" ? "07.00" : shiftVal;
-        setLateBanner({
-          employeeName: activeUser.full_name,
-          lateMinutes: lateMins,
-          shiftLabel: shiftDisp,
-        });
-      } else {
-        setLateBanner(null);
-      }
       if (isAdminServer) {
         speakIndonesian("Terimakasih Sudah Hadir, Selamat Bertempur");
+      } else if (lateInfo.isLate) {
+        speakIndonesian(
+          `Perhatian, ${activeUser.full_name} terlambat ${lateInfo.lateMinutes} menit dari jam masuk ${shiftToday.startTime}.`
+        );
       } else {
         speakIndonesian(
-          lateMins > 0
-            ? `Perhatian, ${activeUser.full_name} terlambat ${lateMins} menit dari jam masuk ${
-                shiftVal === "OFF" ? "07.00" : shiftVal
-              }.`
-            : `Absen masuk ${activeUser.full_name} tercatat tepat waktu.`
+          `Absen masuk ${activeUser.full_name} tercatat tepat waktu.`
         );
       }
     } else {
-      setLateBanner(null);
       if (isAdminServer) {
-        speakIndonesian("Terimakasih, semoga selamat sampai rumah", {
-          melodicRest: true,
-        });
+        speakIndonesian("Terimakasih, semoga selamat sampai rumah");
       } else {
-        speakIndonesian("terima kasih selamat beristirahat", {
-          melodicRest: true,
-        });
+        speakIndonesian("Terimakasih, semoga selamat sampai rumah");
       }
     }
 
@@ -1448,7 +1627,9 @@ export default function AbsensiMultiServerPage() {
     notify(
       "ok",
       entryType === "CLOCK_IN"
-        ? "Terimakasih Sudah Hadir, Selamat Bertempur!"
+        ? lateInfo.isLate
+          ? `Absen MASUK tercatat (TERLAMBAT ${lateInfo.lateMinutes} menit)!`
+          : "Terimakasih Sudah Hadir, Selamat Bertempur!"
         : "Terimakasih, semoga selamat sampai rumah!"
     );
   };
@@ -1487,6 +1668,41 @@ export default function AbsensiMultiServerPage() {
 
   const todayStr = getJakartaDateStr(syncedIsoNow);
 
+  // Notifikasi real-time keterlambatan (> 5 menit) hari ini untuk Admin & semua HP Karyawan
+  const latestLateAlertToday = useMemo(() => {
+    const todayIns = allEntries
+      .filter(
+        (e) =>
+          e.entry_type === "CLOCK_IN" &&
+          getJakartaDateStr(e.punched_at) === todayStr
+      )
+      .sort(
+        (a, b) =>
+          new Date(b.punched_at).getTime() - new Date(a.punched_at).getTime()
+      );
+
+    for (const item of todayIns) {
+      if (item.client_uuid === dismissedLateUuid) continue;
+      const emp = employees.find(
+        (e) => Number(e.id) === Number(item.employee_id)
+      );
+      const shift = getEmployeeShiftForIso(emp, item.punched_at);
+      const detail = calcLateDetail(item.punched_at, shift.startTime);
+      if (detail.isLate) {
+        return {
+          uuid: item.client_uuid,
+          employeeName: item.full_name || emp?.full_name || "Karyawan",
+          empCode: item.emp_code || emp?.emp_code || "",
+          lateMinutes: detail.lateMinutes,
+          shiftLabel: `${shift.code} (${shift.rangeLabel})`,
+          punchedTime: formatTimeWIB(item.punched_at),
+          statusNote: detail.statusNote,
+        };
+      }
+    }
+    return null;
+  }, [allEntries, todayStr, employees, dismissedLateUuid]);
+
   const summaryToday = useMemo(() => {
     const todayEntries = allEntries.filter(
       (e) => getJakartaDateStr(e.punched_at) === todayStr
@@ -1501,10 +1717,8 @@ export default function AbsensiMultiServerPage() {
       );
       if (item.entry_type === "CLOCK_IN") {
         inIds.add(Number(item.employee_id));
-        if (
-          calcLateMinutes(item.punched_at, emp?.shift_start_time || "07.00") >
-          0
-        ) {
+        const shift = getEmployeeShiftForIso(emp, item.punched_at);
+        if (calcLateDetail(item.punched_at, shift.startTime).isLate) {
           lateCount++;
         }
       } else if (item.entry_type === "CLOCK_OUT") {
@@ -1524,12 +1738,34 @@ export default function AbsensiMultiServerPage() {
       reportFilter === "Harian" ? 1 : reportFilter === "Mingguan" ? 7 : 31;
     const minMs = nowMs - limitDays * 86400000;
     return allEntries.filter((e) => {
-      if (reportFilter === "Harian") {
-        return getJakartaDateStr(e.punched_at) === todayStr;
+      const matchPeriod =
+        reportFilter === "Harian"
+          ? getJakartaDateStr(e.punched_at) === todayStr
+          : new Date(e.punched_at).getTime() >= minMs;
+      if (!matchPeriod) return false;
+      if (reportEmpFilter !== "ALL") {
+        return String(e.employee_id) === reportEmpFilter;
       }
-      return new Date(e.punched_at).getTime() >= minMs;
+      return true;
     });
-  }, [allEntries, reportFilter, todayStr, nowMs]);
+  }, [allEntries, reportFilter, reportEmpFilter, todayStr, nowMs]);
+
+  const toggleReportUuid = (uuid: string) => {
+    setSelectedReportUuids((prev) =>
+      prev.includes(uuid) ? prev.filter((u) => u !== uuid) : [...prev, uuid]
+    );
+  };
+
+  const toggleSelectAllReport = () => {
+    if (
+      filteredEntries.length > 0 &&
+      selectedReportUuids.length === filteredEntries.length
+    ) {
+      setSelectedReportUuids([]);
+    } else {
+      setSelectedReportUuids(filteredEntries.map((e) => e.client_uuid));
+    }
+  };
 
   const handleScheduleFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -1556,20 +1792,32 @@ export default function AbsensiMultiServerPage() {
 
       setSchedulePreview(parsed);
       if (parsed.length > 0) {
+        const weeklyMap = loadWeeklySchedulesMap();
         const updated = employees.map((emp) => {
           const match = parsed.find(
             (r) =>
               r.emp_code.toLowerCase() === emp.emp_code.toLowerCase() ||
               r.full_name.toLowerCase() === emp.full_name.toLowerCase()
           );
-          return match
-            ? {
-                ...emp,
-                full_name: match.full_name || emp.full_name,
-                shift_start_time: match.shift_time,
-              }
-            : emp;
+          if (!match) return emp;
+          const nextWeekly: WeeklyScheduleMap = {
+            ...(emp.weekly_schedule || buildDefaultWeeklySchedule(match.shift_code)),
+            ...(match.weekly || {}),
+          };
+          if (!match.weekly) {
+            DAYS_OF_WEEK.forEach((d) => {
+              if (d !== "Minggu") nextWeekly[d] = match.shift_code;
+            });
+          }
+          weeklyMap[emp.emp_code] = nextWeekly;
+          return {
+            ...emp,
+            full_name: match.full_name || emp.full_name,
+            shift_start_time: match.shift_time,
+            weekly_schedule: nextWeekly,
+          };
         });
+        localStorage.setItem(WEEKLY_SCHED_KEY, JSON.stringify(weeklyMap));
         setEmployees(updated);
         notify(
           "ok",
@@ -1585,21 +1833,88 @@ export default function AbsensiMultiServerPage() {
     }
   };
 
-  const buildTimesheetHeaderHtml = () => {
-    const firstRow = filteredEntries[0];
-    const matchedEmp = firstRow
-      ? employees.find((e) => Number(e.id) === Number(firstRow.employee_id))
-      : staffList[0] || employees[0];
-    const memberName =
-      filteredEntries.length === 1
-        ? firstRow?.full_name || matchedEmp?.full_name || "JULDA REKSA ADI"
-        : "SEMUA ANGGOTA / REKAP";
-    const memberCode =
-      filteredEntries.length === 1
-        ? firstRow?.emp_code ||
-          matchedEmp?.emp_code ||
-          "JRA-SCRTY-MPI-22112026-0004"
-        : "ALL-SECURITY-BTG";
+  const getEntriesForExport = () => {
+    if (selectedReportUuids.length > 0) {
+      const picked = filteredEntries.filter((e) =>
+        selectedReportUuids.includes(e.client_uuid)
+      );
+      if (picked.length > 0) return picked;
+    }
+    return filteredEntries;
+  };
+
+  const buildGroupedTimesheetRows = (entriesToUse: TimeEntry[]) => {
+    const groups = new Map<
+      string,
+      {
+        dateStr: string;
+        dayName: string;
+        empId: number;
+        empName: string;
+        empCode: string;
+        shiftInfo: { code: ShiftCode; startTime: string; rangeLabel: string };
+        inEntry?: TimeEntry;
+        outEntry?: TimeEntry;
+      }
+    >();
+
+    const chronological = [...entriesToUse].sort(
+      (a, b) =>
+        new Date(a.punched_at).getTime() - new Date(b.punched_at).getTime()
+    );
+
+    for (const item of chronological) {
+      const dateStr = getJakartaDateStr(item.punched_at);
+      const key = `${item.employee_id}__${dateStr}`;
+      const emp = employees.find(
+        (e) => Number(e.id) === Number(item.employee_id)
+      );
+      const dayName = new Date(item.punched_at).toLocaleDateString("id-ID", {
+        timeZone: "Asia/Jakarta",
+        weekday: "long",
+      });
+      const existing = groups.get(key) || {
+        dateStr,
+        dayName,
+        empId: Number(item.employee_id),
+        empName: item.full_name || emp?.full_name || "Karyawan",
+        empCode: item.emp_code || emp?.emp_code || "-",
+        shiftInfo: getEmployeeShiftForIso(emp, item.punched_at),
+      };
+
+      if (item.entry_type === "CLOCK_IN") {
+        if (!existing.inEntry) existing.inEntry = item;
+      } else {
+        existing.outEntry = item;
+      }
+      groups.set(key, existing);
+    }
+
+    return Array.from(groups.values()).sort((a, b) =>
+      b.dateStr.localeCompare(a.dateStr)
+    );
+  };
+
+  const buildTimesheetHeaderMeta = (groupedRows: ReturnType<typeof buildGroupedTimesheetRows>) => {
+    const uniqueEmpCodes = Array.from(new Set(groupedRows.map((g) => g.empCode)));
+    const singleEmp =
+      reportEmpFilter !== "ALL"
+        ? employees.find((e) => String(e.id) === reportEmpFilter)
+        : uniqueEmpCodes.length === 1
+        ? employees.find((e) => e.emp_code === uniqueEmpCodes[0])
+        : undefined;
+
+    const memberName = singleEmp
+      ? singleEmp.full_name
+      : groupedRows.length > 0 && uniqueEmpCodes.length === 1
+      ? groupedRows[0].empName
+      : "SEMUA ANGGOTA / TERPILIH";
+
+    const memberCode = singleEmp
+      ? singleEmp.emp_code
+      : groupedRows.length > 0 && uniqueEmpCodes.length === 1
+      ? groupedRows[0].empCode
+      : "ALL-SECURITY-BTG";
 
     return {
       memberName,
@@ -1610,80 +1925,82 @@ export default function AbsensiMultiServerPage() {
 
   const runInspection = (format: "XLSX" | "PDF") => {
     if (isKaryawanMode) return;
-    const totalRows = filteredEntries.length;
-    const validGeofence = filteredEntries.filter(
-      (r) => r.is_within_geofence !== false
-    ).length;
-    const totalLateMins = filteredEntries.reduce((acc, item) => {
-      if (item.entry_type !== "CLOCK_IN") return acc;
-      const emp = employees.find(
-        (e) => Number(e.id) === Number(item.employee_id)
-      );
+    const entriesToUse = getEntriesForExport();
+    const grouped = buildGroupedTimesheetRows(entriesToUse);
+    const faceInCount = grouped.filter((g) => Boolean(g.inEntry?.selfie_data)).length;
+    const faceOutCount = grouped.filter((g) => Boolean(g.outEntry?.selfie_data)).length;
+    const totalLateMins = grouped.reduce((acc, g) => {
+      if (!g.inEntry) return acc;
       return (
-        acc + calcLateMinutes(item.punched_at, emp?.shift_start_time || "07.00")
+        acc + calcLateDetail(g.inEntry.punched_at, g.shiftInfo.startTime).lateMinutes
       );
     }, 0);
 
     setInspectionMode(format);
     setInspectionNote(
-      `Inspeksi ${format} siap: ${totalRows} baris data • Radius valid ${validGeofence}/${totalRows} • Total telat ${totalLateMins} menit • Logo MURINDA (Biru Tua Pekat) & Timesheet Security Dormitory Batang terpasang.`
+      `Inspeksi ${format}: ${grouped.length} rekap harian (${entriesToUse.length} scan) • Foto Wajah Masuk: ${faceInCount}, Foto Wajah Keluar: ${faceOutCount} • Total telat (>5 mnt): ${totalLateMins} menit • Logo MURINDA & Timesheet Absensi Security Dormitory Batang siap.`
     );
     notify(
       "ok",
-      `Inspeksi ${format} selesai: ${totalRows} baris data diperiksa.`
+      `Inspeksi ${format} selesai: ${grouped.length} baris rekap diperiksa.`
     );
   };
 
   const exportReport = (format: "XLSX" | "CSV" | "PDF") => {
     if (isKaryawanMode) return;
-    const meta = buildTimesheetHeaderHtml();
+    const entriesToUse = getEntriesForExport();
+    const groupedRows = buildGroupedTimesheetRows(entriesToUse);
+    const meta = buildTimesheetHeaderMeta(groupedRows);
 
     const headers = [
       "TANGGAL",
       "HARI",
+      "ANGGOTA",
+      "SHIFT",
       "JAM MASUK",
+      "FOTO WAJAH MASUK",
       "TERAKHIR KELUAR",
+      "FOTO WAJAH KELUAR",
       "JAM PENGGAJIAN",
       "JAM REG",
       "TELAT",
-      "STATUS",
+      "KETERANGAN",
       "MODE",
     ];
 
-    const rows = filteredEntries.map((item) => {
-      const emp = employees.find(
-        (e) => Number(e.id) === Number(item.employee_id)
-      );
-      const lateMins =
-        item.entry_type === "CLOCK_IN"
-          ? calcLateMinutes(item.punched_at, emp?.shift_start_time || "07.00")
-          : 0;
-      const dayName = new Date(item.punched_at).toLocaleDateString("id-ID", {
-        timeZone: "Asia/Jakarta",
-        weekday: "long",
-      });
-      const isIn = item.entry_type === "CLOCK_IN";
-      return [
-        getJakartaDateStr(item.punched_at),
-        dayName,
-        isIn ? formatTimeWIB(item.punched_at) : "-",
-        !isIn ? formatTimeWIB(item.punched_at) : "-",
-        "0j 00m",
-        "0j 00m",
-        lateMins > 0 ? `${lateMins}m` : "0m",
-        item.is_within_geofence === false ? "LUAR RADIUS" : "HADIR",
-        item.mode || "BARCODE + GPS",
-      ];
-    });
-
     if (format === "CSV") {
+      const csvRows = groupedRows.map((g) => {
+        const lateInfo = g.inEntry
+          ? calcLateDetail(g.inEntry.punched_at, g.shiftInfo.startTime)
+          : { lateMinutes: 0, isLate: false, statusNote: "-" };
+        return [
+          g.dateStr,
+          g.dayName,
+          `${g.empName} (${g.empCode})`,
+          g.shiftInfo.code === "OFF" ? "OFF (LIBUR)" : `${g.shiftInfo.code} (${g.shiftInfo.rangeLabel})`,
+          g.inEntry ? formatTimeWIB(g.inEntry.punched_at) : "-",
+          g.inEntry?.selfie_data ? "ADA FOTO WAJAH" : "-",
+          g.outEntry ? formatTimeWIB(g.outEntry.punched_at) : "-",
+          g.outEntry?.selfie_data ? "ADA FOTO WAJAH" : "-",
+          "0j 00m",
+          "0j 00m",
+          lateInfo.isLate ? `${lateInfo.lateMinutes}m` : "0m",
+          g.inEntry
+            ? lateInfo.statusNote
+            : g.shiftInfo.code === "OFF"
+            ? "LIBUR (OFF)"
+            : "HADIR",
+          g.inEntry?.mode || g.outEntry?.mode || "BARCODE + WAJAH",
+        ];
+      });
+
       const csv = [
         ["MURINDA", "Timesheet Absensi Security Dormitory Batang"],
         ["Month", meta.monthLabel],
         ["Anggota", meta.memberName],
         ["Kode", meta.memberCode],
         headers,
-        ...rows,
+        ...csvRows,
       ]
         .map((r) =>
           r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(",")
@@ -1693,7 +2010,7 @@ export default function AbsensiMultiServerPage() {
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `Timesheet_Security_Dormitory_Batang_${reportFilter}_${todayStr}.csv`;
+      a.download = `Timesheet_Security_Dormitory_Batang_${meta.memberName.replace(/\s+/g, "_")}_${todayStr}.csv`;
       a.click();
       URL.revokeObjectURL(url);
       return;
@@ -1701,14 +2018,54 @@ export default function AbsensiMultiServerPage() {
 
     const murindaLogoSvg = `<svg width="168" height="36" viewBox="0 0 260 54" xmlns="http://www.w3.org/2000/svg"><text x="0" y="38" font-family="Arial Black, Impact, sans-serif" font-weight="900" font-size="34" fill="#0B3B8C" letter-spacing="1.2">MURINDA</text><path d="M182 32 L242 10 L214 34 L252 29 L190 46 Z" fill="#DC2626"/><path d="M174 36 L232 16 L208 36 Z" fill="#082A63"/></svg>`;
 
-    const sheetHtml = `<!DOCTYPE html><html><head><meta charset="utf-8"/><title>Timesheet Absensi Security Dormitory Batang</title><style>body{font-family:Arial,sans-serif;color:#082A63;padding:18px}.top{display:flex;align-items:center;gap:18px;border-bottom:3px solid #0B3B8C;padding-bottom:10px;margin-bottom:12px}.title{font-size:20px;font-weight:900;color:#082A63;margin:0}.meta{margin-bottom:14px;font-size:12px;line-height:1.7;color:#082A63}.meta td{border:none;padding:2px 10px 2px 0}.grid{width:100%;border-collapse:collapse;font-size:11px}.grid th{background:#082A63;color:#ffffff;padding:7px 8px;border:1px solid #0B3B8C;text-align:left}.grid td{padding:6px 8px;border:1px solid #94a3b8;color:#0f172a}</style></head><body><div class="top"><div>${murindaLogoSvg}</div><h1 class="title">Timesheet Absensi Security Dormitory Batang</h1></div><table class="meta"><tr><td><b>Month</b></td><td>${meta.monthLabel}</td></tr><tr><td><b>Anggota</b></td><td>${meta.memberName}</td></tr><tr><td><b>Kode</b></td><td>${meta.memberCode}</td></tr></table><table class="grid"><thead><tr>${headers
+    const bodyRowsHtml = groupedRows
+      .map((g) => {
+        const lateInfo = g.inEntry
+          ? calcLateDetail(g.inEntry.punched_at, g.shiftInfo.startTime)
+          : { lateMinutes: 0, isLate: false, statusNote: "-" };
+        const inImgHtml = g.inEntry?.selfie_data
+          ? `<img src="${g.inEntry.selfie_data}" width="46" height="46" style="width:46px;height:46px;object-fit:cover;border-radius:4px;border:1px solid #082A63" />`
+          : `<span style="color:#64748b">-</span>`;
+        const outImgHtml = g.outEntry?.selfie_data
+          ? `<img src="${g.outEntry.selfie_data}" width="46" height="46" style="width:46px;height:46px;object-fit:cover;border-radius:4px;border:1px solid #082A63" />`
+          : `<span style="color:#64748b">-</span>`;
+        const shiftHtml =
+          g.shiftInfo.code === "OFF"
+            ? `<span style="color:#DC2626;font-weight:900">OFF</span>`
+            : `<b>${g.shiftInfo.code}</b> (${g.shiftInfo.rangeLabel})`;
+        const telatHtml = lateInfo.isLate
+          ? `<span style="color:#DC2626;font-weight:900">${lateInfo.lateMinutes}m</span>`
+          : `0m`;
+        const ketText = g.inEntry
+          ? lateInfo.statusNote
+          : g.shiftInfo.code === "OFF"
+          ? "LIBUR (OFF)"
+          : "HADIR";
+
+        return `<tr>
+          <td>${g.dateStr}</td>
+          <td>${g.dayName}</td>
+          <td><b>${g.empName}</b><br/><span style="font-size:10px;color:#475569">${g.empCode}</span></td>
+          <td>${shiftHtml}</td>
+          <td>${g.inEntry ? formatTimeWIB(g.inEntry.punched_at) : "-"}</td>
+          <td style="text-align:center">${inImgHtml}</td>
+          <td>${g.outEntry ? formatTimeWIB(g.outEntry.punched_at) : "-"}</td>
+          <td style="text-align:center">${outImgHtml}</td>
+          <td>0j 00m</td>
+          <td>0j 00m</td>
+          <td>${telatHtml}</td>
+          <td>${ketText}</td>
+          <td>${g.inEntry?.mode || g.outEntry?.mode || "BARCODE + WAJAH"}</td>
+        </tr>`;
+      })
+      .join("");
+
+    const sheetHtml = `<!DOCTYPE html><html><head><meta charset="utf-8"/><title>Timesheet Absensi Security Dormitory Batang</title><style>body{font-family:Arial,sans-serif;color:#082A63;padding:18px}.top{display:flex;align-items:center;gap:18px;border-bottom:3px solid #0B3B8C;padding-bottom:10px;margin-bottom:12px}.title{font-size:20px;font-weight:900;color:#082A63;margin:0}.meta{margin-bottom:14px;font-size:12px;line-height:1.7;color:#082A63}.meta td{border:none;padding:2px 10px 2px 0}.grid{width:100%;border-collapse:collapse;font-size:11px}.grid th{background:#082A63;color:#ffffff;padding:7px 8px;border:1px solid #0B3B8C;text-align:left}.grid td{padding:6px 8px;border:1px solid #94a3b8;color:#0f172a;vertical-align:middle}</style></head><body><div class="top"><div>${murindaLogoSvg}</div><h1 class="title">Timesheet Absensi Security Dormitory Batang</h1></div><table class="meta"><tr><td><b>Month</b></td><td>${meta.monthLabel}</td></tr><tr><td><b>Anggota</b></td><td>${meta.memberName}</td></tr><tr><td><b>Kode</b></td><td>${meta.memberCode}</td></tr></table><table class="grid"><thead><tr>${headers
       .map((h) => `<th>${h}</th>`)
-      .join("")}</tr></thead><tbody>${rows
-      .map((r) => `<tr>${r.map((c) => `<td>${c}</td>`).join("")}</tr>`)
-      .join("")}</tbody></table></body></html>`;
+      .join("")}</tr></thead><tbody>${bodyRowsHtml}</tbody></table></body></html>`;
 
     if (format === "PDF") {
-      const printWin = window.open("", "_blank", "width=960,height=700");
+      const printWin = window.open("", "_blank", "width=1050,height=720");
       if (printWin) {
         printWin.document.write(sheetHtml);
         printWin.document.close();
@@ -1724,7 +2081,7 @@ export default function AbsensiMultiServerPage() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `MURINDA_Timesheet_Security_Dormitory_Batang_${reportFilter}_${todayStr}.xls`;
+    a.download = `MURINDA_Timesheet_${meta.memberName.replace(/\s+/g, "_")}_${todayStr}.xls`;
     a.click();
     URL.revokeObjectURL(url);
   };
@@ -1829,14 +2186,23 @@ export default function AbsensiMultiServerPage() {
       notify("err", "Isi ID dan Nama Lengkap karyawan.");
       return;
     }
+    const cleanCode = empForm.emp_code.trim();
+    const mondayCode = empForm.weekly_schedule.Senin || "P";
+    const resolvedStartTime =
+      empForm.shift_start_time || shiftCodeToStartTime(mondayCode);
+
+    const weeklyMap = loadWeeklySchedulesMap();
+    weeklyMap[cleanCode] = empForm.weekly_schedule;
+    localStorage.setItem(WEEKLY_SCHED_KEY, JSON.stringify(weeklyMap));
+
     const payload = {
       id: empForm.id || undefined,
-      emp_code: empForm.emp_code.trim(),
+      emp_code: cleanCode,
       full_name: empForm.full_name.trim(),
       role: empForm.role,
       department: empForm.department.trim() || "Operasional",
       pin_code: empForm.pin_code.trim() || "1234",
-      shift_start_time: normalizeShiftTime(empForm.shift_start_time),
+      shift_start_time: normalizeShiftTime(resolvedStartTime),
     };
     if (navigator.onLine) {
       try {
@@ -1857,8 +2223,9 @@ export default function AbsensiMultiServerPage() {
               department: "Operasional",
               pin_code: "1234",
               shift_start_time: "07.00",
+              weekly_schedule: buildDefaultWeeklySchedule("P"),
             });
-            notify("ok", "Data karyawan disimpan.");
+            notify("ok", "Data & jadwal Senin–Minggu karyawan disimpan.");
             return;
           }
         }
@@ -1868,9 +2235,20 @@ export default function AbsensiMultiServerPage() {
     }
     setEmployees((prev) => {
       if (empForm.id) {
-        return prev.map((e) => (e.id === empForm.id ? { ...e, ...payload } : e));
+        return prev.map((e) =>
+          e.id === empForm.id
+            ? { ...e, ...payload, weekly_schedule: empForm.weekly_schedule }
+            : e
+        );
       }
-      return [...prev, { ...payload, id: Date.now() }];
+      return [
+        ...prev,
+        {
+          ...payload,
+          id: Date.now(),
+          weekly_schedule: empForm.weekly_schedule,
+        },
+      ];
     });
     setEmpForm({
       id: 0,
@@ -1880,8 +2258,9 @@ export default function AbsensiMultiServerPage() {
       department: "Operasional",
       pin_code: "1234",
       shift_start_time: "07.00",
+      weekly_schedule: buildDefaultWeeklySchedule("P"),
     });
-    notify("ok", "Data karyawan diperbarui.");
+    notify("ok", "Data & jadwal Senin–Minggu karyawan diperbarui.");
   };
 
   const deleteEmployee = async (id: number) => {
@@ -2085,17 +2464,23 @@ export default function AbsensiMultiServerPage() {
           </div>
         )}
 
-        {lateBanner && (
+        {latestLateAlertToday && (
           <div className="p-3.5 rounded-2xl bg-rose-600 text-white shadow-md border-2 border-rose-200 space-y-1">
-            <div className="text-[11px] font-extrabold uppercase tracking-wider text-rose-100">
-              Peringatan Keterlambatan • Jam Masuk {lateBanner.shiftLabel}
+            <div className="text-[10px] font-extrabold uppercase tracking-wider text-rose-100">
+              Notifikasi Keterlambatan (&gt; 5 Menit) • Shift{" "}
+              {latestLateAlertToday.shiftLabel}
             </div>
-            <div className="text-lg sm:text-xl font-black leading-tight">
-              {lateBanner.employeeName} — Terlambat {lateBanner.lateMinutes} Menit
+            <div className="text-base sm:text-lg font-black leading-tight">
+              {latestLateAlertToday.employeeName} — Terlambat{" "}
+              {latestLateAlertToday.lateMinutes} Menit (Scan{" "}
+              {latestLateAlertToday.punchedTime} WIB)
+            </div>
+            <div className="text-[11px] text-rose-100">
+              {latestLateAlertToday.statusNote}
             </div>
             <button
               type="button"
-              onClick={() => setLateBanner(null)}
+              onClick={() => setDismissedLateUuid(latestLateAlertToday.uuid)}
               className="text-[10px] font-bold underline text-rose-100 pt-0.5"
             >
               Tutup Pemberitahuan
@@ -2212,12 +2597,17 @@ export default function AbsensiMultiServerPage() {
               }}
               className="w-full rounded-lg border border-slate-300 px-2.5 py-2 text-xs font-bold bg-slate-50"
             >
-              {staffList.map((emp) => (
-                <option key={emp.id} value={emp.id}>
-                  {emp.full_name} ({emp.emp_code}) • Jam Masuk{" "}
-                  {emp.shift_start_time || "07.00"}
-                </option>
-              ))}
+              {staffList.map((emp) => {
+                const todaySh = getEmployeeShiftForIso(emp, syncedIsoNow);
+                return (
+                  <option key={emp.id} value={emp.id}>
+                    {emp.full_name} ({emp.emp_code}) •{" "}
+                    {todaySh.code === "OFF"
+                      ? "OFF (Libur)"
+                      : `Shift ${todaySh.code} (${todaySh.rangeLabel})`}
+                  </option>
+                );
+              })}
             </select>
           </section>
         )}
@@ -2275,9 +2665,16 @@ export default function AbsensiMultiServerPage() {
             </button>
           </div>
 
-          <div className="text-[11px] text-slate-500">
-            Jam Masuk: 07.00 / 15.00 / 23.00 • Jadwal:{" "}
-            {activeUser?.shift_start_time || "07.00"}
+          <div className="text-[11px] text-slate-600">
+            Jadwal Hari Ini ({getJakartaDayKey(syncedIsoNow)}):{" "}
+            {activeUserTodayShift.code === "OFF" ? (
+              <span className="font-extrabold text-rose-600">OFF (Libur)</span>
+            ) : (
+              <span className="font-bold text-slate-800">
+                Shift {activeUserTodayShift.code} ({activeUserTodayShift.rangeLabel})
+              </span>
+            )}{" "}
+            • Toleransi telat 5 menit
           </div>
           <div className="text-[11px] font-bold text-emerald-700">
             {geofenceLabel}
@@ -2287,28 +2684,30 @@ export default function AbsensiMultiServerPage() {
             {targetLocation.longitude} • Radius {targetLocation.radius_meters}m
           </div>
 
-          {cooldownInfo.locked && (
+          {cooldownInfo.lockedSameAction && (
             <div className="p-2 rounded-xl bg-amber-50 border border-amber-300 text-[11px] font-bold text-amber-900">
-              Sudah absen{" "}
+              Terakhir absen{" "}
               {cooldownInfo.lastEntry?.entry_type === "CLOCK_IN"
                 ? "MASUK"
                 : "KELUAR"}
-              . Absen normal lagi setelah 6 jam (sisa{" "}
-              {cooldownInfo.remainingText}).
+              .{" "}
+              {cooldownInfo.lastEntry?.entry_type === "CLOCK_IN"
+                ? "Silakan buka kamera depan & klik KELUAR saat jam pulang."
+                : `Absen KELUAR ulang tersedia setelah 6 jam (sisa ${cooldownInfo.remainingText}).`}
             </div>
           )}
 
           <div className="grid grid-cols-2 gap-2">
             <button
               type="button"
-              disabled={cooldownInfo.locked}
+              disabled={isActionLocked("CLOCK_IN")}
               onClick={() => {
                 unlockAudioContext();
                 setSelectedAction("CLOCK_IN");
                 void submitAttendance("CLOCK_IN");
               }}
               className={`py-2 rounded-lg text-xs font-extrabold border disabled:opacity-45 ${
-                selectedAction === "CLOCK_IN" && !cooldownInfo.locked
+                selectedAction === "CLOCK_IN" && !isActionLocked("CLOCK_IN")
                   ? "bg-blue-600 text-white border-blue-600"
                   : "bg-white text-slate-700 border-slate-300"
               }`}
@@ -2317,14 +2716,14 @@ export default function AbsensiMultiServerPage() {
             </button>
             <button
               type="button"
-              disabled={cooldownInfo.locked}
+              disabled={isActionLocked("CLOCK_OUT")}
               onClick={() => {
                 unlockAudioContext();
                 setSelectedAction("CLOCK_OUT");
                 void submitAttendance("CLOCK_OUT");
               }}
               className={`py-2 rounded-lg text-xs font-extrabold border disabled:opacity-45 ${
-                selectedAction === "CLOCK_OUT" && !cooldownInfo.locked
+                selectedAction === "CLOCK_OUT" && !isActionLocked("CLOCK_OUT")
                   ? "bg-blue-600 text-white border-blue-600"
                   : "bg-white text-slate-700 border-slate-300"
               }`}
@@ -2335,11 +2734,10 @@ export default function AbsensiMultiServerPage() {
 
           <button
             type="button"
-            disabled={cooldownInfo.locked}
             onClick={() =>
               qrCameraOn ? stopQrCam() : void startScannerCamera()
             }
-            className="w-full py-2.5 rounded-lg bg-emerald-700 hover:bg-emerald-800 disabled:opacity-45 text-white text-xs font-bold"
+            className="w-full py-2.5 rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-bold"
           >
             {qrCameraOn
               ? "Tutup Scanner Barcode/QR"
@@ -2360,15 +2758,14 @@ export default function AbsensiMultiServerPage() {
           <div className="flex gap-1.5">
             <input
               type="text"
-              disabled={cooldownInfo.locked}
               placeholder="Input Kode Barcode/QR manual jika kamera terkendala"
               value={qrInput}
               onChange={(e) => setQrInput(e.target.value)}
-              className="flex-1 rounded-lg border border-slate-300 px-2.5 py-2 text-xs disabled:bg-slate-100"
+              className="flex-1 rounded-lg border border-slate-300 px-2.5 py-2 text-xs"
             />
             <button
               type="button"
-              disabled={cooldownInfo.locked}
+              disabled={isActionLocked(selectedAction)}
               onClick={() => void submitAttendance(selectedAction, qrInput)}
               className="px-3.5 py-2 rounded-lg bg-slate-900 disabled:opacity-45 text-white text-xs font-bold"
             >
@@ -2379,12 +2776,11 @@ export default function AbsensiMultiServerPage() {
           <div className="pt-2 border-t border-slate-100 space-y-2">
             <div className="flex items-center justify-between">
               <span className="text-[11px] font-extrabold text-slate-700">
-                Selfie Pendeteksi Wajah{" "}
-                {isKaryawanMode ? "(Wajib Karyawan)" : "(Opsional)"}
+                Selfie Kamera Depan (Masuk &amp; Keluar)
               </span>
               {capturedSelfie && (
                 <span className="text-[10px] font-bold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded">
-                  Siap
+                  Siap ({selectedAction === "CLOCK_OUT" ? "KELUAR" : "MASUK"})
                 </span>
               )}
             </div>
@@ -2430,16 +2826,22 @@ export default function AbsensiMultiServerPage() {
             )}
 
             {!selfieCameraOn && (
-              <button
-                type="button"
-                disabled={cooldownInfo.locked}
-                onClick={() => void openSelfieCamera()}
-                className="w-full py-2 rounded-lg bg-slate-800 hover:bg-slate-900 disabled:opacity-45 text-white text-xs font-bold"
-              >
-                {capturedSelfie
-                  ? "Ambil Ulang Selfie Wajah"
-                  : "Buka Kamera Selfie Wajah"}
-              </button>
+              <div className="grid grid-cols-2 gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => void openSelfieCamera("CLOCK_IN")}
+                  className="py-2 rounded-lg bg-slate-800 hover:bg-slate-900 text-white text-[11px] font-bold"
+                >
+                  Kamera Depan (Masuk)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void openSelfieCamera("CLOCK_OUT")}
+                  className="py-2 rounded-lg bg-indigo-700 hover:bg-indigo-800 text-white text-[11px] font-bold"
+                >
+                  Kamera Depan (Keluar)
+                </button>
+              </div>
             )}
 
             {capturedSelfie && !selfieCameraOn && (
@@ -2451,7 +2853,8 @@ export default function AbsensiMultiServerPage() {
                   className="w-12 h-12 rounded-lg object-cover border border-emerald-500"
                 />
                 <span className="text-[11px] text-emerald-800 font-semibold">
-                  Selfie tersimpan. Klik MASUK atau KELUAR.
+                  Foto wajah tersimpan. Klik{" "}
+                  {selectedAction === "CLOCK_OUT" ? "KELUAR" : "MASUK"}.
                 </span>
               </div>
             )}
@@ -2521,8 +2924,14 @@ export default function AbsensiMultiServerPage() {
                       <span>
                         {r.full_name} ({r.emp_code})
                       </span>
-                      <span>
-                        {r.shift_label} • {r.shift_time}
+                      <span
+                        className={
+                          r.shift_code === "OFF"
+                            ? "text-rose-600 font-extrabold"
+                            : ""
+                        }
+                      >
+                        {r.shift_label}
                       </span>
                     </div>
                   ))}
@@ -2531,23 +2940,62 @@ export default function AbsensiMultiServerPage() {
             </section>
 
             <section className="bg-white rounded-2xl p-3.5 border border-slate-200/80 shadow-sm space-y-2.5">
-              <div className="flex items-center justify-between">
+              <div className="flex items-center justify-between gap-1.5">
                 <h2 className="text-xs font-extrabold text-slate-800">
                   3. Laporan &amp; Data Absensi:
                 </h2>
-                <select
-                  value={reportFilter}
-                  onChange={(e) =>
-                    setReportFilter(
-                      e.target.value as "Harian" | "Mingguan" | "Bulanan"
-                    )
-                  }
-                  className="rounded-lg border border-slate-300 px-2 py-1 text-[11px] font-semibold bg-white"
+                <div className="flex items-center gap-1">
+                  <select
+                    value={reportEmpFilter}
+                    onChange={(e) => {
+                      setReportEmpFilter(e.target.value);
+                      setSelectedReportUuids([]);
+                    }}
+                    className="rounded-lg border border-slate-300 px-1.5 py-1 text-[10px] font-semibold bg-white max-w-[115px]"
+                  >
+                    <option value="ALL">Semua Anggota</option>
+                    {employees.map((emp) => (
+                      <option key={emp.id} value={String(emp.id)}>
+                        {emp.full_name}
+                      </option>
+                    ))}
+                  </select>
+                  <select
+                    value={reportFilter}
+                    onChange={(e) => {
+                      setReportFilter(
+                        e.target.value as "Harian" | "Mingguan" | "Bulanan"
+                      );
+                      setSelectedReportUuids([]);
+                    }}
+                    className="rounded-lg border border-slate-300 px-1.5 py-1 text-[10px] font-semibold bg-white"
+                  >
+                    <option value="Harian">Harian</option>
+                    <option value="Mingguan">Mingguan</option>
+                    <option value="Bulanan">Bulanan</option>
+                  </select>
+                </div>
+              </div>
+
+              <div className="flex items-center justify-between text-[10px] bg-slate-50 px-2.5 py-1.5 rounded-lg border border-slate-200">
+                <span className="font-semibold text-slate-600">
+                  Tercentang:{" "}
+                  <b className="text-[#082A63]">
+                    {selectedReportUuids.length > 0
+                      ? `${selectedReportUuids.length} baris terpilih`
+                      : `Semua (${filteredEntries.length} baris)`}
+                  </b>
+                </span>
+                <button
+                  type="button"
+                  onClick={toggleSelectAllReport}
+                  className="font-bold text-blue-700 underline"
                 >
-                  <option value="Harian">Harian</option>
-                  <option value="Mingguan">Mingguan</option>
-                  <option value="Bulanan">Bulanan</option>
-                </select>
+                  {selectedReportUuids.length === filteredEntries.length &&
+                  filteredEntries.length > 0
+                    ? "Batal Centang"
+                    : "Centang Semua"}
+                </button>
               </div>
 
               <div className="p-2 rounded-xl bg-slate-50 border border-slate-200 space-y-1.5">
@@ -2669,13 +3117,22 @@ export default function AbsensiMultiServerPage() {
                 <table className="w-full text-left border-collapse text-[10px]">
                   <thead>
                     <tr className="bg-[#0B1220] text-white">
+                      <th className="p-1.5 text-center">
+                        <input
+                          type="checkbox"
+                          checked={
+                            filteredEntries.length > 0 &&
+                            selectedReportUuids.length === filteredEntries.length
+                          }
+                          onChange={toggleSelectAllReport}
+                        />
+                      </th>
                       <th className="p-1.5">Tanggal</th>
                       <th className="p-1.5">Nama</th>
                       <th className="p-1.5">Jenis</th>
+                      <th className="p-1.5">Foto</th>
                       <th className="p-1.5">Scan</th>
                       <th className="p-1.5">Telat</th>
-                      <th className="p-1.5">Status</th>
-                      <th className="p-1.5">Mode</th>
                       <th className="p-1.5">Aksi</th>
                     </tr>
                   </thead>
@@ -2694,18 +3151,30 @@ export default function AbsensiMultiServerPage() {
                         const emp = employees.find(
                           (e) => Number(e.id) === Number(item.employee_id)
                         );
-                        const lateM =
+                        const shift = getEmployeeShiftForIso(
+                          emp,
+                          item.punched_at
+                        );
+                        const lateDetail =
                           item.entry_type === "CLOCK_IN"
-                            ? calcLateMinutes(
-                                item.punched_at,
-                                emp?.shift_start_time || "07.00"
-                              )
-                            : 0;
+                            ? calcLateDetail(item.punched_at, shift.startTime)
+                            : { lateMinutes: 0, isLate: false, statusNote: "" };
                         return (
                           <tr
                             key={`${item.client_uuid}-${idx}`}
                             className="border-t border-slate-100"
                           >
+                            <td className="p-1.5 text-center">
+                              <input
+                                type="checkbox"
+                                checked={selectedReportUuids.includes(
+                                  item.client_uuid
+                                )}
+                                onChange={() =>
+                                  toggleReportUuid(item.client_uuid)
+                                }
+                              />
+                            </td>
                             <td className="p-1.5 whitespace-nowrap">
                               {getJakartaDateStr(item.punched_at)}
                             </td>
@@ -2718,18 +3187,24 @@ export default function AbsensiMultiServerPage() {
                                 : "KELUAR"}
                             </td>
                             <td className="p-1.5 whitespace-nowrap">
+                              {item.selfie_data ? (
+                                /* eslint-disable-next-line @next/next/no-img-element */
+                                <img
+                                  src={item.selfie_data}
+                                  alt="Wajah"
+                                  className="w-6 h-6 rounded object-cover border border-slate-300"
+                                />
+                              ) : (
+                                "-"
+                              )}
+                            </td>
+                            <td className="p-1.5 whitespace-nowrap">
                               {formatTimeWIB(item.punched_at)}
                             </td>
                             <td className="p-1.5 whitespace-nowrap font-bold text-rose-600">
-                              {lateM > 0 ? `${lateM}m` : "0m"}
-                            </td>
-                            <td className="p-1.5 whitespace-nowrap">
-                              {item.is_within_geofence === false
-                                ? "LUAR"
-                                : "HADIR"}
-                            </td>
-                            <td className="p-1.5 whitespace-nowrap">
-                              {item.mode || "BARCODE + GPS"}
+                              {lateDetail.isLate
+                                ? `${lateDetail.lateMinutes}m`
+                                : "0m"}
                             </td>
                             <td className="p-1.5 whitespace-nowrap space-x-1">
                               <button
@@ -2862,12 +3337,15 @@ export default function AbsensiMultiServerPage() {
                   />
                   <select
                     value={empForm.shift_start_time}
-                    onChange={(e) =>
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      const code = shiftTimeToCode(val);
                       setEmpForm((p) => ({
                         ...p,
-                        shift_start_time: e.target.value,
-                      }))
-                    }
+                        shift_start_time: val,
+                        weekly_schedule: buildDefaultWeeklySchedule(code),
+                      }));
+                    }}
                     className="rounded-lg border border-slate-300 px-2 py-1.5 text-xs bg-white"
                   >
                     {SHIFT_OPTIONS.map((opt) => (
@@ -2877,6 +3355,51 @@ export default function AbsensiMultiServerPage() {
                     ))}
                   </select>
                 </div>
+
+                <div className="p-2 rounded-xl bg-slate-50 border border-slate-200 space-y-1.5">
+                  <div className="text-[10px] font-extrabold text-slate-700">
+                    Jadwal Keberangkatan Senin – Minggu (P: 07.00-15.00 • S: 15.00-23.00 • M: 23.00-07.00 •{" "}
+                    <span className="text-rose-600">OFF: Libur</span>)
+                  </div>
+                  <div className="grid grid-cols-7 gap-1 text-center">
+                    {DAYS_OF_WEEK.map((day) => {
+                      const code = empForm.weekly_schedule[day] || "P";
+                      return (
+                        <div key={day} className="space-y-0.5">
+                          <div className="text-[9px] font-bold text-slate-600">
+                            {day.slice(0, 3)}
+                          </div>
+                          <select
+                            value={code}
+                            onChange={(e) => {
+                              const nextCode = e.target.value as ShiftCode;
+                              setEmpForm((p) => ({
+                                ...p,
+                                weekly_schedule: {
+                                  ...p.weekly_schedule,
+                                  [day]: nextCode,
+                                },
+                              }));
+                            }}
+                            className={`w-full rounded border px-0.5 py-1 text-[10px] font-extrabold text-center bg-white ${
+                              code === "OFF"
+                                ? "text-rose-600 border-rose-400 bg-rose-50"
+                                : "text-slate-800 border-slate-300"
+                            }`}
+                          >
+                            <option value="P">P</option>
+                            <option value="S">S</option>
+                            <option value="M">M</option>
+                            <option value="OFF" className="text-rose-600 font-bold">
+                              OFF
+                            </option>
+                          </select>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+
                 <button
                   type="button"
                   onClick={() => void saveEmployee()}
@@ -2887,48 +3410,74 @@ export default function AbsensiMultiServerPage() {
               </div>
 
               <div className="space-y-1.5 pt-1">
-                {employees.map((emp) => (
-                  <div
-                    key={emp.id}
-                    className="p-2 rounded-lg bg-slate-50 border border-slate-200/70 flex flex-wrap items-center justify-between gap-1.5 text-xs"
-                  >
-                    <div>
-                      <span className="font-bold">{emp.full_name}</span> (
-                      {emp.emp_code}) • {emp.role} • Jam Masuk{" "}
-                      {emp.shift_start_time || "07.00"}
+                {employees.map((emp) => {
+                  const wk =
+                    emp.weekly_schedule ||
+                    buildDefaultWeeklySchedule(
+                      shiftTimeToCode(emp.shift_start_time)
+                    );
+                  return (
+                    <div
+                      key={emp.id}
+                      className="p-2 rounded-lg bg-slate-50 border border-slate-200/70 space-y-1 text-xs"
+                    >
+                      <div className="flex flex-wrap items-center justify-between gap-1.5">
+                        <div>
+                          <span className="font-bold">{emp.full_name}</span> (
+                          {emp.emp_code}) • {emp.role}
+                        </div>
+                        <div className="flex gap-1">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setEmpForm({
+                                id: emp.id,
+                                emp_code: emp.emp_code,
+                                full_name: emp.full_name,
+                                role: emp.role,
+                                department: emp.department,
+                                pin_code: emp.pin_code,
+                                shift_start_time: normalizeShiftTime(
+                                  emp.shift_start_time
+                                ),
+                                weekly_schedule: wk,
+                              })
+                            }
+                            className="px-2 py-0.5 rounded bg-amber-500 text-white text-[10px] font-bold"
+                          >
+                            Edit
+                          </button>
+                          {emp.role !== "ADMIN" && (
+                            <button
+                              type="button"
+                              onClick={() => void deleteEmployee(emp.id)}
+                              className="px-2 py-0.5 rounded bg-rose-600 text-white text-[10px] font-bold"
+                            >
+                              Hapus
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                      <div className="flex flex-wrap gap-1 text-[9px]">
+                        {DAYS_OF_WEEK.map((d) => {
+                          const c = wk[d] || "P";
+                          return (
+                            <span
+                              key={d}
+                              className={`px-1.5 py-0.5 rounded font-bold ${
+                                c === "OFF"
+                                  ? "bg-rose-100 text-rose-600 font-extrabold"
+                                  : "bg-slate-200/80 text-slate-700"
+                              }`}
+                            >
+                              {d.slice(0, 3)}: {c}
+                            </span>
+                          );
+                        })}
+                      </div>
                     </div>
-                    <div className="flex gap-1">
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setEmpForm({
-                            id: emp.id,
-                            emp_code: emp.emp_code,
-                            full_name: emp.full_name,
-                            role: emp.role,
-                            department: emp.department,
-                            pin_code: emp.pin_code,
-                            shift_start_time: normalizeShiftTime(
-                              emp.shift_start_time
-                            ),
-                          })
-                        }
-                        className="px-2 py-0.5 rounded bg-amber-500 text-white text-[10px] font-bold"
-                      >
-                        Edit
-                      </button>
-                      {emp.role !== "ADMIN" && (
-                        <button
-                          type="button"
-                          onClick={() => void deleteEmployee(emp.id)}
-                          className="px-2 py-0.5 rounded bg-rose-600 text-white text-[10px] font-bold"
-                        >
-                          Hapus
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
 
               <div className="pt-2.5 border-t border-slate-100 space-y-1.5">
