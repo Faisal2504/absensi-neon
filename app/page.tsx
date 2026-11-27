@@ -69,7 +69,9 @@ export default function AllInAttendanceSystem() {
     latitude: -6.9148609,
     longitude: 109.7446830,
     radius_meters: 150,
-    shift_start: "07:00",
+    shift1_start: "07:00",
+    shift2_start: "15:00",
+    shift3_start: "23:00",
     late_tolerance: 10,
   });
   const [employees, setEmployees] = useState<Employee[]>([]);
