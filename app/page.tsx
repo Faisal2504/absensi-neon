@@ -1,17 +1,6 @@
 "use client";
 
 import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
-import {
-  RefreshCw,
-  LogOut,
-  QrCode,
-  Camera,
-  CheckCircle2,
-  AlertTriangle,
-  ShieldCheck,
-  UserCheck,
-  Download,
-} from "lucide-react";
 
 type RoleType = "ADMIN" | "MANAGER" | "STAFF";
 
@@ -105,6 +94,13 @@ const formatTimeWIB = (iso?: string | null) =>
         second: "2-digit",
       });
 
+const getNowTimeWIB = () =>
+  new Date().toLocaleTimeString("id-ID", {
+    timeZone: "Asia/Jakarta",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+
 function haversineMeters(
   lat1: number,
   lon1: number,
@@ -122,26 +118,69 @@ function haversineMeters(
   return Math.round(R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
 }
 
+function getInitialStorageState() {
+  if (typeof window === "undefined") {
+    return {
+      qrCode: "ABSENSI-KANTOR-MPI-BTG",
+      empId: 1,
+      queue: [] as TimeEntry[],
+      employees: DEFAULT_EMPLOYEES,
+      locations: DEFAULT_LOCATIONS,
+      entries: [] as TimeEntry[],
+    };
+  }
+  let qrCode = "ABSENSI-KANTOR-MPI-BTG";
+  let empId = 1;
+  let queue: TimeEntry[] = [];
+  let employees = DEFAULT_EMPLOYEES;
+  let locations = DEFAULT_LOCATIONS;
+  let entries: TimeEntry[] = [];
+
+  try {
+    const savedQr = localStorage.getItem(QR_CODE_KEY);
+    if (savedQr) qrCode = savedQr;
+    const savedEmp = localStorage.getItem(ACTIVE_EMP_KEY);
+    if (savedEmp && Number(savedEmp) > 0) empId = Number(savedEmp);
+    const rawQ = localStorage.getItem(QUEUE_KEY);
+    if (rawQ) queue = JSON.parse(rawQ);
+    const rawC = localStorage.getItem(CACHE_KEY);
+    if (rawC) {
+      const cached = JSON.parse(rawC);
+      if (Array.isArray(cached.employees) && cached.employees.length > 0) {
+        employees = cached.employees;
+      }
+      if (Array.isArray(cached.locations) && cached.locations.length > 0) {
+        locations = cached.locations;
+      }
+      if (Array.isArray(cached.entries)) {
+        entries = cached.entries;
+      }
+    }
+  } catch {
+    // Abaikan error storage
+  }
+
+  return { qrCode, empId, queue, employees, locations, entries };
+}
+
 export default function AbsensiQrFacePage() {
-  const [employees, setEmployees] = useState<Employee[]>(DEFAULT_EMPLOYEES);
-  const [locations, setLocations] = useState<LocationItem[]>(DEFAULT_LOCATIONS);
-  const [serverEntries, setServerEntries] = useState<TimeEntry[]>([]);
-  const [offlineQueue, setOfflineQueue] = useState<TimeEntry[]>([]);
-  const [selectedEmpId, setSelectedEmpId] = useState<number>(1);
+  const initialState = useMemo(() => getInitialStorageState(), []);
+
+  const [employees, setEmployees] = useState<Employee[]>(initialState.employees);
+  const [locations, setLocations] = useState<LocationItem[]>(initialState.locations);
+  const [serverEntries, setServerEntries] = useState<TimeEntry[]>(initialState.entries);
+  const [offlineQueue, setOfflineQueue] = useState<TimeEntry[]>(initialState.queue);
+  const [selectedEmpId, setSelectedEmpId] = useState<number>(initialState.empId);
   const [adminView, setAdminView] = useState<"absen" | "monitoring">("absen");
   const [accountPickerOpen, setAccountPickerOpen] = useState(false);
 
-  const [isOnline, setIsOnline] = useState(true);
-  const [isSyncing, setIsSyncing] = useState(false);
-  const [lastSyncLabel, setLastSyncLabel] = useState(() =>
-    new Date().toLocaleTimeString("id-ID", {
-      timeZone: "Asia/Jakarta",
-      hour: "2-digit",
-      minute: "2-digit",
-    })
+  const [isOnline, setIsOnline] = useState<boolean>(() =>
+    typeof navigator !== "undefined" ? navigator.onLine : true
   );
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [lastSyncLabel, setLastSyncLabel] = useState<string>(() => getNowTimeWIB());
 
-  const [officeQrCode, setOfficeQrCode] = useState("ABSENSI-KANTOR-MPI-BTG");
+  const [officeQrCode, setOfficeQrCode] = useState<string>(initialState.qrCode);
   const [qrCodeInput, setQrCodeInput] = useState("");
   const [qrVerified, setQrVerified] = useState(false);
   const [qrCameraOn, setQrCameraOn] = useState(false);
@@ -219,26 +258,6 @@ export default function AbsensiQrFacePage() {
     setSelfieCameraOn(false);
   }, []);
 
-  useEffect(() => {
-    setIsOnline(typeof navigator !== "undefined" ? navigator.onLine : true);
-    const handleOnline = () => {
-      setIsOnline(true);
-      showToast("ok", "Koneksi online kembali.");
-    };
-    const handleOffline = () => {
-      setIsOnline(false);
-      showToast("warn", "Mode offline aktif. Absen disimpan di HP.");
-    };
-    window.addEventListener("online", handleOnline);
-    window.addEventListener("offline", handleOffline);
-    return () => {
-      window.removeEventListener("online", handleOnline);
-      window.removeEventListener("offline", handleOffline);
-      stopQrCamera();
-      stopSelfieCamera();
-    };
-  }, [showToast, stopQrCamera, stopSelfieCamera]);
-
   const syncQueue = useCallback(
     async (queueToSync: TimeEntry[]) => {
       if (!navigator.onLine || queueToSync.length === 0) return;
@@ -253,14 +272,11 @@ export default function AbsensiQrFacePage() {
         if (data.ok) {
           localStorage.removeItem(QUEUE_KEY);
           setOfflineQueue([]);
-          setLastSyncLabel(
-            new Date().toLocaleTimeString("id-ID", {
-              timeZone: "Asia/Jakarta",
-              hour: "2-digit",
-              minute: "2-digit",
-            })
+          setLastSyncLabel(getNowTimeWIB());
+          showToast(
+            "ok",
+            `${data.syncedCount || queueToSync.length} data tersinkron.`
           );
-          showToast("ok", `${data.syncedCount || queueToSync.length} data tersinkron.`);
         }
       } catch {
         // Pertahankan antrean bila jaringan gagal
@@ -296,13 +312,7 @@ export default function AbsensiQrFacePage() {
         if (Array.isArray(data.entries)) {
           setServerEntries(data.entries);
         }
-        setLastSyncLabel(
-          new Date().toLocaleTimeString("id-ID", {
-            timeZone: "Asia/Jakarta",
-            hour: "2-digit",
-            minute: "2-digit",
-          })
-        );
+        setLastSyncLabel(getNowTimeWIB());
         localStorage.setItem(
           CACHE_KEY,
           JSON.stringify({
@@ -318,25 +328,51 @@ export default function AbsensiQrFacePage() {
   }, [syncQueue]);
 
   useEffect(() => {
-    try {
-      const savedQr = localStorage.getItem(QR_CODE_KEY);
-      if (savedQr) setOfficeQrCode(savedQr);
-      const savedEmp = localStorage.getItem(ACTIVE_EMP_KEY);
-      if (savedEmp) setSelectedEmpId(Number(savedEmp));
-      const rawQ = localStorage.getItem(QUEUE_KEY);
-      if (rawQ) setOfflineQueue(JSON.parse(rawQ));
-      const rawC = localStorage.getItem(CACHE_KEY);
-      if (rawC) {
-        const cached = JSON.parse(rawC);
-        if (cached.employees?.length) setEmployees(cached.employees);
-        if (cached.locations?.length) setLocations(cached.locations);
-        if (cached.entries?.length) setServerEntries(cached.entries);
+    const handleOnline = () => {
+      setIsOnline(true);
+      showToast("ok", "Koneksi online kembali.");
+      void loadServerData();
+    };
+    const handleOffline = () => {
+      setIsOnline(false);
+      showToast("warn", "Mode offline aktif. Absen disimpan di HP.");
+    };
+    window.addEventListener("online", handleOnline);
+    window.addEventListener("offline", handleOffline);
+
+    const gpsTimer = window.setTimeout(() => {
+      if (!("geolocation" in navigator)) {
+        setGpsLabel("GPS tidak tersedia");
+      } else {
+        navigator.geolocation.getCurrentPosition(
+          (pos) => {
+            setGpsCoords({
+              lat: pos.coords.latitude,
+              lng: pos.coords.longitude,
+            });
+            setGpsLabel(`Akurasi ±${Math.round(pos.coords.accuracy)}m`);
+          },
+          () => {
+            setGpsLabel("Lokasi GPS aktif");
+          },
+          { enableHighAccuracy: true, timeout: 10000, maximumAge: 15000 }
+        );
       }
-    } catch {
-      // Abaikan error storage
-    }
-    loadServerData();
-  }, [loadServerData]);
+    }, 0);
+
+    const syncTimer = window.setTimeout(() => {
+      void loadServerData();
+    }, 0);
+
+    return () => {
+      clearTimeout(gpsTimer);
+      clearTimeout(syncTimer);
+      window.removeEventListener("online", handleOnline);
+      window.removeEventListener("offline", handleOffline);
+      stopQrCamera();
+      stopSelfieCamera();
+    };
+  }, [showToast, loadServerData, stopQrCamera, stopSelfieCamera]);
 
   const checkGps = useCallback(() => {
     if (!("geolocation" in navigator)) {
@@ -355,10 +391,6 @@ export default function AbsensiQrFacePage() {
       { enableHighAccuracy: true, timeout: 10000, maximumAge: 15000 }
     );
   }, []);
-
-  useEffect(() => {
-    checkGps();
-  }, [checkGps]);
 
   const geofenceInfo = useMemo(() => {
     if (!gpsCoords || locations.length === 0) return null;
@@ -492,11 +524,15 @@ export default function AbsensiQrFacePage() {
           setFaceMessage("Wajah terdeteksi! Tekan tombol Ambil Selfie.");
         } else {
           setFaceStatus("no_face");
-          setFaceMessage("Wajah belum terlihat. Posisikan wajah di tengah kamera.");
+          setFaceMessage(
+            "Wajah belum terlihat. Posisikan wajah di tengah kamera."
+          );
         }
       } catch {
         setFaceStatus("fallback");
-        setFaceMessage("Deteksi wajah otomatis dilewati, silakan ambil foto selfie.");
+        setFaceMessage(
+          "Deteksi wajah otomatis dilewati, silakan ambil foto selfie."
+        );
         return;
       }
       faceRafRef.current = requestAnimationFrame(detectStep);
@@ -718,7 +754,7 @@ export default function AbsensiQrFacePage() {
                 : "bg-rose-600"
             }`}
           >
-            <AlertTriangle className="w-4 h-4 shrink-0" />
+            <span>!</span>
             <span>{toast.text}</span>
           </div>
         )}
@@ -764,21 +800,17 @@ export default function AbsensiQrFacePage() {
           <div className="grid grid-cols-2 gap-2.5 pt-1">
             <button
               type="button"
-              onClick={() => loadServerData()}
+              onClick={() => void loadServerData()}
               disabled={isSyncing}
               className="py-2.5 px-3 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs flex items-center justify-center gap-1.5"
             >
-              <RefreshCw
-                className={`w-4 h-4 ${isSyncing ? "animate-spin" : ""}`}
-              />
-              <span>Refresh Server</span>
+              <span>{isSyncing ? "Menyinkronkan..." : "Refresh Server"}</span>
             </button>
             <button
               type="button"
               onClick={handleKeluarSession}
               className="py-2.5 px-3 rounded-xl bg-rose-600 hover:bg-rose-700 text-white font-bold text-xs flex items-center justify-center gap-1.5"
             >
-              <LogOut className="w-4 h-4" />
               <span>Keluar</span>
             </button>
           </div>
@@ -830,7 +862,9 @@ export default function AbsensiQrFacePage() {
                         {emp.emp_code} • {emp.role}
                       </div>
                     </div>
-                    <UserCheck className="w-4 h-4 text-slate-600" />
+                    <span className="text-xs font-bold text-slate-600">
+                      {selected ? "Aktif" : "Pilih"}
+                    </span>
                   </button>
                 );
               })}
@@ -838,7 +872,7 @@ export default function AbsensiQrFacePage() {
           </section>
         )}
 
-        {/* Navigasi Khusus Admin Saja (Karyawan Tidak Bisa Akses Fitur Lain) */}
+        {/* Navigasi Khusus Admin Saja */}
         {isAdmin && (
           <section className="bg-white rounded-2xl p-3 border border-slate-200 shadow-sm space-y-2.5">
             <div className="grid grid-cols-2 gap-2">
@@ -872,10 +906,9 @@ export default function AbsensiQrFacePage() {
         {isAdmin && adminView === "monitoring" ? (
           <section className="bg-white rounded-2xl p-4 border border-slate-200 shadow-sm space-y-3">
             <div className="flex items-center justify-between border-b border-slate-100 pb-2.5">
-              <div className="flex items-center gap-2 font-bold text-sm text-slate-900">
-                <ShieldCheck className="w-4 h-4 text-blue-600" />
-                <span>Monitoring Absensi Terbaru</span>
-              </div>
+              <span className="font-bold text-sm text-slate-900">
+                Monitoring Absensi Terbaru
+              </span>
               <span className="text-xs font-bold text-slate-500">
                 {combinedEntries.length} catatan
               </span>
@@ -894,6 +927,7 @@ export default function AbsensiQrFacePage() {
                   >
                     <div className="flex items-center gap-2.5 min-w-0">
                       {item.selfie_data ? (
+                        // eslint-disable-next-line @next/next/no-img-element
                         <img
                           src={item.selfie_data}
                           alt={item.full_name || "Selfie"}
@@ -939,6 +973,7 @@ export default function AbsensiQrFacePage() {
                 }}
                 className="w-full rounded-xl border border-slate-300 px-3 py-2 text-xs font-semibold text-center"
               />
+              {/* eslint-disable-next-line @next/next/no-img-element */}
               <img
                 src={qrImageUrl}
                 alt="QR Code Resmi"
@@ -954,7 +989,6 @@ export default function AbsensiQrFacePage() {
                 rel="noreferrer"
                 className="inline-flex items-center justify-center gap-1.5 px-4 py-2 rounded-xl bg-emerald-700 text-white text-xs font-bold"
               >
-                <Download className="w-4 h-4" />
                 <span>Download PNG</span>
               </a>
             </div>
@@ -972,21 +1006,24 @@ export default function AbsensiQrFacePage() {
                   {gpsLabel}
                 </p>
               </div>
-              <span className="px-2.5 py-1 rounded-lg bg-blue-50 text-blue-700 text-[10px] font-extrabold uppercase shrink-0">
-                LANGSUNG KE DATABASE
-              </span>
+              <button
+                type="button"
+                onClick={checkGps}
+                className="px-2.5 py-1 rounded-lg bg-blue-50 text-blue-700 text-[10px] font-extrabold uppercase shrink-0"
+              >
+                CEK GPS
+              </button>
             </div>
 
             {/* Langkah 1: Scan QR Code */}
             <div className="rounded-xl bg-slate-50 border border-slate-200 p-3.5 space-y-2.5">
               <div className="flex items-center justify-between">
-                <span className="text-xs font-extrabold text-slate-800 flex items-center gap-1.5">
-                  <QrCode className="w-4 h-4 text-blue-600" />
-                  <span>1. Scan QR Code Kantor</span>
+                <span className="text-xs font-extrabold text-slate-800">
+                  1. Scan QR Code Kantor
                 </span>
                 {qrVerified && (
-                  <span className="text-[11px] font-bold text-emerald-700 bg-emerald-100 px-2 py-0.5 rounded-full flex items-center gap-1">
-                    <CheckCircle2 className="w-3.5 h-3.5" /> QR Valid
+                  <span className="text-[11px] font-bold text-emerald-700 bg-emerald-100 px-2 py-0.5 rounded-full">
+                    QR Valid
                   </span>
                 )}
               </div>
@@ -994,10 +1031,9 @@ export default function AbsensiQrFacePage() {
               {!qrCameraOn ? (
                 <button
                   type="button"
-                  onClick={startQrScanner}
+                  onClick={() => void startQrScanner()}
                   className="w-full py-2.5 px-3 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-bold text-xs flex items-center justify-center gap-2"
                 >
-                  <QrCode className="w-4 h-4" />
                   <span>Buka Kamera Scan QR</span>
                 </button>
               ) : (
@@ -1052,9 +1088,8 @@ export default function AbsensiQrFacePage() {
             {/* Langkah 2: Foto Selfie Pendeteksi Wajah */}
             <div className="rounded-xl bg-slate-50 border border-slate-200 p-3.5 space-y-2.5">
               <div className="flex items-center justify-between">
-                <span className="text-xs font-extrabold text-slate-800 flex items-center gap-1.5">
-                  <Camera className="w-4 h-4 text-emerald-600" />
-                  <span>2. Foto Selfie Pendeteksi Wajah</span>
+                <span className="text-xs font-extrabold text-slate-800">
+                  2. Foto Selfie Pendeteksi Wajah
                 </span>
                 {capturedSelfie && (
                   <span className="text-[11px] font-bold text-emerald-700 bg-emerald-100 px-2 py-0.5 rounded-full">
@@ -1088,7 +1123,7 @@ export default function AbsensiQrFacePage() {
                   <div className="grid grid-cols-2 gap-2">
                     <button
                       type="button"
-                      onClick={captureSelfiePhoto}
+                      onClick={() => void captureSelfiePhoto()}
                       className="py-2.5 rounded-xl bg-emerald-600 text-white text-xs font-bold"
                     >
                       Ambil Selfie
@@ -1107,10 +1142,9 @@ export default function AbsensiQrFacePage() {
               {!selfieCameraOn && (
                 <button
                   type="button"
-                  onClick={startSelfieCamera}
+                  onClick={() => void startSelfieCamera()}
                   className="w-full py-2.5 px-3 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-bold text-xs flex items-center justify-center gap-2"
                 >
-                  <Camera className="w-4 h-4" />
                   <span>
                     {capturedSelfie
                       ? "Ambil Ulang Selfie Wajah"
@@ -1121,6 +1155,7 @@ export default function AbsensiQrFacePage() {
 
               {capturedSelfie && !selfieCameraOn && (
                 <div className="flex items-center gap-3 pt-1">
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
                   <img
                     src={capturedSelfie}
                     alt="Hasil Selfie Wajah"
@@ -1141,7 +1176,7 @@ export default function AbsensiQrFacePage() {
               <button
                 type="button"
                 disabled={isSubmitting}
-                onClick={() => handleAbsenSubmit("CLOCK_IN")}
+                onClick={() => void handleAbsenSubmit("CLOCK_IN")}
                 className="py-4 px-3 rounded-xl bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 text-white font-extrabold text-xs sm:text-sm tracking-wide shadow"
               >
                 + ABSEN MASUK SEKARANG
@@ -1149,7 +1184,7 @@ export default function AbsensiQrFacePage() {
               <button
                 type="button"
                 disabled={isSubmitting}
-                onClick={() => handleAbsenSubmit("CLOCK_OUT")}
+                onClick={() => void handleAbsenSubmit("CLOCK_OUT")}
                 className="py-4 px-3 rounded-xl bg-rose-600 hover:bg-rose-700 disabled:opacity-60 text-white font-extrabold text-xs sm:text-sm tracking-wide shadow"
               >
                 + ABSEN KELUAR SEKARANG
