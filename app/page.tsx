@@ -56,8 +56,7 @@ type BarcodeDetectorConstructor = new (options?: { formats?: string[] }) => Barc
 const KANTOR_LAT = -6.9148609;
 const KANTOR_LNG = 109.7446830;
 const MAX_RADIUS = 150;
-const OFFICIAL_QR_CODE = 'KANTOR-UTAMA-01';
-
+const OFFICIAL_QR_CODE = 'ABSENSI-KANTOR-MPI-BTG'
 async function getLocalDB() {
   return openDB('AbsensiNeonDB', 2, {
     upgrade(db) {
