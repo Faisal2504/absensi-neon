@@ -11,13 +11,20 @@ interface BeforeInstallPromptEvent extends Event {
   userChoice: Promise<{ outcome: 'accepted' | 'dismissed' }>;
 }
 
+interface KaryawanItem {
+  id_karyawan: string;
+  nama: string;
+  pin: string;
+  role: 'admin' | 'karyawan';
+}
+
 interface JadwalItem {
   id_karyawan: string;
   nama: string;
   tanggal: string;
   jam_berangkat: string;
   jam_pulang: string;
-  toleransi_menit?: number;
+  toleransi_menit: number;
 }
 
 interface AbsenRecord {
@@ -36,17 +43,36 @@ interface AbsenRecord {
   qr_id: string;
 }
 
+interface DetectedBarcode {
+  rawValue: string;
+}
+
+interface BarcodeDetectorInstance {
+  detect: (source: HTMLVideoElement) => Promise<DetectedBarcode[]>;
+}
+
+type BarcodeDetectorConstructor = new (options?: { formats?: string[] }) => BarcodeDetectorInstance;
+
 const KANTOR_LAT = -6.9148609;
 const KANTOR_LNG = 109.7446830;
 const MAX_RADIUS = 150;
+const OFFICIAL_QR_CODE = 'ABSENSI-KANTOR-MPI-BTG';
 
 async function getLocalDB() {
   return openDB('AbsensiNeonDB', 2, {
     upgrade(db) {
-      if (!db.objectStoreNames.contains('queue')) db.createObjectStore('queue', { keyPath: 'id_log' });
-      if (!db.objectStoreNames.contains('logs')) db.createObjectStore('logs', { keyPath: 'id_log' });
-      if (!db.objectStoreNames.contains('jadwal')) db.createObjectStore('jadwal', { keyPath: ['id_karyawan', 'tanggal'] });
-      if (!db.objectStoreNames.contains('users')) db.createObjectStore('users', { keyPath: 'id_karyawan' });
+      if (!db.objectStoreNames.contains('queue')) {
+        db.createObjectStore('queue', { keyPath: 'id_log' });
+      }
+      if (!db.objectStoreNames.contains('logs')) {
+        db.createObjectStore('logs', { keyPath: 'id_log' });
+      }
+      if (!db.objectStoreNames.contains('jadwal')) {
+        db.createObjectStore('jadwal', { keyPath: ['id_karyawan', 'tanggal'] });
+      }
+      if (!db.objectStoreNames.contains('users')) {
+        db.createObjectStore('users', { keyPath: 'id_karyawan' });
+      }
     },
   });
 }
@@ -56,43 +82,61 @@ function hitungJarakMeter(lat1: number, lon1: number, lat2: number, lon2: number
   const rad = Math.PI / 180;
   const dLat = (lat2 - lat1) * rad;
   const dLon = (lon2 - lon1) * rad;
-  const a = Math.sin(dLat / 2) ** 2 + Math.cos(lat1 * rad) * Math.cos(lat2 * rad) * Math.sin(dLon / 2) ** 2;
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(lat1 * rad) * Math.cos(lat2 * rad) * Math.sin(dLon / 2) ** 2;
   return Math.round(R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
 }
 
+function todayISO(): string {
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = String(now.getMonth() + 1).padStart(2, '0');
+  const d = String(now.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+function nowHHMM(): string {
+  const now = new Date();
+  return `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+}
+
 export default function AbsensiPage() {
-  const [user, setUser] = useState<{ id: string; nama: string } | null>(null);
-  const [inpId, setInpId] = useState('');
-  const [inpPin, setInpPin] = useState('');
-  const [userRole, setUserRole] = useState<'admin' | 'karyawan'>('karyawan');
+  const [user, setUser] = useState<KaryawanItem | null>(null);
+  const [loginId, setLoginId] = useState('');
+  const [loginPin, setLoginPin] = useState('');
+  const [loadingLogin, setLoadingLogin] = useState(false);
+
   const [isOnline, setIsOnline] = useState(true);
   const [queueCount, setQueueCount] = useState(0);
   const [installPrompt, setInstallPrompt] = useState<BeforeInstallPromptEvent | null>(null);
 
-  const [gps, setGps] = useState<{ lat: number; lng: number; jarak: number } | null>(null);
+  const [gpsCoords, setGpsCoords] = useState<{ lat: number; lng: number } | null>(null);
+  const [jarakMeter, setJarakMeter] = useState<number | null>(null);
   const [jenisAbsen, setJenisAbsen] = useState<'MASUK' | 'KELUAR'>('MASUK');
-  const [jadwalHariIni, setJadwalHariIni] = useState('07:00');
-  const [toleransiHariIni, setToleransiHariIni] = useState(10);
-  const [logs, setLogs] = useState<AbsenRecord[]>([]);
-  const [filterLaporan, setFilterLaporan] = useState<'harian' | 'mingguan' | 'bulanan'>('harian');
-  const [scanning, setScanning] = useState(false);
 
-  const [daftarKaryawan, setDaftarKaryawan] = useState<{ id_karyawan: string; nama: string; pin: string; role: string }[]>([]);
-  const [formKry, setFormKry] = useState({ id_karyawan: '', nama: '', pin: '1234', role: 'karyawan' });
-  const scannerRef = useRef<unknown>(null);
+  const [scanning, setScanning] = useState(false);
+  const [manualQr, setManualQr] = useState('');
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const scanTimerRef = useRef<number | null>(null);
+
+  const [karyawanList, setKaryawanList] = useState<KaryawanItem[]>([]);
+  const [jadwalList, setJadwalList] = useState<JadwalItem[]>([]);
+  const [logs, setLogs] = useState<AbsenRecord[]>([]);
+  const [filterLaporan, setFilterLaporan] = useState<'Harian' | 'Mingguan' | 'Bulanan'>('Harian');
+
+  const [formId, setFormId] = useState('');
+  const [formNama, setFormNama] = useState('');
+  const [formPin, setFormPin] = useState('1234');
+  const [formRole, setFormRole] = useState<'karyawan' | 'admin'>('karyawan');
+
+  const qrImageUrl = `https://api.qrserver.com/v1/create-qr-code/?size=400x400&margin=12&data=${encodeURIComponent(
+    OFFICIAL_QR_CODE
+  )}`;
 
   useEffect(() => {
-    if ('serviceWorker' in navigator) {
-      navigator.serviceWorker.register('/sw.js').catch(() => {});
-    }
-
-    const handleBeforeInstall = (e: Event) => {
-      e.preventDefault();
-      setInstallPrompt(e as BeforeInstallPromptEvent);
-    };
-    window.addEventListener('beforeinstallprompt', handleBeforeInstall);
-
-    setIsOnline(navigator.onLine);
+    setIsOnline(typeof navigator !== 'undefined' ? navigator.onLine : true);
     const onOnline = () => {
       setIsOnline(true);
       syncOfflineQueue();
@@ -101,250 +145,291 @@ export default function AbsensiPage() {
     window.addEventListener('online', onOnline);
     window.addEventListener('offline', onOffline);
 
-    const savedUser = localStorage.getItem('neon_absen_user');
+    const onBeforeInstall = (e: Event) => {
+      e.preventDefault();
+      setInstallPrompt(e as BeforeInstallPromptEvent);
+    };
+    window.addEventListener('beforeinstallprompt', onBeforeInstall);
+
+    const savedUser = localStorage.getItem('absensi_user');
     if (savedUser) {
-      const parsed = JSON.parse(savedUser);
-      setUser({ id: parsed.id, nama: parsed.nama });
-      if (parsed.role === 'admin') {
-        setUserRole('admin');
-        loadKaryawan();
+      try {
+        setUser(JSON.parse(savedUser));
+      } catch {
+        localStorage.removeItem('absensi_user');
       }
     }
-    refreshLocalAndCloud();
-
-    const watchId = navigator.geolocation?.watchPosition(
-      (pos) => {
-        const jarak = hitungJarakMeter(pos.coords.latitude, pos.coords.longitude, KANTOR_LAT, KANTOR_LNG);
-        setGps({ lat: pos.coords.latitude, lng: pos.coords.longitude, jarak });
-      },
-      () => {},
-      { enableHighAccuracy: true, maximumAge: 5000 }
-    );
 
     return () => {
-      window.removeEventListener('beforeinstallprompt', handleBeforeInstall);
       window.removeEventListener('online', onOnline);
       window.removeEventListener('offline', onOffline);
-      if (watchId) navigator.geolocation.clearWatch(watchId);
+      window.removeEventListener('beforeinstallprompt', onBeforeInstall);
     };
   }, []);
 
   useEffect(() => {
-    if (!user) return;
-    const today = new Date().toISOString().slice(0, 10);
-    getLocalDB().then(async (db) => {
-      const match = await db.get('jadwal', [user.id, today]);
-      setJadwalHariIni(match ? match.jam_berangkat : '07:00');
-      setToleransiHariIni(match?.toleransi_menit ?? 10);
-    });
+    if (!('geolocation' in navigator)) return;
+    const watchId = navigator.geolocation.watchPosition(
+      (pos) => {
+        const lat = pos.coords.latitude;
+        const lng = pos.coords.longitude;
+        setGpsCoords({ lat, lng });
+        setJarakMeter(hitungJarakMeter(lat, lng, KANTOR_LAT, KANTOR_LNG));
+      },
+      () => {
+        setJarakMeter(null);
+      },
+      { enableHighAccuracy: true, maximumAge: 5000, timeout: 10000 }
+    );
+    return () => navigator.geolocation.clearWatch(watchId);
+  }, []);
+
+  useEffect(() => {
+    if (user) {
+      refreshAllData();
+      syncOfflineQueue();
+    }
   }, [user]);
 
-  async function installAplikasiKeHP() {
-    if (!installPrompt) return;
-    await installPrompt.prompt();
-    const choice = await installPrompt.userChoice;
-    if (choice.outcome === 'accepted') setInstallPrompt(null);
-  }
-
-  async function refreshLocalAndCloud() {
+  async function refreshAllData() {
     const db = await getLocalDB();
-    setQueueCount((await db.getAll('queue')).length);
+    const qAll = await db.getAll('queue');
+    setQueueCount(qAll.length);
 
     if (navigator.onLine) {
-      await syncOfflineQueue();
       try {
-        const [resLogs, resJadwal, resUsers] = await Promise.all([
-          fetch('/api/absen'),
-          fetch('/api/jadwal'),
-          fetch('/api/karyawan'),
+        const [resK, resJ, resA] = await Promise.all([
+          fetch('/api/karyawan').then((r) => r.json()),
+          fetch('/api/jadwal').then((r) => r.json()),
+          fetch('/api/absen').then((r) => r.json()),
         ]);
-        const jsonLogs = await resLogs.json();
-        const jsonJadwal = await resJadwal.json();
-        const jsonUsers = await resUsers.json();
-
-        if (jsonLogs.status === 'ok') {
-          setLogs(jsonLogs.data);
-          const tx = db.transaction('logs', 'readwrite');
-          for (const item of jsonLogs.data) await tx.store.put(item);
-          await tx.done;
-        }
-        if (jsonJadwal.status === 'ok') {
-          const tx = db.transaction('jadwal', 'readwrite');
-          for (const item of jsonJadwal.data) await tx.store.put(item);
-          await tx.done;
-        }
-        if (jsonUsers.status === 'ok') {
+        if (resK.status === 'ok') {
+          setKaryawanList(resK.data);
           const tx = db.transaction('users', 'readwrite');
-          for (const item of jsonUsers.data) await tx.store.put(item);
+          await tx.store.clear();
+          for (const u of resK.data) await tx.store.put(u);
           await tx.done;
         }
-      } catch {}
-    } else {
-      setLogs((await db.getAll('logs')).reverse());
+        if (resJ.status === 'ok') {
+          setJadwalList(resJ.data);
+          const tx = db.transaction('jadwal', 'readwrite');
+          for (const j of resJ.data) await tx.store.put(j);
+          await tx.done;
+        }
+        if (resA.status === 'ok') {
+          setLogs(resA.data);
+          const tx = db.transaction('logs', 'readwrite');
+          for (const l of resA.data) await tx.store.put(l);
+          await tx.done;
+        }
+        return;
+      } catch {
+        // Fallback ke IndexedDB saat jaringan tidak stabil
+      }
     }
+
+    setKaryawanList(await db.getAll('users'));
+    setJadwalList(await db.getAll('jadwal'));
+    const cachedLogs = await db.getAll('logs');
+    setLogs(cachedLogs.reverse());
   }
 
   async function syncOfflineQueue() {
     if (!navigator.onLine) return;
     const db = await getLocalDB();
-    const queue = await db.getAll('queue');
-    if (queue.length === 0) return;
+    const queued: AbsenRecord[] = await db.getAll('queue');
+    if (queued.length === 0) {
+      setQueueCount(0);
+      return;
+    }
     try {
       const res = await fetch('/api/absen', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ records: queue }),
-      });
-      if (res.ok) {
+        body: JSON.stringify({ records: queued }),
+      }).then((r) => r.json());
+
+      if (res.status === 'ok') {
         const tx = db.transaction('queue', 'readwrite');
         await tx.store.clear();
         await tx.done;
         setQueueCount(0);
+        await refreshAllData();
       }
-    } catch {}
+    } catch {
+      // Tetap simpan di antrean sampai sinyal kembali normal
+    }
   }
 
-  async function handleLoginDenganPin(e: React.FormEvent) {
+  async function handleLogin(e: React.FormEvent) {
     e.preventDefault();
-    const cleanId = inpId.trim().toUpperCase();
-    const cleanPin = inpPin.trim();
-    if (!cleanId || !cleanPin) return alert('Masukkan ID Karyawan dan PIN!');
+    const id = loginId.trim().toUpperCase();
+    const pin = loginPin.trim();
+    if (!id || !pin) return alert('Masukkan ID dan PIN!');
+    setLoadingLogin(true);
+    try {
+      if (navigator.onLine) {
+        const res = await fetch('/api/karyawan', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'login', id_karyawan: id, pin }),
+        }).then((r) => r.json());
 
-    const db = await getLocalDB();
-
-    if (navigator.onLine) {
-      const res = await fetch('/api/karyawan', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'login', id_karyawan: cleanId, pin: cleanPin }),
-      });
-      const json = await res.json();
-      if (!res.ok) return alert(json.message || 'Login gagal');
-
-      await db.put('users', {
-        id_karyawan: json.user.id_karyawan,
-        nama: json.user.nama,
-        pin: cleanPin,
-        role: json.user.role,
-      });
-
-      const u = { id: json.user.id_karyawan, nama: json.user.nama, role: json.user.role };
-      localStorage.setItem('neon_absen_user', JSON.stringify(u));
-      setUser({ id: u.id, nama: u.nama });
-      setUserRole(u.role);
-      if (u.role === 'admin') loadKaryawan();
-    } else {
-      const cachedUser = await db.get('users', cleanId);
-      if (cachedUser && cachedUser.pin === cleanPin) {
-        const u = { id: cachedUser.id_karyawan, nama: cachedUser.nama, role: cachedUser.role };
-        localStorage.setItem('neon_absen_user', JSON.stringify(u));
-        setUser({ id: u.id, nama: u.nama });
-        setUserRole(u.role);
-        alert('Berhasil masuk menggunakan data Offline HP.');
+        if (res.status === 'ok') {
+          setUser(res.user);
+          localStorage.setItem('absensi_user', JSON.stringify(res.user));
+          setLoadingLogin(false);
+          return;
+        }
+        alert(res.message || 'ID atau PIN salah!');
       } else {
-        alert('Data akun belum tersimpan offline. Sambungkan internet untuk login pertama kali.');
+        const db = await getLocalDB();
+        const localUser = await db.get('users', id);
+        if (localUser && localUser.pin === pin) {
+          setUser(localUser);
+          localStorage.setItem('absensi_user', JSON.stringify(localUser));
+        } else {
+          alert('Login offline gagal: data user belum tersimpan atau PIN salah.');
+        }
       }
+    } catch {
+      alert('Gagal terhubung ke server.');
+    } finally {
+      setLoadingLogin(false);
     }
   }
 
   function handleLogout() {
-    localStorage.removeItem('neon_absen_user');
+    stopCamera();
+    localStorage.removeItem('absensi_user');
     setUser(null);
-    setUserRole('karyawan');
   }
 
-  async function loadKaryawan() {
-    const db = await getLocalDB();
-    if (!navigator.onLine) {
-      setDaftarKaryawan(await db.getAll('users'));
+  async function handleInstallPWA() {
+    if (!installPrompt) {
+      alert('Ketuk ikon titik tiga (⋮) di pojok kanan atas Chrome lalu pilih "Install aplikasi".');
       return;
     }
-    const res = await fetch('/api/karyawan');
-    const json = await res.json();
-    if (json.status === 'ok') {
-      setDaftarKaryawan(json.data);
-      const tx = db.transaction('users', 'readwrite');
-      for (const u of json.data) await tx.store.put(u);
-      await tx.done;
+    await installPrompt.prompt();
+    await installPrompt.userChoice;
+    setInstallPrompt(null);
+  }
+
+  function stopCamera() {
+    if (scanTimerRef.current) {
+      window.clearInterval(scanTimerRef.current);
+      scanTimerRef.current = null;
+    }
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
+    }
+    setScanning(false);
+  }
+
+  async function startCamera() {
+    if (jarakMeter === null) {
+      alert('Lokasi GPS belum terkunci. Pastikan GPS HP aktif lalu tunggu beberapa detik.');
+      return;
+    }
+    if (jarakMeter > MAX_RADIUS) {
+      alert(`Anda berada di luar radius kantor (${jarakMeter}m > ${MAX_RADIUS}m). Absensi ditolak.`);
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'environment' },
+        audio: false,
+      });
+      streamRef.current = stream;
+      setScanning(true);
+
+      setTimeout(() => {
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+          videoRef.current.play().catch(() => {});
+        }
+      }, 150);
+
+      const BarcodeDetectorClass = (
+        window as unknown as { BarcodeDetector?: BarcodeDetectorConstructor }
+      ).BarcodeDetector;
+
+      if (BarcodeDetectorClass) {
+        const detector = new BarcodeDetectorClass({ formats: ['qr_code'] });
+        scanTimerRef.current = window.setInterval(async () => {
+          if (!videoRef.current || videoRef.current.readyState < 2) return;
+          try {
+            const codes = await detector.detect(videoRef.current);
+            if (codes.length > 0 && codes[0].rawValue) {
+              const scannedValue = codes[0].rawValue.trim();
+              stopCamera();
+              await prosesAbsenQR(scannedValue);
+            }
+          } catch {
+            // Abaikan frame yang belum terbaca
+          }
+        }, 450);
+      }
+    } catch {
+      alert('Tidak dapat membuka kamera. Pastikan izin kamera di browser sudah diaktifkan.');
     }
   }
 
-  async function simpanKaryawanBaru(e: React.FormEvent) {
-    e.preventDefault();
-    if (!navigator.onLine) return alert('Menambah karyawan baru membutuhkan koneksi internet.');
-    const res = await fetch('/api/karyawan', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(formKry),
-    });
-    const json = await res.json();
-    if (json.status === 'ok') {
-      setFormKry({ id_karyawan: '', nama: '', pin: '1234', role: 'karyawan' });
-      loadKaryawan();
-      alert('Data karyawan tersimpan!');
-    } else alert(json.message || 'Gagal menyimpan');
-  }
+  async function prosesAbsenQR(qrText: string) {
+    if (!user) return;
+    const cleanQr = qrText.trim();
 
-  async function hapusKaryawan(id: string) {
-    if (!navigator.onLine) return alert('Menghapus karyawan membutuhkan koneksi internet.');
-    if (!confirm(`Hapus karyawan ${id}?`)) return;
-    if ((await fetch(`/api/karyawan?id=${encodeURIComponent(id)}`, { method: 'DELETE' })).ok) loadKaryawan();
-  }
+    if (cleanQr !== OFFICIAL_QR_CODE) {
+      alert(
+        `QR Code tidak valid ("${cleanQr}").\nHarap pindai QR Code resmi Kantor Utama (${OFFICIAL_QR_CODE}).`
+      );
+      return;
+    }
 
-  async function mulaiScanQR() {
-    if (!gps) return alert('Tunggu lokasi GPS terkunci terlebih dahulu!');
-    if (gps.jarak > MAX_RADIUS) return alert(`Absen ditolak! Jarak ${gps.jarak}m (maks ${MAX_RADIUS}m).`);
-    setScanning(true);
-    const { Html5Qrcode } = await import('html5-qrcode');
-    const html5QrCode = new Html5Qrcode('qr-reader');
-    scannerRef.current = html5QrCode;
-    html5QrCode.start(
-      { facingMode: 'environment' },
-      { fps: 10, qrbox: { width: 220, height: 220 } },
-      async (decodedText) => {
-        await html5QrCode.stop();
-        setScanning(false);
-        await prosesSimpanAbsen(decodedText);
-      },
-      () => {}
-    ).catch(() => {
-      setScanning(false);
-      alert('Gagal membuka kamera.');
-    });
-  }
+    if (jarakMeter === null || jarakMeter > MAX_RADIUS) {
+      alert(`Gagal: Posisi GPS di luar radius kantor (${jarakMeter ?? '-'}m / maks ${MAX_RADIUS}m).`);
+      return;
+    }
 
-  async function prosesSimpanAbsen(qrId: string) {
-    if (!user || !gps) return;
-    const now = new Date();
-    const tanggal = now.toISOString().slice(0, 10);
-    const waktuScan = now.toTimeString().slice(0, 5);
-    const [jJam, jMenit] = jadwalHariIni.split(':').map(Number);
-    const [sJam, sMenit] = waktuScan.split(':').map(Number);
-    const selisih = sJam * 60 + sMenit - (jJam * 60 + jMenit);
-    const telatMenit = jenisAbsen === 'MASUK' && selisih > 0 ? selisih : 0;
-    const status =
-      jenisAbsen === 'KELUAR'
-        ? 'Pulang'
-        : telatMenit === 0
-        ? 'Tepat Waktu'
-        : telatMenit <= toleransiHariIni
-        ? 'Toleransi'
-        : 'Terlambat';
+    const tgl = todayISO();
+    const waktuScan = nowHHMM();
+    const jadwalHariIni = jadwalList.find(
+      (j) => j.id_karyawan === user.id_karyawan && j.tanggal === tgl
+    );
+    const jamJadwal = jadwalHariIni?.jam_berangkat || '07:00';
+    const toleransi = jadwalHariIni?.toleransi_menit ?? 10;
+
+    let telatMenit = 0;
+    let status = 'Tepat Waktu';
+
+    if (jenisAbsen === 'MASUK') {
+      const [jh, jm] = jamJadwal.split(':').map(Number);
+      const [sh, sm] = waktuScan.split(':').map(Number);
+      const diff = sh * 60 + sm - (jh * 60 + jm);
+      if (diff > toleransi) {
+        telatMenit = diff;
+        status = `Terlambat ${diff}m`;
+      }
+    } else {
+      status = 'Pulang';
+    }
 
     const record: AbsenRecord = {
-      id_log: `${user.id}-${tanggal}-${jenisAbsen}-${Date.now()}`,
-      tanggal,
-      id_karyawan: user.id,
+      id_log: `${tgl}_${user.id_karyawan}_${jenisAbsen}_${Date.now()}`,
+      tanggal: tgl,
+      id_karyawan: user.id_karyawan,
       nama: user.nama,
       jenis: jenisAbsen,
       waktu_scan: waktuScan,
-      jadwal_berangkat: jadwalHariIni,
+      jadwal_berangkat: jamJadwal,
       telat_menit: telatMenit,
       status,
-      koordinat_gps: `${gps.lat.toFixed(6)}, ${gps.lng.toFixed(6)}`,
-      jarak_meter: gps.jarak,
+      koordinat_gps: gpsCoords ? `${gpsCoords.lat.toFixed(6)},${gpsCoords.lng.toFixed(6)}` : '-',
+      jarak_meter: jarakMeter,
       mode_rekam: navigator.onLine ? 'Online' : 'Offline-Sync',
-      qr_id: qrId,
+      qr_id: cleanQr,
     };
 
     const db = await getLocalDB();
@@ -357,239 +442,619 @@ export default function AbsensiPage() {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ records: [record] }),
-        });
-        if (!res.ok) throw new Error();
-        alert(`Absen ${jenisAbsen} berhasil (${status})!`);
+        }).then((r) => r.json());
+
+        if (res.status === 'ok') {
+          alert(`Absen ${jenisAbsen} berhasil dicatat (${waktuScan}) • ${status}`);
+          return;
+        }
       } catch {
-        await db.put('queue', { ...record, mode_rekam: 'Offline-Sync' });
-        setQueueCount((c) => c + 1);
+        // Lanjut simpan ke antrean offline
       }
-    } else {
-      await db.put('queue', record);
-      setQueueCount((c) => c + 1);
-      alert(`Mode Offline: Absen ${jenisAbsen} tersimpan di HP dan otomatis terkirim saat online.`);
+    }
+
+    await db.put('queue', record);
+    const qAll = await db.getAll('queue');
+    setQueueCount(qAll.length);
+    alert(`Mode Offline: Absen ${jenisAbsen} disimpan ke antrean (${waktuScan}) dan akan otomatis terkirim saat online.`);
+  }
+
+  async function handleDownloadQR() {
+    try {
+      const response = await fetch(qrImageUrl);
+      const blob = await response.blob();
+      const imgBitmap = await createImageBitmap(blob);
+
+      const canvas = document.createElement('canvas');
+      canvas.width = 600;
+      canvas.height = 720;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      ctx.strokeStyle = '#0f172a';
+      ctx.lineWidth = 8;
+      ctx.strokeRect(20, 20, 560, 680);
+
+      ctx.fillStyle = '#0f172a';
+      ctx.font = 'bold 30px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('QR ABSENSI KANTOR UTAMA', 300, 80);
+
+      ctx.font = '18px sans-serif';
+      ctx.fillStyle = '#475569';
+      ctx.fillText('Pindai untuk Absen MASUK & KELUAR', 300, 115);
+
+      ctx.drawImage(imgBitmap, 100, 145, 400, 400);
+
+      ctx.fillStyle = '#0f172a';
+      ctx.font = 'bold 26px monospace';
+      ctx.fillText(OFFICIAL_QR_CODE, 300, 600);
+
+      ctx.font = '16px sans-serif';
+      ctx.fillStyle = '#64748b';
+      ctx.fillText(`Radius GPS Aktif: Maks ${MAX_RADIUS} Meter`, 300, 645);
+
+      const link = document.createElement('a');
+      link.download = `QR-Absensi-${OFFICIAL_QR_CODE}.png`;
+      link.href = canvas.toDataURL('image/png');
+      link.click();
+    } catch {
+      window.open(qrImageUrl, '_blank');
     }
   }
 
-  async function handleFileJadwal(e: React.ChangeEvent<HTMLInputElement>) {
+  function handlePrintQR() {
+    const printWin = window.open('', '_blank', 'width=600,height=750');
+    if (!printWin) return;
+    printWin.document.write(`
+      <!DOCTYPE html>
+      <html>
+        <head>
+          <title>Cetak QR Absensi - ${OFFICIAL_QR_CODE}</title>
+          <style>
+            body { font-family: Arial, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
+            .card { border: 4px solid #0f172a; border-radius: 16px; padding: 32px; text-align: center; width: 360px; }
+            h1 { font-size: 22px; margin: 0 0 8px; color: #0f172a; }
+            p { font-size: 14px; color: #475569; margin: 0 0 20px; }
+            img { width: 280px; height: 280px; display: block; margin: 0 auto 16px; }
+            .code { font-family: monospace; font-size: 20px; font-weight: bold; letter-spacing: 1px; color: #0f172a; }
+            .note { font-size: 12px; color: #64748b; margin-top: 12px; }
+          </style>
+        </head>
+        <body>
+          <div class="card">
+            <h1>QR ABSENSI KANTOR UTAMA</h1>
+            <p>Buka Aplikasi Absensi &rarr; Pilih MASUK / KELUAR &rarr; Pindai QR</p>
+            <img src="${qrImageUrl}" onload="window.print();" />
+            <div class="code">${OFFICIAL_QR_CODE}</div>
+            <div class="note">Validasi GPS Aktif • Radius Maks ${MAX_RADIUS} Meter</div>
+          </div>
+        </body>
+      </html>
+    `);
+    printWin.document.close();
+  }
+
+  async function handleUploadJadwal(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     if (!file) return;
-    const parsedRows: JadwalItem[] = [];
+    try {
+      const buf = await file.arrayBuffer();
+      const wb = XLSX.read(buf);
+      const sheet = wb.Sheets[wb.SheetNames[0]];
+      const rawRows = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet);
+      const formatted: JadwalItem[] = rawRows.map((r) => ({
+        id_karyawan: String(r.id_karyawan || r.ID || '').trim().toUpperCase(),
+        nama: String(r.nama || r.Nama || '').trim(),
+        tanggal: String(r.tanggal || r.Tanggal || todayISO()).trim(),
+        jam_berangkat: String(r.jam_berangkat || r.Jam_Masuk || '07:00').trim(),
+        jam_pulang: String(r.jam_pulang || r.Jam_Pulang || '17:00').trim(),
+        toleransi_menit: Number(r.toleransi_menit || 10),
+      })).filter((item) => item.id_karyawan && item.tanggal);
 
-    if (file.name.endsWith('.xlsx') || file.name.endsWith('.xls')) {
-      const wb = XLSX.read(await file.arrayBuffer());
-      const raw = XLSX.utils.sheet_to_json<Record<string, unknown>>(wb.Sheets[wb.SheetNames[0]]);
-      for (const r of raw) {
-        parsedRows.push({
-          id_karyawan: String(r.ID_Karyawan || '').trim().toUpperCase(),
-          nama: String(r.Nama_Karyawan || '').trim(),
-          tanggal: String(r.Tanggal || '').trim(),
-          jam_berangkat: String(r.Jam_Berangkat_Jadwal || '07:00').trim(),
-          jam_pulang: String(r.Jam_Pulang_Jadwal || '17:00').trim(),
-        });
+      if (formatted.length === 0) {
+        alert('Format file tidak sesuai. Pastikan ada kolom: id_karyawan, nama, tanggal, jam_berangkat.');
+        return;
       }
-    } else if (file.name.endsWith('.pdf')) {
-      const pdfjsLib = await import('pdfjs-dist');
-      pdfjsLib.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.mjs`;
-      const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(await file.arrayBuffer()) }).promise;
-      let fullText = '';
-      for (let i = 1; i <= pdf.numPages; i++) {
-        const content = await (await pdf.getPage(i)).getTextContent();
-        fullText += content.items.map((it) => ('str' in it ? it.str : '')).join(' ') + '\n';
-      }
-      const regex = /([A-Z]+-\d+)\s+([A-Za-z\s]+?)\s+(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})/g;
-      let match;
-      while ((match = regex.exec(fullText)) !== null) {
-        parsedRows.push({
-          id_karyawan: match[1].trim(),
-          nama: match[2].trim(),
-          tanggal: match[3].trim(),
-          jam_berangkat: match[4].trim(),
-          jam_pulang: '17:00',
-        });
-      }
-    }
 
-    if (parsedRows.length === 0) return alert('Tidak ada baris jadwal valid terbaca.');
-    const db = await getLocalDB();
-    const tx = db.transaction('jadwal', 'readwrite');
-    for (const item of parsedRows) await tx.store.put(item);
-    await tx.done;
-
-    if (navigator.onLine) {
-      await fetch('/api/jadwal', {
+      const res = await fetch('/api/jadwal', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ rows: parsedRows }),
-      });
+        body: JSON.stringify({ rows: formatted }),
+      }).then((r) => r.json());
+
+      if (res.status === 'ok') {
+        alert(`Berhasil menyimpan ${res.saved} jadwal keberangkatan.`);
+        await refreshAllData();
+      }
+    } catch {
+      alert('Gagal membaca file jadwal.');
     }
-    alert(`Berhasil mengimpor ${parsedRows.length} baris jadwal!`);
   }
 
-  function getFilteredLogs() {
-    const now = new Date();
-    return logs.filter((l) => {
-      const diffDays = (now.getTime() - new Date(l.tanggal).getTime()) / 86400000;
-      if (filterLaporan === 'harian') return l.tanggal === now.toISOString().slice(0, 10);
-      if (filterLaporan === 'mingguan') return diffDays <= 7;
-      return diffDays <= 31;
-    });
-  }
+  async function handleSaveKaryawan(e: React.FormEvent) {
+    e.preventDefault();
+    const id = formId.trim().toUpperCase();
+    const nama = formNama.trim();
+    const pin = formPin.trim() || '1234';
+    if (!id || !nama) return alert('ID dan Nama wajib diisi!');
 
-  function exportLaporan(format: 'xlsx' | 'pdf' | 'csv') {
-    const data = getFilteredLogs();
-    if (format === 'xlsx' || format === 'csv') {
-      const wb = XLSX.utils.book_new();
-      XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(data), 'Laporan_Absensi');
-      XLSX.writeFile(wb, `laporan-absensi-${filterLaporan}.${format}`);
+    const res = await fetch('/api/karyawan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id_karyawan: id, nama, pin, role: formRole }),
+    }).then((r) => r.json());
+
+    if (res.status === 'ok') {
+      setFormId('');
+      setFormNama('');
+      setFormPin('1234');
+      setFormRole('karyawan');
+      await refreshAllData();
     } else {
-      const doc = new jsPDF();
-      doc.text(`Laporan Absensi (${filterLaporan.toUpperCase()})`, 14, 15);
-      autoTable(doc, {
-        startY: 22,
-        head: [['Tanggal', 'ID', 'Nama', 'Jenis', 'Scan', 'Telat', 'Status']],
-        body: data.map((r) => [r.tanggal, r.id_karyawan, r.nama, r.jenis, r.waktu_scan, `${r.telat_menit}m`, r.status]),
-      });
-      doc.save(`laporan-absensi-${filterLaporan}.pdf`);
+      alert(res.message || 'Gagal menyimpan data karyawan.');
     }
   }
 
-  return (
-    <main className="max-w-4xl mx-auto p-4 space-y-6">
-      <header className="bg-slate-900 text-white p-4 rounded-xl flex flex-wrap justify-between items-center gap-2">
-        <div>
-          <h1 className="font-bold text-lg">APLIKASI ABSENSI QR & GPS</h1>
-          {user && <p className="text-xs text-slate-300">{user.nama} ({user.id}) • {userRole.toUpperCase()}</p>}
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
-          {installPrompt && (
-            <button onClick={installAplikasiKeHP} className="bg-indigo-600 px-3 py-1 rounded text-xs font-bold">
+  async function handleDeleteKaryawan(id: string) {
+    if (id === 'ADM-001') return alert('Akun Admin utama tidak boleh dihapus.');
+    if (!confirm(`Hapus karyawan ${id}?`)) return;
+    const res = await fetch(`/api/karyawan?id=${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    }).then((r) => r.json());
+    if (res.status === 'ok') {
+      await refreshAllData();
+    }
+  }
+
+  const filteredLogs = logs.filter((l) => {
+    if (user?.role !== 'admin' && l.id_karyawan !== user?.id_karyawan) return false;
+    const tgl = l.tanggal;
+    const today = todayISO();
+    if (filterLaporan === 'Harian') return tgl === today;
+    if (filterLaporan === 'Mingguan') {
+      const diff = (new Date(today).getTime() - new Date(tgl).getTime()) / (1000 * 3600 * 24);
+      return diff >= 0 && diff <= 7;
+    }
+    return tgl.slice(0, 7) === today.slice(0, 7);
+  });
+
+  function exportXLSX() {
+    const ws = XLSX.utils.json_to_sheet(filteredLogs);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Laporan_Absensi');
+    XLSX.writeFile(wb, `Laporan_Absensi_${filterLaporan}_${todayISO()}.xlsx`);
+  }
+
+  function exportCSV() {
+    const ws = XLSX.utils.json_to_sheet(filteredLogs);
+    const csv = XLSX.utils.sheet_to_csv(ws);
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `Laporan_Absensi_${filterLaporan}_${todayISO()}.csv`;
+    a.click();
+  }
+
+  function exportPDF() {
+    const doc = new jsPDF();
+    doc.text(`Laporan Absensi (${filterLaporan}) - ${todayISO()}`, 14, 16);
+    autoTable(doc, {
+      startY: 22,
+      head: [['Tanggal', 'Nama', 'Jenis', 'Scan', 'Telat', 'Status', 'Mode']],
+      body: filteredLogs.map((l) => [
+        l.tanggal,
+        l.nama,
+        l.jenis,
+        l.waktu_scan,
+        `${l.telat_menit}m`,
+        l.status,
+        l.mode_rekam,
+      ]),
+    });
+    doc.save(`Laporan_Absensi_${filterLaporan}_${todayISO()}.pdf`);
+  }
+
+  if (!user) {
+    return (
+      <main className="min-h-screen bg-slate-100 p-4 max-w-md mx-auto">
+        <div className="bg-slate-900 text-white rounded-2xl p-4 mb-5 shadow">
+          <h1 className="font-bold text-lg tracking-wide">APLIKASI ABSENSI QR &amp; GPS</h1>
+          <div className="flex items-center gap-2 mt-3 flex-wrap">
+            <button
+              onClick={handleInstallPWA}
+              className="bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold px-3 py-1.5 rounded-full"
+            >
               + Install Aplikasi
             </button>
-          )}
-          <span className={`px-3 py-1 rounded-full text-xs font-bold ${isOnline ? 'bg-emerald-600' : 'bg-amber-600'}`}>
+            <span
+              className={`text-xs font-semibold px-3 py-1.5 rounded-full ${
+                isOnline ? 'bg-emerald-600' : 'bg-amber-600'
+              }`}
+            >
+              {isOnline ? 'ONLINE' : 'OFFLINE'} • ANTREAN: {queueCount}
+            </span>
+          </div>
+        </div>
+
+        <form onSubmit={handleLogin} className="bg-white rounded-2xl p-5 shadow space-y-4">
+          <h2 className="font-bold text-slate-800 text-base">Login Karyawan / Admin</h2>
+          <input
+            type="text"
+            placeholder="ID (KRY-001 / ADM-001)"
+            value={loginId}
+            onChange={(e) => setLoginId(e.target.value)}
+            className="w-full border border-slate-300 rounded-xl px-3.5 py-2.5 text-sm uppercase"
+          />
+          <input
+            type="password"
+            placeholder="PIN"
+            value={loginPin}
+            onChange={(e) => setLoginPin(e.target.value)}
+            className="w-full border border-slate-300 rounded-xl px-3.5 py-2.5 text-sm"
+          />
+          <button
+            type="submit"
+            disabled={loadingLogin}
+            className="w-full bg-blue-700 hover:bg-blue-600 text-white font-semibold py-2.5 rounded-xl text-sm"
+          >
+            {loadingLogin ? 'Memeriksa...' : 'Masuk Aplikasi'}
+          </button>
+        </form>
+      </main>
+    );
+  }
+
+  const todaySchedule = jadwalList.find(
+    (j) => j.id_karyawan === user.id_karyawan && j.tanggal === todayISO()
+  );
+  const gpsAman = jarakMeter !== null && jarakMeter <= MAX_RADIUS;
+
+  return (
+    <main className="min-h-screen bg-slate-100 p-4 max-w-md mx-auto space-y-4 pb-10">
+      {/* Header */}
+      <div className="bg-slate-900 text-white rounded-2xl p-4 shadow">
+        <h1 className="font-bold text-base tracking-wide">APLIKASI ABSENSI QR &amp; GPS</h1>
+        <p className="text-xs text-slate-300 mt-0.5">
+          {user.nama} ({user.id_karyawan}) • {user.role.toUpperCase()}
+        </p>
+        <div className="flex items-center gap-2 mt-3 flex-wrap">
+          <span
+            className={`text-xs font-semibold px-3 py-1 rounded-full ${
+              isOnline ? 'bg-emerald-600' : 'bg-amber-600'
+            }`}
+          >
             {isOnline ? 'ONLINE' : 'OFFLINE'} • ANTREAN: {queueCount}
           </span>
-          {queueCount > 0 && isOnline && (
-            <button onClick={syncOfflineQueue} className="bg-blue-600 px-3 py-1 rounded text-xs font-bold">
-              Sync
+          {installPrompt && (
+            <button
+              onClick={handleInstallPWA}
+              className="bg-indigo-600 text-xs font-semibold px-3 py-1 rounded-full"
+            >
+              + Install
             </button>
           )}
-          {user && (
-            <button onClick={handleLogout} className="bg-red-600 px-3 py-1 rounded text-xs">
-              Keluar
-            </button>
-          )}
+          <button
+            onClick={handleLogout}
+            className="bg-red-600 hover:bg-red-500 text-xs font-semibold px-3 py-1 rounded-full"
+          >
+            Keluar
+          </button>
         </div>
-      </header>
+      </div>
 
-      {!user ? (
-        <form onSubmit={handleLoginDenganPin} className="bg-white p-6 rounded-xl shadow space-y-4">
-          <h2 className="font-bold text-lg">Login Karyawan / Admin</h2>
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-            <input value={inpId} onChange={(e) => setInpId(e.target.value)} placeholder="ID (KRY-001 / ADM-001)" className="border p-2 rounded" />
-            <input type="password" value={inpPin} onChange={(e) => setInpPin(e.target.value)} placeholder="PIN" className="border p-2 rounded" />
-            <button type="submit" className="bg-blue-800 text-white font-bold py-2 px-4 rounded">Masuk Aplikasi</button>
+      {/* 1. Scan QR & GPS Realtime */}
+      <section className="bg-white rounded-2xl p-4 shadow space-y-3">
+        <h2 className="font-bold text-slate-800 text-sm">1. Scan QR &amp; GPS Realtime</h2>
+        <p className="text-xs text-slate-600">
+          Jadwal Masuk: <strong>{todaySchedule?.jam_berangkat || '07:00'}</strong>
+        </p>
+        <p className={`text-xs font-semibold ${gpsAman ? 'text-emerald-600' : 'text-red-600'}`}>
+          GPS:{' '}
+          {jarakMeter === null
+            ? 'Mencari sinyal lokasi GPS...'
+            : `Jarak ${jarakMeter}m (${gpsAman ? 'Aman' : 'Di Luar Radius'})`}
+        </p>
+
+        <div className="grid grid-cols-2 gap-2">
+          <button
+            type="button"
+            onClick={() => setJenisAbsen('MASUK')}
+            className={`py-2 rounded-xl text-xs font-bold border ${
+              jenisAbsen === 'MASUK'
+                ? 'bg-blue-700 text-white border-blue-700'
+                : 'bg-white text-slate-700 border-slate-300'
+            }`}
+          >
+            MASUK
+          </button>
+          <button
+            type="button"
+            onClick={() => setJenisAbsen('KELUAR')}
+            className={`py-2 rounded-xl text-xs font-bold border ${
+              jenisAbsen === 'KELUAR'
+                ? 'bg-blue-700 text-white border-blue-700'
+                : 'bg-white text-slate-700 border-slate-300'
+            }`}
+          >
+            KELUAR
+          </button>
+        </div>
+
+        {!scanning ? (
+          <button
+            type="button"
+            onClick={startCamera}
+            className="w-full bg-emerald-700 hover:bg-emerald-600 text-white font-semibold py-2.5 rounded-xl text-xs"
+          >
+            Buka Kamera Scan QR
+          </button>
+        ) : (
+          <div className="space-y-2">
+            <video
+              ref={videoRef}
+              playsInline
+              muted
+              className="w-full rounded-xl bg-black aspect-square object-cover"
+            />
+            <button
+              type="button"
+              onClick={stopCamera}
+              className="w-full bg-red-600 text-white font-semibold py-2 rounded-xl text-xs"
+            >
+              Tutup Kamera
+            </button>
           </div>
-        </form>
-      ) : (
+        )}
+
+        <div className="pt-1 border-t border-slate-100 flex gap-2">
+          <input
+            type="text"
+            placeholder="Input Kode QR manual jika kamera terkendala"
+            value={manualQr}
+            onChange={(e) => setManualQr(e.target.value)}
+            className="flex-1 border border-slate-300 rounded-xl px-3 py-2 text-xs"
+          />
+          <button
+            type="button"
+            onClick={() => {
+              if (!manualQr.trim()) return;
+              prosesAbsenQR(manualQr);
+              setManualQr('');
+            }}
+            className="bg-slate-800 text-white text-xs font-semibold px-3 py-2 rounded-xl"
+          >
+            Kirim
+          </button>
+        </div>
+      </section>
+
+      {/* 2. Input Jadwal */}
+      {user.role === 'admin' && (
+        <section className="bg-white rounded-2xl p-4 shadow space-y-2">
+          <h2 className="font-bold text-slate-800 text-sm">2. Input Jadwal (.XLSX / .CSV)</h2>
+          <input
+            type="file"
+            accept=".xlsx,.xls,.csv"
+            onChange={handleUploadJadwal}
+            className="w-full text-xs border border-slate-300 rounded-xl p-2"
+          />
+        </section>
+      )}
+
+      {/* 3. Laporan */}
+      <section className="bg-white rounded-2xl p-4 shadow space-y-3">
+        <div className="flex items-center justify-between">
+          <h2 className="font-bold text-slate-800 text-sm">3. Laporan:</h2>
+          <select
+            value={filterLaporan}
+            onChange={(e) => setFilterLaporan(e.target.value as 'Harian' | 'Mingguan' | 'Bulanan')}
+            className="border border-slate-300 rounded-lg px-2.5 py-1 text-xs"
+          >
+            <option value="Harian">Harian</option>
+            <option value="Mingguan">Mingguan</option>
+            <option value="Bulanan">Bulanan</option>
+          </select>
+        </div>
+
+        <div className="flex gap-2">
+          <button
+            onClick={exportXLSX}
+            className="bg-emerald-700 text-white text-xs font-semibold px-3 py-1.5 rounded-lg"
+          >
+            XLSX
+          </button>
+          <button
+            onClick={exportPDF}
+            className="bg-red-600 text-white text-xs font-semibold px-3 py-1.5 rounded-lg"
+          >
+            PDF
+          </button>
+          <button
+            onClick={exportCSV}
+            className="bg-slate-800 text-white text-xs font-semibold px-3 py-1.5 rounded-lg"
+          >
+            CSV
+          </button>
+        </div>
+
+        <div className="overflow-x-auto">
+          <table className="w-full text-left border-collapse text-[11px]">
+            <thead>
+              <tr className="bg-slate-900 text-white">
+                <th className="p-2">Tanggal</th>
+                <th className="p-2">Nama</th>
+                <th className="p-2">Jenis</th>
+                <th className="p-2">Scan</th>
+                <th className="p-2">Telat</th>
+                <th className="p-2">Status</th>
+                <th className="p-2">Mode</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filteredLogs.length === 0 ? (
+                <tr>
+                  <td colSpan={7} className="p-3 text-center text-slate-400">
+                    Belum ada data absensi.
+                  </td>
+                </tr>
+              ) : (
+                filteredLogs.map((l) => (
+                  <tr key={l.id_log} className="border-b border-slate-200">
+                    <td className="p-2">{l.tanggal}</td>
+                    <td className="p-2 font-medium">{l.nama}</td>
+                    <td className="p-2">{l.jenis}</td>
+                    <td className="p-2">{l.waktu_scan}</td>
+                    <td className="p-2">{l.telat_menit}m</td>
+                    <td className="p-2">{l.status}</td>
+                    <td className="p-2">{l.mode_rekam}</td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      {/* 4. Panel Admin: QR Kantor Utama & Data Karyawan */}
+      {user.role === 'admin' && (
         <>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <section className="bg-white p-5 rounded-xl shadow space-y-3">
-              <h2 className="font-bold text-base">1. Scan QR & GPS Realtime</h2>
-              <p className="text-sm">Jadwal Masuk: <strong>{jadwalHariIni}</strong></p>
-              <p className="text-sm">
-                GPS:{' '}
-                {gps ? (
-                  <span className={gps.jarak <= MAX_RADIUS ? 'text-emerald-700 font-semibold' : 'text-red-600 font-semibold'}>
-                    Jarak {gps.jarak}m ({gps.jarak <= MAX_RADIUS ? 'Aman' : 'Di Luar Radius'})
-                  </span>
-                ) : (
-                  'Mengunci GPS...'
-                )}
-              </p>
-              <div className="flex gap-2">
-                <button type="button" onClick={() => setJenisAbsen('MASUK')} className={`flex-1 py-2 rounded font-bold text-xs ${jenisAbsen === 'MASUK' ? 'bg-blue-800 text-white' : 'bg-slate-200'}`}>MASUK</button>
-                <button type="button" onClick={() => setJenisAbsen('KELUAR')} className={`flex-1 py-2 rounded font-bold text-xs ${jenisAbsen === 'KELUAR' ? 'bg-blue-800 text-white' : 'bg-slate-200'}`}>KELUAR</button>
-              </div>
-              <div id="qr-reader" className="w-full rounded overflow-hidden" />
-              {!scanning && <button onClick={mulaiScanQR} className="w-full bg-emerald-700 text-white font-bold py-2.5 rounded-lg">Buka Kamera Scan QR</button>}
-            </section>
-
-            <section className="bg-white p-5 rounded-xl shadow space-y-3">
-              <h2 className="font-bold text-base">2. Input Jadwal (.XLSX / .PDF)</h2>
-              <input type="file" accept=".xlsx,.xls,.pdf" onChange={handleFileJadwal} className="block w-full text-sm border p-2 rounded" />
-            </section>
-          </div>
-
-          <section className="bg-white p-5 rounded-xl shadow space-y-4">
-            <div className="flex flex-wrap justify-between items-center gap-2">
-              <div className="flex items-center gap-2">
-                <h2 className="font-bold text-base">3. Laporan:</h2>
-                <select value={filterLaporan} onChange={(e) => setFilterLaporan(e.target.value as 'harian' | 'mingguan' | 'bulanan')} className="border p-1.5 rounded text-sm">
-                  <option value="harian">Harian</option>
-                  <option value="mingguan">Mingguan</option>
-                  <option value="bulanan">Bulanan</option>
-                </select>
-              </div>
-              <div className="flex gap-2">
-                <button onClick={() => exportLaporan('xlsx')} className="bg-emerald-700 text-white px-3 py-1.5 rounded text-xs font-bold">XLSX</button>
-                <button onClick={() => exportLaporan('pdf')} className="bg-red-700 text-white px-3 py-1.5 rounded text-xs font-bold">PDF</button>
-                <button onClick={() => exportLaporan('csv')} className="bg-slate-800 text-white px-3 py-1.5 rounded text-xs font-bold">CSV</button>
-              </div>
+          <section className="bg-white rounded-2xl p-4 shadow space-y-3 border-t-4 border-emerald-600">
+            <h2 className="font-bold text-slate-800 text-sm">
+              4. QR Code Resmi Kantor Utama
+            </h2>
+            <p className="text-xs text-slate-600">
+              Cetak atau tampilkan QR Code ini di lokasi kantor. Sistem mengunci pemindaian agar
+              karyawan hanya bisa absen <strong>MASUK</strong> dan <strong>KELUAR</strong> memakai
+              QR resmi ini.
+            </p>
+            <div className="bg-slate-50 border border-slate-200 rounded-xl p-4 flex flex-col items-center">
+              <img
+                src={qrImageUrl}
+                alt={`QR ${OFFICIAL_QR_CODE}`}
+                className="w-48 h-48 rounded-lg border border-slate-300 bg-white p-2"
+              />
+              <span className="mt-2 font-mono font-bold text-sm text-slate-900">
+                {OFFICIAL_QR_CODE}
+              </span>
+              <span className="text-[11px] text-slate-500">
+                Radius GPS: Maks {MAX_RADIUS} meter
+              </span>
             </div>
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={handleDownloadQR}
+                className="bg-emerald-700 hover:bg-emerald-600 text-white font-semibold py-2 rounded-xl text-xs"
+              >
+                Download PNG
+              </button>
+              <button
+                type="button"
+                onClick={handlePrintQR}
+                className="bg-slate-800 hover:bg-slate-700 text-white font-semibold py-2 rounded-xl text-xs"
+              >
+                Cetak QR
+              </button>
+            </div>
+          </section>
+
+          <section className="bg-white rounded-2xl p-4 shadow space-y-3 border-t-4 border-blue-700">
+            <h2 className="font-bold text-slate-800 text-sm">5. Panel Admin: Data Karyawan</h2>
+            <form onSubmit={handleSaveKaryawan} className="space-y-2.5">
+              <input
+                type="text"
+                placeholder="ID (KRY-005)"
+                value={formId}
+                onChange={(e) => setFormId(e.target.value)}
+                className="w-full border border-slate-300 rounded-xl px-3 py-2 text-xs uppercase"
+              />
+              <input
+                type="text"
+                placeholder="Nama Lengkap"
+                value={formNama}
+                onChange={(e) => setFormNama(e.target.value)}
+                className="w-full border border-slate-300 rounded-xl px-3 py-2 text-xs"
+              />
+              <input
+                type="text"
+                placeholder="PIN (1234)"
+                value={formPin}
+                onChange={(e) => setFormPin(e.target.value)}
+                className="w-full border border-slate-300 rounded-xl px-3 py-2 text-xs"
+              />
+              <select
+                value={formRole}
+                onChange={(e) => setFormRole(e.target.value as 'karyawan' | 'admin')}
+                className="w-full border border-slate-300 rounded-xl px-3 py-2 text-xs"
+              >
+                <option value="karyawan">Karyawan</option>
+                <option value="admin">Admin</option>
+              </select>
+              <button
+                type="submit"
+                className="w-full bg-blue-700 hover:bg-blue-600 text-white font-semibold py-2.5 rounded-xl text-xs"
+              >
+                Simpan
+              </button>
+            </form>
+
             <div className="overflow-x-auto">
-              <table className="w-full text-xs text-left border">
-                <thead className="bg-slate-800 text-white">
-                  <tr><th className="p-2">Tanggal</th><th className="p-2">Nama</th><th className="p-2">Jenis</th><th className="p-2">Scan</th><th className="p-2">Telat</th><th className="p-2">Status</th><th className="p-2">Mode</th></tr>
+              <table className="w-full text-left border-collapse text-[11px]">
+                <thead>
+                  <tr className="bg-slate-900 text-white">
+                    <th className="p-2">ID</th>
+                    <th className="p-2">Nama</th>
+                    <th className="p-2">PIN</th>
+                    <th className="p-2">Role</th>
+                    <th className="p-2">Aksi</th>
+                  </tr>
                 </thead>
                 <tbody>
-                  {getFilteredLogs().map((row) => (
-                    <tr key={row.id_log} className="border-b">
-                      <td className="p-2">{row.tanggal}</td><td className="p-2">{row.nama}</td><td className="p-2">{row.jenis}</td>
-                      <td className="p-2">{row.waktu_scan}</td><td className="p-2">{row.telat_menit}m</td><td className="p-2">{row.status}</td><td className="p-2">{row.mode_rekam}</td>
+                  {karyawanList.map((k) => (
+                    <tr key={k.id_karyawan} className="border-b border-slate-200">
+                      <td className="p-2 font-semibold">{k.id_karyawan}</td>
+                      <td className="p-2">{k.nama}</td>
+                      <td className="p-2">{k.pin}</td>
+                      <td className="p-2 uppercase">{k.role}</td>
+                      <td className="p-2 flex gap-1">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setFormId(k.id_karyawan);
+                            setFormNama(k.nama);
+                            setFormPin(k.pin);
+                            setFormRole(k.role);
+                          }}
+                          className="bg-amber-500 text-white px-2 py-1 rounded text-[10px] font-semibold"
+                        >
+                          Edit
+                        </button>
+                        {k.id_karyawan !== 'ADM-001' && (
+                          <button
+                            type="button"
+                            onClick={() => handleDeleteKaryawan(k.id_karyawan)}
+                            className="bg-red-600 text-white px-2 py-1 rounded text-[10px] font-semibold"
+                          >
+                            Hapus
+                          </button>
+                        )}
+                      </td>
                     </tr>
                   ))}
                 </tbody>
               </table>
             </div>
           </section>
-
-          {userRole === 'admin' && (
-            <section className="bg-white p-6 rounded-xl shadow space-y-4 border-t-4 border-blue-800">
-              <h2 className="font-bold text-lg text-blue-900">4. Panel Admin: Data Karyawan</h2>
-              <form onSubmit={simpanKaryawanBaru} className="grid grid-cols-1 md:grid-cols-5 gap-2">
-                <input value={formKry.id_karyawan} onChange={(e) => setFormKry({ ...formKry, id_karyawan: e.target.value })} placeholder="ID (KRY-005)" className="border p-2 rounded text-sm" required />
-                <input value={formKry.nama} onChange={(e) => setFormKry({ ...formKry, nama: e.target.value })} placeholder="Nama Lengkap" className="border p-2 rounded text-sm" required />
-                <input value={formKry.pin} onChange={(e) => setFormKry({ ...formKry, pin: e.target.value })} placeholder="PIN" className="border p-2 rounded text-sm" required />
-                <select value={formKry.role} onChange={(e) => setFormKry({ ...formKry, role: e.target.value })} className="border p-2 rounded text-sm">
-                  <option value="karyawan">Karyawan</option>
-                  <option value="admin">Admin</option>
-                </select>
-                <button type="submit" className="bg-blue-800 text-white font-bold py-2 px-4 rounded text-sm">Simpan</button>
-              </form>
-              <div className="overflow-x-auto">
-                <table className="w-full text-xs text-left border">
-                  <thead className="bg-slate-800 text-white">
-                    <tr><th className="p-2">ID</th><th className="p-2">Nama</th><th className="p-2">PIN</th><th className="p-2">Role</th><th className="p-2">Aksi</th></tr>
-                  </thead>
-                  <tbody>
-                    {daftarKaryawan.map((k) => (
-                      <tr key={k.id_karyawan} className="border-b">
-                        <td className="p-2 font-mono font-bold">{k.id_karyawan}</td><td className="p-2">{k.nama}</td><td className="p-2">{k.pin}</td><td className="p-2 uppercase">{k.role}</td>
-                        <td className="p-2 flex gap-1">
-                          <button type="button" onClick={() => setFormKry({ id_karyawan: k.id_karyawan, nama: k.nama, pin: k.pin, role: k.role })} className="bg-amber-500 text-white px-2 py-1 rounded">Edit</button>
-                          {k.id_karyawan !== user.id && <button type="button" onClick={() => hapusKaryawan(k.id_karyawan)} className="bg-red-600 text-white px-2 py-1 rounded">Hapus</button>}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </section>
-          )}
         </>
       )}
     </main>
   );
 }
+
+    
+
+        
