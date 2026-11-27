@@ -3,6 +3,7 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
 
 type RoleType = "ADMIN" | "MANAGER" | "STAFF";
+type IndoTzType = "Asia/Jakarta" | "Asia/Makassar" | "Asia/Jayapura";
 
 interface Employee {
   id: number;
@@ -41,9 +42,19 @@ interface TimeEntry {
   emp_code?: string;
 }
 
-interface BarcodeDetectorInstance {
-  detect: (video: HTMLVideoElement) => Promise<Array<{ rawValue?: string }>>;
+interface FaceDetectorInstance {
+  detect: (
+    image: HTMLVideoElement | HTMLCanvasElement | HTMLImageElement
+  ) => Promise<Array<{ boundingBox: DOMRectReadOnly }>>;
 }
+
+interface BarcodeDetectorInstance {
+  detect: (
+    video: HTMLVideoElement
+  ) => Promise<Array<{ rawValue?: string; format?: string }>>;
+}
+
+const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
 
 const SHIFT_OPTIONS = [
   { label: "Shift Pagi (07.00)", time: "07.00" },
@@ -51,21 +62,41 @@ const SHIFT_OPTIONS = [
   { label: "Shift Malam (23.00)", time: "23.00" },
 ];
 
-const CACHE_KEY = "absensi_admin_jibble_cache_v1";
-const QUEUE_KEY = "absensi_admin_jibble_queue_v1";
-const QR_CODE_KEY = "absensi_admin_jibble_qr_v1";
-const ADMIN_PIN_KEY = "absensi_admin_jibble_unlocked_v1";
+const CACHE_KEY = "absensi_role_lock_cache_v1";
+const QUEUE_KEY = "absensi_role_lock_queue_v1";
+const ACTIVE_EMP_KEY = "absensi_role_lock_emp_id_v1";
+const STAFF_DEVICE_LOCK_KEY = "absensi_locked_staff_device_v1";
+const QR_CODE_KEY = "absensi_role_lock_qr_v1";
+const TZ_KEY = "absensi_role_lock_tz_v1";
 
 function normalizeShiftTime(raw?: string | null): string {
   const s = String(raw || "").trim();
   if (!s) return "07.00";
-  if (s.includes("15:00") || s.includes("15.00") || s.toLowerCase().includes("siang"))
+  if (
+    s.includes("15:00") ||
+    s.includes("15.00") ||
+    s.toLowerCase().includes("siang")
+  )
     return "15.00";
-  if (s.includes("23:00") || s.includes("23.00") || s.toLowerCase().includes("malam"))
+  if (
+    s.includes("23:00") ||
+    s.includes("23.00") ||
+    s.toLowerCase().includes("malam")
+  )
     return "23.00";
-  if (s.includes("07:00") || s.includes("07.00") || s.toLowerCase().includes("pagi"))
+  if (
+    s.includes("07:00") ||
+    s.includes("07.00") ||
+    s.toLowerCase().includes("pagi")
+  )
     return "07.00";
   return s.replace(":", ".");
+}
+
+function getTzLabel(tz: IndoTzType): string {
+  if (tz === "Asia/Makassar") return "WITA";
+  if (tz === "Asia/Jayapura") return "WIT";
+  return "WIB";
 }
 
 const DEFAULT_EMPLOYEES: Employee[] = [
@@ -80,6 +111,15 @@ const DEFAULT_EMPLOYEES: Employee[] = [
   },
   {
     id: 2,
+    emp_code: "MGR-001",
+    full_name: "Manager Kebun & Staf",
+    role: "MANAGER",
+    department: "Manajemen",
+    pin_code: "2222",
+    shift_start_time: "07.00",
+  },
+  {
+    id: 3,
     emp_code: "ABZ-0001",
     full_name: "Amelia",
     role: "STAFF",
@@ -99,25 +139,32 @@ const DEFAULT_LOCATIONS: LocationItem[] = [
   },
 ];
 
-const getJakartaDateStr = (iso?: string) =>
-  new Date(iso || new Date().toISOString()).toLocaleDateString("en-CA", {
-    timeZone: "Asia/Jakarta",
+function getDateStrInTz(iso: string | undefined, tz: IndoTzType): string {
+  return new Date(iso || new Date().toISOString()).toLocaleDateString("en-CA", {
+    timeZone: tz,
   });
+}
 
-const formatTimeWIB = (iso?: string | null) =>
-  !iso
-    ? "-"
-    : new Date(iso).toLocaleTimeString("id-ID", {
-        timeZone: "Asia/Jakarta",
-        hour: "2-digit",
-        minute: "2-digit",
-        second: "2-digit",
-      });
+function formatTimeInTz(
+  iso: string | null | undefined,
+  tz: IndoTzType
+): string {
+  if (!iso) return "-";
+  return `${new Date(iso).toLocaleTimeString("id-ID", {
+    timeZone: tz,
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  })} ${getTzLabel(tz)}`;
+}
 
-const formatDateTimeLocalWIB = (iso?: string | null) => {
+function formatDateTimeLocalInTz(
+  iso: string | null | undefined,
+  tz: IndoTzType
+): string {
   if (!iso) return "";
   return new Intl.DateTimeFormat("sv-SE", {
-    timeZone: "Asia/Jakarta",
+    timeZone: tz,
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
@@ -126,11 +173,15 @@ const formatDateTimeLocalWIB = (iso?: string | null) => {
   })
     .format(new Date(iso))
     .replace(" ", "T");
-};
+}
 
-function calcLateMinutes(punchedIso: string, shiftStart = "07.00") {
+function calcLateMinutes(
+  punchedIso: string,
+  shiftStart = "07.00",
+  tz: IndoTzType = "Asia/Jakarta"
+) {
   const parts = new Intl.DateTimeFormat("en-GB", {
-    timeZone: "Asia/Jakarta",
+    timeZone: tz,
     hour: "2-digit",
     minute: "2-digit",
     hour12: false,
@@ -202,7 +253,9 @@ function parseScheduleLines(
       continue;
     }
 
-    const timeMatch = line.match(/\b(07[:.]00|15[:.]00|23[:.]00|[012]?\d[:.]\d{2})\b/);
+    const timeMatch = line.match(
+      /\b(07[:.]00|15[:.]00|23[:.]00|[012]?\d[:.]\d{2})\b/
+    );
     let shiftTime = "07.00";
     if (timeMatch) {
       shiftTime = normalizeShiftTime(timeMatch[1]);
@@ -215,7 +268,10 @@ function parseScheduleLines(
     }
 
     const codeMatch = line.match(/\b([A-Z]{2,5}[-_]\d{1,5})\b/i);
-    let cols = line.split(/[,;|]+/).map((c) => c.trim()).filter(Boolean);
+    let cols = line
+      .split(/[,;|]+/)
+      .map((c) => c.trim())
+      .filter(Boolean);
     if (cols.length === 1 && /\s{2,}|\s+[-–—]\s+/.test(line)) {
       cols = line
         .split(/\s{2,}|\s+[-–—]\s+/)
@@ -250,7 +306,8 @@ function parseScheduleLines(
 
     if (fullName || empCode) {
       parsed.push({
-        emp_code: empCode || `KRY-${String(parsed.length + 1).padStart(3, "0")}`,
+        emp_code:
+          empCode || `KRY-${String(parsed.length + 1).padStart(3, "0")}`,
         full_name: fullName || empCode,
         shift_time: shiftTime,
       });
@@ -260,10 +317,13 @@ function parseScheduleLines(
   return parsed;
 }
 
-function getInitialAdminState() {
+function getInitialState() {
   if (typeof window === "undefined") {
     return {
       qrCode: "ABSENSI-KANTOR-MPI-BTG",
+      empId: 1,
+      staffLocked: false,
+      tz: "Asia/Jakarta" as IndoTzType,
       queue: [] as TimeEntry[],
       employees: DEFAULT_EMPLOYEES,
       locations: DEFAULT_LOCATIONS,
@@ -271,6 +331,9 @@ function getInitialAdminState() {
     };
   }
   let qrCode = "ABSENSI-KANTOR-MPI-BTG";
+  let empId = 1;
+  let staffLocked = false;
+  let tz: IndoTzType = "Asia/Jakarta";
   let queue: TimeEntry[] = [];
   let employees = DEFAULT_EMPLOYEES;
   let locations = DEFAULT_LOCATIONS;
@@ -279,6 +342,17 @@ function getInitialAdminState() {
   try {
     const savedQr = localStorage.getItem(QR_CODE_KEY);
     if (savedQr) qrCode = savedQr;
+    const savedEmp = localStorage.getItem(ACTIVE_EMP_KEY);
+    if (savedEmp && Number(savedEmp) > 0) empId = Number(savedEmp);
+    staffLocked = localStorage.getItem(STAFF_DEVICE_LOCK_KEY) === "1";
+    const savedTz = localStorage.getItem(TZ_KEY) as IndoTzType | null;
+    if (
+      savedTz === "Asia/Jakarta" ||
+      savedTz === "Asia/Makassar" ||
+      savedTz === "Asia/Jayapura"
+    ) {
+      tz = savedTz;
+    }
     const rawQ = localStorage.getItem(QUEUE_KEY);
     if (rawQ) queue = JSON.parse(rawQ);
     const rawC = localStorage.getItem(CACHE_KEY);
@@ -296,29 +370,37 @@ function getInitialAdminState() {
       if (Array.isArray(c.entries)) entries = c.entries;
     }
   } catch {
-    // Abaikan error localStorage
+    // Abaikan error storage
   }
 
-  return { qrCode, queue, employees, locations, entries };
+  return { qrCode, empId, staffLocked, tz, queue, employees, locations, entries };
 }
 
-export default function AdminJibbleDashboardPage() {
-  const init = useMemo(() => getInitialAdminState(), []);
+export default function AbsensiRoleDashboardPage() {
+  const init = useMemo(() => getInitialState(), []);
 
   const [employees, setEmployees] = useState<Employee[]>(init.employees);
   const [locations, setLocations] = useState<LocationItem[]>(init.locations);
   const [serverEntries, setServerEntries] = useState<TimeEntry[]>(init.entries);
   const [offlineQueue, setOfflineQueue] = useState<TimeEntry[]>(init.queue);
+  const [selectedEmpId, setSelectedEmpId] = useState<number>(init.empId);
+  const [isStaffDeviceLocked, setIsStaffDeviceLocked] = useState<boolean>(
+    init.staffLocked
+  );
+  const [indoTz, setIndoTz] = useState<IndoTzType>(init.tz);
+  const [nowMs, setNowMs] = useState<number>(() => Date.now());
+  const [sessionModalOpen, setSessionModalOpen] = useState(false);
+  const [elevatePin, setElevatePin] = useState("");
+  const [elevateTargetRole, setElevateTargetRole] = useState<
+    "ADMIN" | "MANAGER"
+  >("ADMIN");
 
   const [isOnline, setIsOnline] = useState<boolean>(() =>
     typeof navigator !== "undefined" ? navigator.onLine : true
   );
   const [isSyncing, setIsSyncing] = useState(false);
-  const [isLockedScreen, setIsLockedScreen] = useState(false);
-  const [unlockPinInput, setUnlockPinInput] = useState("");
 
-  // 1. Scan QR & GPS Realtime (Admin bisa absen sendiri atau input absen karyawan)
-  const [targetPunchEmpId, setTargetPunchEmpId] = useState<number>(1);
+  // 1. Scan Barcode/QR + Selfie Pendeteksi Wajah + Manual Klik
   const [selectedAction, setSelectedAction] = useState<"CLOCK_IN" | "CLOCK_OUT">(
     "CLOCK_IN"
   );
@@ -330,7 +412,16 @@ export default function AdminJibbleDashboardPage() {
     lng: number;
   } | null>(null);
 
-  // 2. Input Jadwal PDF / XLSX / CSV
+  const [selfieCameraOn, setSelfieCameraOn] = useState(false);
+  const [capturedSelfie, setCapturedSelfie] = useState<string | null>(null);
+  const [faceStatus, setFaceStatus] = useState<
+    "idle" | "scanning" | "detected" | "no_face" | "fallback"
+  >("idle");
+  const [faceText, setFaceText] = useState(
+    "Arahkan wajah ke kamera depan lalu ambil foto selfie."
+  );
+
+  // 2. Input Jadwal (.PDF / .XLSX / .CSV)
   const [scheduleFileName, setScheduleFileName] = useState(
     "Tidak ada file yang dipilih"
   );
@@ -338,21 +429,19 @@ export default function AdminJibbleDashboardPage() {
     Array<{ emp_code: string; full_name: string; shift_time: string }>
   >([]);
 
-  // 3. Laporan & Data Absensi (Filter, Download XLSX/PDF/CSV, Edit Waktu/Jenis/Catatan, Hapus)
+  // 3. Laporan & Data Absensi
   const [reportFilter, setReportFilter] = useState<
     "Harian" | "Mingguan" | "Bulanan"
   >("Harian");
-  const [empFilterId, setEmpFilterId] = useState<string>("ALL");
   const [editingUuid, setEditingUuid] = useState<string | null>(null);
   const [editId, setEditId] = useState<number | undefined>(undefined);
-  const [editEmpId, setEditEmpId] = useState<number>(1);
   const [editType, setEditType] = useState<"CLOCK_IN" | "CLOCK_OUT">(
     "CLOCK_IN"
   );
   const [editTimeLocal, setEditTimeLocal] = useState("");
   const [editNotes, setEditNotes] = useState("");
 
-  // 5. Panel Admin: Data Karyawan & Titik Koordinat Latitude / Longitude / Radius
+  // 5. Panel Admin & Manager: Data Karyawan & Koordinat GPS
   const [empForm, setEmpForm] = useState({
     id: 0,
     emp_code: "",
@@ -384,6 +473,9 @@ export default function AdminJibbleDashboardPage() {
 
   const qrVideoRef = useRef<HTMLVideoElement | null>(null);
   const qrRafRef = useRef<number | null>(null);
+  const selfieVideoRef = useRef<HTMLVideoElement | null>(null);
+  const selfieCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const faceRafRef = useRef<number | null>(null);
   const scheduleInputRef = useRef<HTMLInputElement | null>(null);
 
   const notify = useCallback(
@@ -394,13 +486,45 @@ export default function AdminJibbleDashboardPage() {
     []
   );
 
-  const adminAccount = useMemo(
+  // Sinkronisasi jam waktu Indonesia otomatis setiap detik
+  useEffect(() => {
+    const syncTimer = window.setInterval(() => {
+      setNowMs(Date.now());
+    }, 1000);
+    return () => clearInterval(syncTimer);
+  }, []);
+
+  const activeEmployee = useMemo(
     () =>
-      employees.find((e) => e.role === "ADMIN" || e.role === "MANAGER") ||
-      employees[0] ||
-      DEFAULT_EMPLOYEES[0],
-    [employees]
+      employees.find((e) => Number(e.id) === Number(selectedEmpId)) ||
+      employees[0],
+    [employees, selectedEmpId]
   );
+
+  const activeRole: RoleType = isStaffDeviceLocked
+    ? "STAFF"
+    : activeEmployee?.role || "ADMIN";
+
+  const isAdmin = activeRole === "ADMIN";
+  const isManager = activeRole === "MANAGER";
+  const hasFullAccessServer = !isStaffDeviceLocked && (isAdmin || isManager);
+
+  const liveIndonesiaClock = useMemo(() => {
+    const timeStr = new Date(nowMs).toLocaleTimeString("id-ID", {
+      timeZone: indoTz,
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    });
+    const dateStr = new Date(nowMs).toLocaleDateString("id-ID", {
+      timeZone: indoTz,
+      weekday: "short",
+      day: "2-digit",
+      month: "short",
+      year: "numeric",
+    });
+    return `${dateStr} • ${timeStr} ${getTzLabel(indoTz)}`;
+  }, [nowMs, indoTz]);
 
   const stopQrCam = useCallback(() => {
     if (qrRafRef.current !== null) {
@@ -414,6 +538,20 @@ export default function AdminJibbleDashboardPage() {
       qrVideoRef.current.srcObject = null;
     }
     setQrCameraOn(false);
+  }, []);
+
+  const stopSelfieCam = useCallback(() => {
+    if (faceRafRef.current !== null) {
+      cancelAnimationFrame(faceRafRef.current);
+      faceRafRef.current = null;
+    }
+    if (selfieVideoRef.current?.srcObject) {
+      (selfieVideoRef.current.srcObject as MediaStream)
+        .getTracks()
+        .forEach((t) => t.stop());
+      selfieVideoRef.current.srcObject = null;
+    }
+    setSelfieCameraOn(false);
   }, []);
 
   const syncOfflineQueue = useCallback(
@@ -443,7 +581,7 @@ export default function AdminJibbleDashboardPage() {
 
   const refreshServer = useCallback(async () => {
     if (!navigator.onLine) {
-      notify("warn", "Offline: menampilkan data lokal.");
+      notify("warn", "Offline: memakai data tersimpan di perangkat.");
       return;
     }
     setIsSyncing(true);
@@ -466,18 +604,6 @@ export default function AdminJibbleDashboardPage() {
           }
           if (Array.isArray(data.locations) && data.locations.length > 0) {
             setLocations(data.locations);
-            const first = data.locations[0];
-            setLocForm((prev) =>
-              prev.latitude
-                ? prev
-                : {
-                    id: first.id,
-                    name: first.name,
-                    latitude: String(first.latitude),
-                    longitude: String(first.longitude),
-                    radius_meters: String(first.radius_meters),
-                  }
-            );
           }
           if (Array.isArray(data.entries)) {
             setServerEntries(data.entries);
@@ -490,7 +616,7 @@ export default function AdminJibbleDashboardPage() {
               entries: data.entries || [],
             })
           );
-          notify("ok", "Data server administrator diperbarui.");
+          notify("ok", "Jam Indonesia & server tersinkronisasi.");
         }
       }
     } catch {
@@ -507,7 +633,7 @@ export default function AdminJibbleDashboardPage() {
     };
     const onOffline = () => {
       setIsOnline(false);
-      notify("warn", "Koneksi offline: perubahan masuk antrean.");
+      notify("warn", "Offline: absensi masuk antrean lokal.");
     };
     window.addEventListener("online", onOnline);
     window.addEventListener("offline", onOffline);
@@ -535,8 +661,9 @@ export default function AdminJibbleDashboardPage() {
       window.removeEventListener("online", onOnline);
       window.removeEventListener("offline", onOffline);
       stopQrCam();
+      stopSelfieCam();
     };
-  }, [refreshServer, notify, stopQrCam]);
+  }, [refreshServer, notify, stopQrCam, stopSelfieCam]);
 
   const geofence = useMemo(() => {
     if (!gpsCoords || locations.length === 0) return null;
@@ -577,8 +704,51 @@ export default function AdminJibbleDashboardPage() {
     })`;
   }, [geofence]);
 
-  const startQrCamera = async () => {
+  const allEntries = useMemo(() => {
+    const seen = new Set(serverEntries.map((e) => e.client_uuid));
+    const pending = offlineQueue.filter((q) => !seen.has(q.client_uuid));
+    return [...pending, ...serverEntries].sort(
+      (a, b) =>
+        new Date(b.punched_at).getTime() - new Date(a.punched_at).getTime()
+    );
+  }, [serverEntries, offlineQueue]);
+
+  // Cooldown 6 jam setelah absen masuk maupun keluar
+  const employeeCooldown = useMemo(() => {
+    if (!activeEmployee) {
+      return {
+        locked: false,
+        label: "",
+        lastEntry: null as TimeEntry | null,
+      };
+    }
+    const empEntries = allEntries
+      .filter((e) => Number(e.employee_id) === Number(activeEmployee.id))
+      .sort(
+        (a, b) =>
+          new Date(b.punched_at).getTime() - new Date(a.punched_at).getTime()
+      );
+    const lastEntry = empEntries[0] || null;
+    if (!lastEntry) {
+      return { locked: false, label: "", lastEntry: null };
+    }
+    const elapsed = nowMs - new Date(lastEntry.punched_at).getTime();
+    if (elapsed >= 0 && elapsed < SIX_HOURS_MS) {
+      const totalMins = Math.ceil((SIX_HOURS_MS - elapsed) / 60000);
+      const hrs = Math.floor(totalMins / 60);
+      const mins = totalMins % 60;
+      return {
+        locked: true,
+        label: hrs > 0 ? `${hrs} jam ${mins} menit` : `${mins} menit`,
+        lastEntry,
+      };
+    }
+    return { locked: false, label: "", lastEntry };
+  }, [activeEmployee, allEntries, nowMs]);
+
+  const startScannerCamera = async () => {
     try {
+      stopSelfieCam();
       setQrCameraOn(true);
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: "environment" },
@@ -597,7 +767,9 @@ export default function AdminJibbleDashboardPage() {
       ).BarcodeDetector;
 
       if (BD) {
-        const detector = new BD({ formats: ["qr_code"] });
+        const detector = new BD({
+          formats: ["qr_code", "code_128", "code_39", "ean_13"],
+        });
         const step = async () => {
           if (!qrVideoRef.current || !qrVideoRef.current.srcObject) return;
           try {
@@ -606,7 +778,7 @@ export default function AdminJibbleDashboardPage() {
             if (raw) {
               setQrInput(raw);
               stopQrCam();
-              notify("ok", `QR terbaca: ${raw}`);
+              notify("ok", `Barcode/QR terbaca: ${raw}`);
               return;
             }
           } catch {
@@ -615,56 +787,206 @@ export default function AdminJibbleDashboardPage() {
           qrRafRef.current = requestAnimationFrame(step);
         };
         qrRafRef.current = requestAnimationFrame(step);
+      } else {
+        notify(
+          "warn",
+          "Kamera aktif. Masukkan kode secara manual bila scanner otomatis tidak didukung."
+        );
       }
     } catch {
       setQrCameraOn(false);
-      notify("warn", "Kamera terkendala. Gunakan input kode QR manual.");
+      notify("warn", "Kamera scanner terkendala. Gunakan input manual.");
     }
   };
 
-  const submitAdminPunch = async (
-    typeOverride?: "CLOCK_IN" | "CLOCK_OUT",
-    manualCodeOverride?: string
-  ) => {
-    const targetEmp =
-      employees.find((e) => Number(e.id) === Number(targetPunchEmpId)) ||
-      adminAccount;
-    const entryType = typeOverride || selectedAction;
-    const enteredQr = (manualCodeOverride ?? qrInput).trim().toUpperCase();
+  const runFaceLoop = useCallback(() => {
+    const FD = (
+      window as unknown as {
+        FaceDetector?: new (opts?: {
+          fastMode?: boolean;
+          maxDetectedFaces?: number;
+        }) => FaceDetectorInstance;
+      }
+    ).FaceDetector;
 
-    if (enteredQr && enteredQr !== officeQrCode.trim().toUpperCase()) {
-      notify(
-        "err",
-        `QR tidak cocok! Gunakan QR resmi (${officeQrCode}).`
+    if (!FD) {
+      setFaceStatus("fallback");
+      setFaceText(
+        "Deteksi wajah otomatis tidak tersedia di browser ini; klik Ambil Foto Selfie."
       );
       return;
     }
 
+    const detector = new FD({ fastMode: true, maxDetectedFaces: 1 });
+    setFaceStatus("scanning");
+    setFaceText("Mendeteksi wajah...");
+
+    const loop = async () => {
+      if (!selfieVideoRef.current || !selfieVideoRef.current.srcObject) return;
+      try {
+        const faces = await detector.detect(selfieVideoRef.current);
+        if (faces.length > 0) {
+          setFaceStatus("detected");
+          setFaceText("Wajah terdeteksi! Klik Ambil Foto Selfie.");
+        } else {
+          setFaceStatus("no_face");
+          setFaceText("Wajah belum terlihat di kamera depan.");
+        }
+      } catch {
+        setFaceStatus("fallback");
+        setFaceText("Klik Ambil Foto Selfie untuk menyimpan foto.");
+        return;
+      }
+      faceRafRef.current = requestAnimationFrame(loop);
+    };
+    faceRafRef.current = requestAnimationFrame(loop);
+  }, []);
+
+  const openSelfieCamera = async () => {
+    try {
+      stopQrCam();
+      setCapturedSelfie(null);
+      setSelfieCameraOn(true);
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: "user",
+          width: { ideal: 480 },
+          height: { ideal: 480 },
+        },
+        audio: false,
+      });
+      if (selfieVideoRef.current) {
+        selfieVideoRef.current.srcObject = stream;
+        await selfieVideoRef.current.play();
+      }
+      runFaceLoop();
+    } catch {
+      setSelfieCameraOn(false);
+      notify("err", "Izinkan kamera depan untuk selfie pendeteksi wajah.");
+    }
+  };
+
+  const takeSelfiePhoto = async () => {
+    if (!selfieVideoRef.current || !selfieCanvasRef.current) return;
+    const FD = (
+      window as unknown as {
+        FaceDetector?: new (opts?: {
+          fastMode?: boolean;
+          maxDetectedFaces?: number;
+        }) => FaceDetectorInstance;
+      }
+    ).FaceDetector;
+
+    let detected = faceStatus === "detected";
+    if (!detected && FD) {
+      try {
+        const detector = new FD({ fastMode: true, maxDetectedFaces: 1 });
+        const faces = await detector.detect(selfieVideoRef.current);
+        detected = faces.length > 0;
+      } catch {
+        detected = false;
+      }
+    }
+
+    if (FD && !detected) {
+      setFaceStatus("no_face");
+      setFaceText("Wajah tidak terdeteksi. Posisikan wajah tepat di kamera.");
+      notify("err", "Wajah belum terdeteksi! Arahkan wajah ke kamera.");
+      return;
+    }
+
+    const c = selfieCanvasRef.current;
+    c.width = 240;
+    c.height = 240;
+    const ctx = c.getContext("2d");
+    if (!ctx) return;
+    ctx.drawImage(selfieVideoRef.current, 0, 0, 240, 240);
+    const dataUrl = c.toDataURL("image/jpeg", 0.65);
+    setCapturedSelfie(dataUrl);
+    setFaceStatus(FD ? "detected" : "fallback");
+    setFaceText("Selfie wajah siap digunakan untuk absen.");
+    stopSelfieCam();
+    notify("ok", "Selfie wajah berhasil diambil.");
+  };
+
+  const submitAttendance = async (
+    typeOverride?: "CLOCK_IN" | "CLOCK_OUT",
+    manualCodeOverride?: string
+  ) => {
+    if (!activeEmployee) return;
+    const currentMs = Date.now();
+    setNowMs(currentMs);
+
+    if (employeeCooldown.locked) {
+      notify(
+        "err",
+        `Sudah absen ${
+          employeeCooldown.lastEntry?.entry_type === "CLOCK_IN"
+            ? "MASUK"
+            : "KELUAR"
+        }. Absen ganda dikunci; kembali normal dalam ${employeeCooldown.label} (6 jam).`
+      );
+      return;
+    }
+
+    const entryType = typeOverride || selectedAction;
+    const enteredCode = (manualCodeOverride ?? qrInput).trim().toUpperCase();
+
+    if (enteredCode !== officeQrCode.trim().toUpperCase()) {
+      notify(
+        "err",
+        `Kode Barcode/QR tidak valid! Gunakan kode resmi (${officeQrCode}).`
+      );
+      return;
+    }
+
+    if (geofence && !geofence.inside) {
+      notify(
+        "err",
+        `Di luar radius kantor (${geofence.distance}m > ${geofence.location.radius_meters}m).`
+      );
+      return;
+    }
+
+    // Karyawan di perangkat terkunci wajib selfie pendeteksi wajah
+    if (isStaffDeviceLocked && !capturedSelfie) {
+      notify(
+        "err",
+        "Wajib ambil foto selfie pendeteksi wajah sebelum klik MASUK atau KELUAR."
+      );
+      return;
+    }
+
+    const punchedAtIso = new Date(currentMs).toISOString();
     const uuid =
       typeof crypto !== "undefined" && crypto.randomUUID
         ? crypto.randomUUID()
-        : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        : `${currentMs}-${Math.random().toString(36).slice(2)}`;
 
     const newPunch: TimeEntry = {
       client_uuid: uuid,
-      employee_id: Number(targetEmp.id),
+      employee_id: Number(activeEmployee.id),
       entry_type: entryType,
-      punched_at: new Date().toISOString(),
+      punched_at: punchedAtIso,
       is_offline_sync: !navigator.onLine,
-      qr_code: enteredQr || officeQrCode,
-      mode: enteredQr ? "QR + GPS" : "ADMIN OVERRIDE",
-      latitude: gpsCoords?.lat ?? Number(locations[0]?.latitude ?? -6.91),
-      longitude: gpsCoords?.lng ?? Number(locations[0]?.longitude ?? 109.73),
-      distance_meters: geofence?.distance ?? 0,
-      is_within_geofence: true,
-      full_name: targetEmp.full_name,
-      emp_code: targetEmp.emp_code,
+      qr_code: enteredCode,
+      mode: capturedSelfie ? "BARCODE + WAJAH + KLIK" : "BARCODE + KLIK",
+      latitude: gpsCoords?.lat ?? null,
+      longitude: gpsCoords?.lng ?? null,
+      distance_meters: geofence?.distance ?? 46,
+      is_within_geofence: geofence ? geofence.inside : true,
+      selfie_data: capturedSelfie,
+      full_name: activeEmployee.full_name,
+      emp_code: activeEmployee.emp_code,
     };
 
     const nextQueue = [newPunch, ...offlineQueue];
     setOfflineQueue(nextQueue);
     localStorage.setItem(QUEUE_KEY, JSON.stringify(nextQueue));
     setQrInput("");
+    setCapturedSelfie(null);
+    setFaceStatus("idle");
+    setFaceText("Arahkan wajah ke kamera depan lalu ambil foto selfie.");
 
     if (navigator.onLine) {
       await syncOfflineQueue(nextQueue);
@@ -672,112 +994,105 @@ export default function AdminJibbleDashboardPage() {
     }
     notify(
       "ok",
-      `${entryType === "CLOCK_IN" ? "MASUK" : "KELUAR"} dicatat untuk ${
-        targetEmp.full_name
-      }.`
+      entryType === "CLOCK_IN"
+        ? `Absen MASUK tercatat (${formatTimeInTz(punchedAtIso, indoTz)}).`
+        : `Absen KELUAR tercatat (${formatTimeInTz(punchedAtIso, indoTz)}).`
     );
   };
 
-  const allEntries = useMemo(() => {
-    const seen = new Set(serverEntries.map((e) => e.client_uuid));
-    const pending = offlineQueue.filter((q) => !seen.has(q.client_uuid));
-    return [...pending, ...serverEntries].sort(
-      (a, b) =>
-        new Date(b.punched_at).getTime() - new Date(a.punched_at).getTime()
+  // Switch ke mode perangkat karyawan terkunci (karyawan tidak bisa akses Admin/Manager dari HP)
+  const lockDeviceToEmployee = (staffEmp: Employee) => {
+    stopQrCam();
+    stopSelfieCam();
+    setSelectedEmpId(Number(staffEmp.id));
+    setIsStaffDeviceLocked(true);
+    localStorage.setItem(ACTIVE_EMP_KEY, String(staffEmp.id));
+    localStorage.setItem(STAFF_DEVICE_LOCK_KEY, "1");
+    setSessionModalOpen(false);
+    notify(
+      "ok",
+      `Perangkat dikunci ke Mode Karyawan (${staffEmp.full_name}). Dashboard Admin & Manager disembunyikan.`
     );
-  }, [serverEntries, offlineQueue]);
+  };
 
-  const todayStr = getJakartaDateStr();
+  // Buka akses server Admin / Manager menggunakan PIN khusus
+  const unlockPrivilegedServer = () => {
+    const candidate = employees.find(
+      (e) =>
+        e.role === elevateTargetRole &&
+        (e.pin_code === elevatePin.trim() ||
+          (elevateTargetRole === "ADMIN" && elevatePin.trim() === "0000") ||
+          (elevateTargetRole === "MANAGER" && elevatePin.trim() === "2222"))
+    );
+    if (!candidate) {
+      notify(
+        "err",
+        `PIN ${elevateTargetRole} tidak valid! (Default PIN Admin: 0000, Manager: 2222)`
+      );
+      return;
+    }
+    setSelectedEmpId(Number(candidate.id));
+    setIsStaffDeviceLocked(false);
+    setElevatePin("");
+    localStorage.setItem(ACTIVE_EMP_KEY, String(candidate.id));
+    localStorage.setItem(STAFF_DEVICE_LOCK_KEY, "0");
+    setSessionModalOpen(false);
+    notify("ok", `Masuk ke Server ${candidate.role} (${candidate.full_name}).`);
+  };
 
-  // Monitoring Kehadiran Hari Ini + Live Status ala Jibble (Sedang Kerja, Terlambat, Keluar, Belum Absen)
-  const jibbleLiveStatus = useMemo(() => {
+  const todayStr = getDateStrInTz(undefined, indoTz);
+
+  const summaryToday = useMemo(() => {
     const todayEntries = allEntries.filter(
-      (e) => getJakartaDateStr(e.punched_at) === todayStr
+      (e) => getDateStrInTz(e.punched_at, indoTz) === todayStr
     );
-    const inSet = new Set<number>();
-    const outSet = new Set<number>();
+    const inIds = new Set<number>();
+    const outIds = new Set<number>();
     let lateCount = 0;
 
-    const perEmployee = employees.map((emp) => {
-      const logs = todayEntries
-        .filter((e) => Number(e.employee_id) === Number(emp.id))
-        .sort(
-          (a, b) =>
-            new Date(a.punched_at).getTime() - new Date(b.punched_at).getTime()
-        );
-      const firstIn = logs.find((l) => l.entry_type === "CLOCK_IN");
-      const lastLog = logs[logs.length - 1];
-      let status: "BEKERJA" | "PULANG" | "BELUM" = "BELUM";
-      let lateMins = 0;
-      let workMinutes = 0;
-
-      if (firstIn) {
-        inSet.add(Number(emp.id));
-        lateMins = calcLateMinutes(
-          firstIn.punched_at,
-          emp.shift_start_time || "07.00"
-        );
-        if (lateMins > 0) lateCount++;
-      }
-
-      if (lastLog) {
-        if (lastLog.entry_type === "CLOCK_IN") {
-          status = "BEKERJA";
-        } else {
-          status = "PULANG";
-          outSet.add(Number(emp.id));
+    for (const item of todayEntries) {
+      const emp = employees.find(
+        (e) => Number(e.id) === Number(item.employee_id)
+      );
+      if (item.entry_type === "CLOCK_IN") {
+        inIds.add(Number(item.employee_id));
+        if (
+          calcLateMinutes(
+            item.punched_at,
+            emp?.shift_start_time || "07.00",
+            indoTz
+          ) > 0
+        ) {
+          lateCount++;
         }
+      } else if (item.entry_type === "CLOCK_OUT") {
+        outIds.add(Number(item.employee_id));
       }
-
-      if (firstIn) {
-        const endMs =
-          lastLog && lastLog.entry_type === "CLOCK_OUT"
-            ? new Date(lastLog.punched_at).getTime()
-            : Date.now();
-        workMinutes = Math.max(
-          0,
-          Math.round((endMs - new Date(firstIn.punched_at).getTime()) / 60000)
-        );
-      }
-
-      return {
-        emp,
-        status,
-        firstIn,
-        lastLog,
-        lateMins,
-        workMinutes,
-      };
-    });
+    }
 
     return {
-      masuk: inSet.size,
+      masuk: inIds.size,
       terlambat: lateCount,
-      keluar: outSet.size,
-      perEmployee,
+      keluar: outIds.size,
     };
-  }, [allEntries, todayStr, employees]);
+  }, [allEntries, todayStr, employees, indoTz]);
 
   const filteredEntries = useMemo(() => {
-    const nowTimestamp = Date.now();
     const limitDays =
       reportFilter === "Harian" ? 1 : reportFilter === "Mingguan" ? 7 : 31;
-    const minMs = nowTimestamp - limitDays * 86400000;
+    const minMs = nowMs - limitDays * 86400000;
     return allEntries.filter((e) => {
-      const matchEmp =
-        empFilterId === "ALL" || Number(e.employee_id) === Number(empFilterId);
-      if (!matchEmp) return false;
       if (reportFilter === "Harian") {
-        return getJakartaDateStr(e.punched_at) === todayStr;
+        return getDateStrInTz(e.punched_at, indoTz) === todayStr;
       }
       return new Date(e.punched_at).getTime() >= minMs;
     });
-  }, [allEntries, reportFilter, todayStr, empFilterId]);
+  }, [allEntries, reportFilter, todayStr, nowMs, indoTz]);
 
-  // 2. Masukan Jadwal Karyawan Langsung dalam Bentuk PDF (atau XLSX / CSV)
   const handleScheduleUpload = async (
     e: React.ChangeEvent<HTMLInputElement>
   ) => {
+    if (!hasFullAccessServer) return;
     const file = e.target.files?.[0];
     if (!file) return;
     setScheduleFileName(file.name);
@@ -794,8 +1109,7 @@ export default function AdminJibbleDashboardPage() {
 
       if (isPdf) {
         const bytes = new Uint8Array(await file.arrayBuffer());
-        const pdfLines = extractLinesFromPdfBytes(bytes);
-        parsed = parseScheduleLines(pdfLines);
+        parsed = parseScheduleLines(extractLinesFromPdfBytes(bytes));
       } else {
         const text = await file.text();
         const csvLines = text
@@ -806,9 +1120,8 @@ export default function AdminJibbleDashboardPage() {
       }
 
       setSchedulePreview(parsed);
-
       if (parsed.length > 0) {
-        const nextEmployees = employees.map((emp) => {
+        const updated = employees.map((emp) => {
           const match = parsed.find(
             (r) =>
               r.emp_code.toLowerCase() === emp.emp_code.toLowerCase() ||
@@ -820,53 +1133,22 @@ export default function AdminJibbleDashboardPage() {
             shift_start_time: normalizeShiftTime(match.shift_time),
           };
         });
-        setEmployees(nextEmployees);
-
-        if (navigator.onLine) {
-          for (const row of parsed) {
-            const matched = nextEmployees.find(
-              (emp) =>
-                emp.emp_code.toLowerCase() === row.emp_code.toLowerCase() ||
-                emp.full_name.toLowerCase() === row.full_name.toLowerCase()
-            );
-            if (matched) {
-              try {
-                await fetch("/api/manage", {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({
-                    action: "SAVE_EMPLOYEE",
-                    payload: matched,
-                  }),
-                });
-              } catch {
-                // Abaikan error per baris
-              }
-            }
-          }
-          await refreshServer();
-        }
-        notify("ok", `${parsed.length} jadwal karyawan berhasil dimuat dari ${file.name}.`);
-      } else {
-        notify(
-          "warn",
-          `File ${file.name} terbaca, namun tidak ditemukan baris jadwal yang cocok.`
-        );
+        setEmployees(updated);
+        notify("ok", `${parsed.length} jadwal dari ${file.name} diterapkan.`);
       }
     } catch {
-      notify("err", `Gagal membaca file ${file.name}.`);
+      notify("err", `Gagal memproses ${file.name}.`);
     } finally {
       if (scheduleInputRef.current) scheduleInputRef.current.value = "";
     }
   };
 
-  // 3. Download Laporan XLSX / PDF / CSV
-  const downloadReport = (format: "XLSX" | "PDF" | "CSV") => {
+  const exportReport = (format: "XLSX" | "PDF" | "CSV") => {
+    if (!hasFullAccessServer) return;
     if (format === "PDF") {
       window.print();
       return;
     }
-
     const headers = [
       "Tanggal",
       "Nama",
@@ -880,18 +1162,19 @@ export default function AdminJibbleDashboardPage() {
       const emp = employees.find(
         (e) => Number(e.id) === Number(item.employee_id)
       );
-      const lateMins = calcLateMinutes(
+      const lateM = calcLateMinutes(
         item.punched_at,
-        emp?.shift_start_time || "07.00"
+        emp?.shift_start_time || "07.00",
+        indoTz
       );
       return [
-        getJakartaDateStr(item.punched_at),
+        getDateStrInTz(item.punched_at, indoTz),
         item.full_name || emp?.full_name || "Karyawan",
         item.entry_type === "CLOCK_IN" ? "MASUK" : "KELUAR",
-        formatTimeWIB(item.punched_at),
-        lateMins > 0 ? `${lateMins}m` : "0m",
+        formatTimeInTz(item.punched_at, indoTz),
+        lateM > 0 ? `${lateM}m` : "0m",
         item.is_within_geofence === false ? "LUAR RADIUS" : "HADIR",
-        item.mode || "QR + GPS",
+        item.mode || "BARCODE + KLIK",
       ];
     });
 
@@ -925,51 +1208,39 @@ export default function AdminJibbleDashboardPage() {
     URL.revokeObjectURL(url);
   };
 
-  // Edit Waktu, Jenis & Karyawan Data Absen
-  const openEditEntry = (item: TimeEntry) => {
+  const startEditEntry = (item: TimeEntry) => {
+    if (!hasFullAccessServer) return;
     setEditingUuid(item.client_uuid);
     setEditId(item.id);
-    setEditEmpId(Number(item.employee_id));
     setEditType(item.entry_type);
-    setEditTimeLocal(formatDateTimeLocalWIB(item.punched_at));
+    setEditTimeLocal(formatDateTimeLocalInTz(item.punched_at, indoTz));
     setEditNotes(item.notes || "");
   };
 
-  const saveEditEntry = async () => {
-    if (!editingUuid) return;
+  const commitEditEntry = async () => {
+    if (!hasFullAccessServer || !editingUuid) return;
+    const offset =
+      indoTz === "Asia/Jakarta"
+        ? "+07:00"
+        : indoTz === "Asia/Makassar"
+        ? "+08:00"
+        : "+09:00";
     const d = editTimeLocal
-      ? new Date(`${editTimeLocal}:00+07:00`)
+      ? new Date(`${editTimeLocal}:00${offset}`)
       : new Date();
     const nextIso = isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString();
-    const targetEmp = employees.find((e) => Number(e.id) === Number(editEmpId));
 
     setServerEntries((prev) =>
       prev.map((x) =>
         x.client_uuid === editingUuid
-          ? {
-              ...x,
-              employee_id: editEmpId,
-              full_name: targetEmp?.full_name || x.full_name,
-              emp_code: targetEmp?.emp_code || x.emp_code,
-              entry_type: editType,
-              punched_at: nextIso,
-              notes: editNotes,
-            }
+          ? { ...x, entry_type: editType, punched_at: nextIso, notes: editNotes }
           : x
       )
     );
     setOfflineQueue((prev) => {
       const next = prev.map((x) =>
         x.client_uuid === editingUuid
-          ? {
-              ...x,
-              employee_id: editEmpId,
-              full_name: targetEmp?.full_name || x.full_name,
-              emp_code: targetEmp?.emp_code || x.emp_code,
-              entry_type: editType,
-              punched_at: nextIso,
-              notes: editNotes,
-            }
+          ? { ...x, entry_type: editType, punched_at: nextIso, notes: editNotes }
           : x
       );
       localStorage.setItem(QUEUE_KEY, JSON.stringify(next));
@@ -986,23 +1257,22 @@ export default function AdminJibbleDashboardPage() {
             payload: {
               id: editId,
               client_uuid: editingUuid,
-              employee_id: editEmpId,
               entry_type: editType,
               punched_at: nextIso,
               notes: editNotes,
             },
           }),
         });
-        await refreshServer();
       } catch {
-        // Pertahankan perubahan state
+        // Pertahankan perubahan
       }
     }
     setEditingUuid(null);
-    notify("ok", "Waktu dan data absen berhasil diperbarui.");
+    notify("ok", "Data absen diperbarui.");
   };
 
-  const deleteEntry = async (item: TimeEntry) => {
+  const removeEntry = async (item: TimeEntry) => {
+    if (!hasFullAccessServer) return;
     setServerEntries((prev) =>
       prev.filter(
         (x) =>
@@ -1024,18 +1294,17 @@ export default function AdminJibbleDashboardPage() {
             payload: { id: item.id, client_uuid: item.client_uuid },
           }),
         });
-        await refreshServer();
       } catch {
-        // Abaikan error jaringan
+        // Abaikan error
       }
     }
-    notify("ok", "Catatan absen berhasil dihapus.");
+    notify("ok", "Data absen dihapus.");
   };
 
-  // Simpan / Edit / Hapus Anggota Karyawan
   const saveEmployee = async () => {
+    if (!hasFullAccessServer) return;
     if (!empForm.emp_code.trim() || !empForm.full_name.trim()) {
-      notify("err", "Isi ID dan Nama Lengkap karyawan.");
+      notify("err", "Isi ID dan Nama Lengkap.");
       return;
     }
     const payload = {
@@ -1047,38 +1316,23 @@ export default function AdminJibbleDashboardPage() {
       pin_code: empForm.pin_code.trim() || "1234",
       shift_start_time: normalizeShiftTime(empForm.shift_start_time),
     };
-    if (navigator.onLine) {
-      try {
-        const res = await fetch("/api/manage", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ action: "SAVE_EMPLOYEE", payload }),
-        });
-        const data = await res.json();
-        if (data.ok) {
-          await refreshServer();
-          setEmpForm({
-            id: 0,
-            emp_code: "",
-            full_name: "",
-            role: "STAFF",
-            department: "Operasional",
-            pin_code: "1234",
-            shift_start_time: "07.00",
-          });
-          notify("ok", "Anggota karyawan berhasil disimpan.");
-          return;
-        }
-      } catch {
-        // Fallback lokal
-      }
-    }
     setEmployees((prev) => {
       if (empForm.id) {
         return prev.map((e) => (e.id === empForm.id ? { ...e, ...payload } : e));
       }
       return [...prev, { ...payload, id: Date.now() }];
     });
+    if (navigator.onLine) {
+      try {
+        await fetch("/api/manage", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "SAVE_EMPLOYEE", payload }),
+        });
+      } catch {
+        // Abaikan error
+      }
+    }
     setEmpForm({
       id: 0,
       emp_code: "",
@@ -1088,31 +1342,28 @@ export default function AdminJibbleDashboardPage() {
       pin_code: "1234",
       shift_start_time: "07.00",
     });
-    notify("ok", "Anggota karyawan diperbarui.");
+    notify("ok", "Data karyawan tersimpan.");
   };
 
-  const deleteEmployee = async (emp: Employee) => {
+  const deleteEmployee = async (id: number) => {
+    if (!hasFullAccessServer) return;
+    setEmployees((prev) => prev.filter((e) => Number(e.id) !== Number(id)));
     if (navigator.onLine) {
       try {
         await fetch("/api/manage", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            action: "DELETE_EMPLOYEE",
-            payload: { id: emp.id },
-          }),
+          body: JSON.stringify({ action: "DELETE_EMPLOYEE", payload: { id } }),
         });
-        await refreshServer();
       } catch {
         // Abaikan error
       }
     }
-    setEmployees((prev) => prev.filter((e) => Number(e.id) !== Number(emp.id)));
-    notify("ok", `Anggota karyawan ${emp.full_name} berhasil dihapus.`);
+    notify("ok", "Karyawan dihapus.");
   };
 
-  // Edit / Simpan / Hapus Koordinat Latitude, Longitude & Radius Kantor
-  const saveLocationCoordinates = async () => {
+  const saveLocation = async () => {
+    if (!hasFullAccessServer) return;
     if (!locForm.name.trim() || !locForm.latitude || !locForm.longitude) {
       notify("err", "Isi nama lokasi, latitude, dan longitude.");
       return;
@@ -1124,95 +1375,36 @@ export default function AdminJibbleDashboardPage() {
       longitude: Number(locForm.longitude),
       radius_meters: Number(locForm.radius_meters) || 150,
     };
-    if (navigator.onLine) {
-      try {
-        const res = await fetch("/api/manage", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ action: "SAVE_LOCATION", payload }),
-        });
-        const data = await res.json();
-        if (data.ok) {
-          await refreshServer();
-          notify("ok", "Koordinat Latitude/Longitude & Radius disimpan.");
-          return;
-        }
-      } catch {
-        // Fallback lokal
-      }
-    }
     setLocations((prev) => {
       if (locForm.id) {
         return prev.map((l) => (l.id === locForm.id ? { ...l, ...payload } : l));
       }
       return [...prev, { ...payload, id: Date.now() }];
     });
-    notify("ok", "Koordinat GPS diperbarui.");
-  };
-
-  const deleteLocation = async (id: number) => {
     if (navigator.onLine) {
       try {
         await fetch("/api/manage", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ action: "DELETE_LOCATION", payload: { id } }),
+          body: JSON.stringify({ action: "SAVE_LOCATION", payload }),
         });
-        await refreshServer();
       } catch {
         // Abaikan error
       }
     }
-    setLocations((prev) => prev.filter((l) => l.id !== id));
-    notify("ok", "Titik lokasi dihapus.");
+    notify("ok", "Koordinat GPS & radius diperbarui.");
   };
 
   const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(
     officeQrCode
   )}`;
 
-  if (isLockedScreen) {
-    return (
-      <div className="min-h-screen bg-[#ECEFF4] flex items-center justify-center p-4">
-        <div className="max-w-sm w-full bg-white rounded-2xl p-5 shadow space-y-3 border border-slate-200">
-          <div className="text-sm font-extrabold text-slate-900 uppercase">
-            Server Administrator Terkunci
-          </div>
-          <p className="text-xs text-slate-500">
-            Masukkan PIN Admin ({adminAccount.full_name}) untuk membuka kembali
-            dashboard full akses.
-          </p>
-          <input
-            type="password"
-            inputMode="numeric"
-            placeholder="PIN Admin (default: 0000)"
-            value={unlockPinInput}
-            onChange={(e) => setUnlockPinInput(e.target.value)}
-            className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm text-center tracking-widest"
-          />
-          <button
-            type="button"
-            onClick={() => {
-              if (
-                unlockPinInput === adminAccount.pin_code ||
-                unlockPinInput === "0000"
-              ) {
-                localStorage.setItem(ADMIN_PIN_KEY, "1");
-                setIsLockedScreen(false);
-                setUnlockPinInput("");
-                notify("ok", "Akses Admin dibuka.");
-              } else {
-                notify("err", "PIN Admin salah.");
-              }
-            }}
-            className="w-full py-2.5 rounded-lg bg-blue-600 text-white text-xs font-extrabold"
-          >
-            Masuk Server Admin
-          </button>
-        </div>
-      </div>
-    );
-  }
+  const myRecentEntries = useMemo(() => {
+    if (!activeEmployee) return [];
+    return allEntries
+      .filter((e) => Number(e.employee_id) === Number(activeEmployee.id))
+      .slice(0, 5);
+  }, [allEntries, activeEmployee]);
 
   return (
     <div className="min-h-screen bg-[#ECEFF4] text-slate-900 p-2.5 sm:p-4">
@@ -1231,15 +1423,66 @@ export default function AdminJibbleDashboardPage() {
           </div>
         )}
 
-        {/* Header Utama */}
-        <header className="bg-[#0B1220] text-white rounded-2xl p-3.5 shadow space-y-2.5">
-          <div>
-            <h1 className="text-sm font-extrabold tracking-wide uppercase">
-              APLIKASI ABSENSI QR &amp; GPS
-            </h1>
-            <p className="text-[11px] text-slate-300 mt-0.5">
-              {adminAccount.full_name} ({adminAccount.emp_code}) • ADMIN
-            </p>
+        {/* Header Utama + Pembeda Server ADMIN / MANAGER / KARYAWAN + Jam Indonesia Otomatis */}
+        <header
+          className={`text-white rounded-2xl p-3.5 shadow space-y-2.5 ${
+            isStaffDeviceLocked
+              ? "bg-[#111827]"
+              : isManager
+              ? "bg-[#1E1B4B]"
+              : "bg-[#0B1220]"
+          }`}
+        >
+          <div className="flex items-start justify-between gap-2">
+            <div>
+              <h1 className="text-sm font-extrabold tracking-wide uppercase">
+                APLIKASI ABSENSI QR &amp; GPS
+              </h1>
+              <p className="text-[11px] text-slate-300 mt-0.5">
+                {activeEmployee?.full_name || "Admin Operasional"} (
+                {activeEmployee?.emp_code || "ADM-001"}) •{" "}
+                {isStaffDeviceLocked
+                  ? "SERVER KARYAWAN (TERBATAS)"
+                  : isManager
+                  ? "SERVER MANAGER (FULL AKSES)"
+                  : "SERVER ADMIN (FULL AKSES)"}
+              </p>
+            </div>
+            <span
+              className={`px-2 py-0.5 rounded text-[9px] font-extrabold uppercase shrink-0 ${
+                isStaffDeviceLocked
+                  ? "bg-sky-500 text-slate-950"
+                  : isManager
+                  ? "bg-violet-500 text-white"
+                  : "bg-amber-400 text-slate-950"
+              }`}
+            >
+              {isStaffDeviceLocked
+                ? "HP KARYAWAN LOCK"
+                : isManager
+                ? "MANAGER"
+                : "ADMIN"}
+            </span>
+          </div>
+
+          {/* Jam Waktu Indonesia Tersinkronisasi Otomatis */}
+          <div className="flex items-center justify-between bg-white/10 rounded-lg px-2.5 py-1.5 text-[11px]">
+            <span className="font-bold text-emerald-300">
+              {liveIndonesiaClock}
+            </span>
+            <select
+              value={indoTz}
+              onChange={(e) => {
+                const nextTz = e.target.value as IndoTzType;
+                setIndoTz(nextTz);
+                localStorage.setItem(TZ_KEY, nextTz);
+              }}
+              className="bg-slate-900 text-white border border-white/20 rounded px-1.5 py-0.5 text-[10px] font-bold"
+            >
+              <option value="Asia/Jakarta">WIB</option>
+              <option value="Asia/Makassar">WITA</option>
+              <option value="Asia/Jayapura">WIT</option>
+            </select>
           </div>
 
           <div className="flex flex-wrap items-center gap-1.5">
@@ -1248,7 +1491,10 @@ export default function AdminJibbleDashboardPage() {
             </span>
             <button
               type="button"
-              onClick={() => void refreshServer()}
+              onClick={() => {
+                setNowMs(Date.now());
+                void refreshServer();
+              }}
               disabled={isSyncing}
               className="px-2.5 py-1 rounded-md bg-blue-600 hover:bg-blue-700 text-white text-[10px] font-bold"
             >
@@ -1258,184 +1504,236 @@ export default function AdminJibbleDashboardPage() {
               type="button"
               onClick={() => {
                 stopQrCam();
-                setIsLockedScreen(true);
+                stopSelfieCam();
+                setSessionModalOpen(true);
               }}
               className="px-2.5 py-1 rounded-md bg-rose-600 hover:bg-rose-700 text-white text-[10px] font-bold"
             >
-              Keluar
+              {isStaffDeviceLocked ? "Sesi Karyawan" : "Keluar / Mode"}
             </button>
           </div>
         </header>
 
-        {/* Monitoring Kehadiran Hari Ini + Live Status Anggota (Gaya Jibble) */}
-        <section className="bg-white rounded-2xl p-3.5 border-t-4 border-t-blue-600 border border-slate-200/80 shadow-sm space-y-2.5">
+        {/* Modal Sesi: Karyawan Terkunci di Mode Absen Saja; Admin/Manager Pakai PIN */}
+        {sessionModalOpen && (
+          <section className="bg-white rounded-2xl p-3.5 border border-slate-200 shadow-sm space-y-2.5">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-extrabold text-slate-800">
+                {isStaffDeviceLocked
+                  ? "Mode Karyawan Terkunci di Perangkat Ini"
+                  : "Pilih Mode Server & Karyawan"}
+              </span>
+              <button
+                type="button"
+                onClick={() => setSessionModalOpen(false)}
+                className="text-[11px] font-bold px-2 py-0.5 rounded bg-slate-100"
+              >
+                Tutup
+              </button>
+            </div>
+
+            {/* Daftar Akun Karyawan (STAFF) */}
+            <div className="space-y-1.5">
+              <div className="text-[10px] font-bold text-slate-500 uppercase">
+                Akun Karyawan (Hanya Dashboard Absen)
+              </div>
+              {employees
+                .filter((e) => e.role === "STAFF")
+                .map((staff) => (
+                  <button
+                    key={staff.id}
+                    type="button"
+                    onClick={() => lockDeviceToEmployee(staff)}
+                    className={`w-full p-2.5 rounded-xl border text-left flex items-center justify-between text-xs ${
+                      isStaffDeviceLocked &&
+                      Number(staff.id) === Number(activeEmployee?.id)
+                        ? "border-sky-600 bg-sky-50 font-bold"
+                        : "border-slate-200 bg-slate-50"
+                    }`}
+                  >
+                    <span>
+                      {staff.full_name} ({staff.emp_code})
+                    </span>
+                    <span className="text-[10px] font-extrabold px-2 py-0.5 rounded bg-sky-100 text-sky-800">
+                      KUNCI KE HP KARYAWAN
+                    </span>
+                  </button>
+                ))}
+            </div>
+
+            {/* Buka Server ADMIN atau MANAGER dengan PIN */}
+            <div className="pt-2.5 border-t border-slate-200 space-y-2">
+              <div className="text-[10px] font-bold text-slate-600 uppercase">
+                Akses Server ADMIN / MANAGER (Wajib PIN)
+              </div>
+              <div className="grid grid-cols-2 gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => setElevateTargetRole("ADMIN")}
+                  className={`py-1.5 rounded-lg text-[11px] font-bold border ${
+                    elevateTargetRole === "ADMIN"
+                      ? "bg-slate-900 text-white border-slate-900"
+                      : "bg-white text-slate-700"
+                  }`}
+                >
+                  Server ADMIN
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setElevateTargetRole("MANAGER")}
+                  className={`py-1.5 rounded-lg text-[11px] font-bold border ${
+                    elevateTargetRole === "MANAGER"
+                      ? "bg-violet-700 text-white border-violet-700"
+                      : "bg-white text-slate-700"
+                  }`}
+                >
+                  Server MANAGER
+                </button>
+              </div>
+              <div className="flex gap-1.5">
+                <input
+                  type="password"
+                  inputMode="numeric"
+                  placeholder={`PIN ${elevateTargetRole}`}
+                  value={elevatePin}
+                  onChange={(e) => setElevatePin(e.target.value)}
+                  className="flex-1 rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs"
+                />
+                <button
+                  type="button"
+                  onClick={unlockPrivilegedServer}
+                  className="px-3 py-1.5 rounded-lg bg-blue-600 text-white text-xs font-bold"
+                >
+                  Buka Server
+                </button>
+              </div>
+            </div>
+          </section>
+        )}
+
+        {/* Monitoring Kehadiran Hari Ini (Hanya Server ADMIN & MANAGER) */}
+        {hasFullAccessServer && (
+          <section
+            className={`bg-white rounded-2xl p-3.5 border-t-4 border border-slate-200/80 shadow-sm space-y-2.5 ${
+              isManager ? "border-t-violet-600" : "border-t-blue-600"
+            }`}
+          >
+            <div className="flex items-center justify-between">
+              <h2 className="text-xs font-extrabold text-slate-800">
+                Monitoring Kehadiran Hari Ini ({todayStr})
+              </h2>
+              <span className="px-2 py-0.5 rounded bg-emerald-100 text-emerald-700 text-[9px] font-extrabold uppercase">
+                {isManager ? "MANAGER LIVE" : "ADMIN LIVE"}
+              </span>
+            </div>
+            <div className="grid grid-cols-3 gap-2 text-center">
+              <div className="p-2.5 rounded-xl bg-blue-50/80 border border-blue-100">
+                <div className="text-base font-extrabold text-blue-700">
+                  {summaryToday.masuk}
+                </div>
+                <div className="text-[10px] text-slate-500 font-medium">
+                  Absen Masuk
+                </div>
+              </div>
+              <div className="p-2.5 rounded-xl bg-amber-50/80 border border-amber-100">
+                <div className="text-base font-extrabold text-amber-600">
+                  {summaryToday.terlambat}
+                </div>
+                <div className="text-[10px] text-slate-500 font-medium">
+                  Terlambat
+                </div>
+              </div>
+              <div className="p-2.5 rounded-xl bg-emerald-50/80 border border-emerald-100">
+                <div className="text-base font-extrabold text-emerald-700">
+                  {summaryToday.keluar}
+                </div>
+                <div className="text-[10px] text-slate-500 font-medium">
+                  Absen Keluar
+                </div>
+              </div>
+            </div>
+          </section>
+        )}
+
+        {/* 1. Dashboard Absen: Scanner Barcode/QR + Selfie Pendeteksi Wajah + Manual Klik */}
+        <section className="bg-white rounded-2xl p-3.5 border-t-4 border-t-blue-500 border border-slate-200/80 shadow-sm space-y-2.5">
           <div className="flex items-center justify-between">
             <h2 className="text-xs font-extrabold text-slate-800">
-              Monitoring Kehadiran Hari Ini ({todayStr})
+              1. Dashboard Absen (Barcode + Selfie Wajah + Klik)
             </h2>
-            <span className="px-2 py-0.5 rounded bg-emerald-100 text-emerald-700 text-[9px] font-extrabold uppercase">
-              LIVE SERVER
-            </span>
-          </div>
-
-          <div className="grid grid-cols-3 gap-2 text-center">
-            <div className="p-2.5 rounded-xl bg-blue-50/80 border border-blue-100">
-              <div className="text-base font-extrabold text-blue-700">
-                {jibbleLiveStatus.masuk}
-              </div>
-              <div className="text-[10px] text-slate-500 font-medium">
-                Absen Masuk
-              </div>
-            </div>
-            <div className="p-2.5 rounded-xl bg-amber-50/80 border border-amber-100">
-              <div className="text-base font-extrabold text-amber-600">
-                {jibbleLiveStatus.terlambat}
-              </div>
-              <div className="text-[10px] text-slate-500 font-medium">
-                Terlambat
-              </div>
-            </div>
-            <div className="p-2.5 rounded-xl bg-emerald-50/80 border border-emerald-100">
-              <div className="text-base font-extrabold text-emerald-700">
-                {jibbleLiveStatus.keluar}
-              </div>
-              <div className="text-[10px] text-slate-500 font-medium">
-                Absen Keluar
-              </div>
-            </div>
-          </div>
-
-          {/* Live Presence Board ala Jibble */}
-          <div className="pt-1.5 border-t border-slate-100 space-y-1.5">
-            <div className="text-[10px] font-extrabold text-slate-500 uppercase">
-              Status Anggota Live (Jibble View)
-            </div>
-            {jibbleLiveStatus.perEmployee.map(
-              ({ emp, status, firstIn, lateMins, workMinutes }) => {
-                const hrs = Math.floor(workMinutes / 60);
-                const mins = workMinutes % 60;
-                return (
-                  <div
-                    key={emp.id}
-                    className="flex items-center justify-between p-2 rounded-xl bg-slate-50 border border-slate-200/60 text-[11px]"
-                  >
-                    <div className="flex items-center gap-2 min-w-0">
-                      <span
-                        className={`w-2.5 h-2.5 rounded-full shrink-0 ${
-                          status === "BEKERJA"
-                            ? "bg-emerald-500"
-                            : status === "PULANG"
-                            ? "bg-blue-500"
-                            : "bg-slate-300"
-                        }`}
-                      />
-                      <div className="truncate">
-                        <div className="font-bold text-slate-800 truncate">
-                          {emp.full_name}{" "}
-                          <span className="text-[10px] font-normal text-slate-500">
-                            ({emp.emp_code})
-                          </span>
-                        </div>
-                        <div className="text-[10px] text-slate-500">
-                          Shift {emp.shift_start_time || "07.00"}
-                          {firstIn
-                            ? ` • Masuk ${formatTimeWIB(firstIn.punched_at)}`
-                            : ""}
-                          {lateMins > 0 ? ` • Telat ${lateMins}m` : ""}
-                        </div>
-                      </div>
-                    </div>
-                    <div className="text-right shrink-0 ml-2">
-                      <span
-                        className={`px-2 py-0.5 rounded text-[9px] font-extrabold ${
-                          status === "BEKERJA"
-                            ? "bg-emerald-100 text-emerald-700"
-                            : status === "PULANG"
-                            ? "bg-blue-100 text-blue-700"
-                            : "bg-slate-200 text-slate-600"
-                        }`}
-                      >
-                        {status === "BEKERJA"
-                          ? "BEKERJA"
-                          : status === "PULANG"
-                          ? "PULANG"
-                          : "BELUM"}
-                      </span>
-                      {workMinutes > 0 && (
-                        <div className="text-[9px] text-slate-500 mt-0.5">
-                          {hrs}j {mins}m
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                );
-              }
+            {isStaffDeviceLocked && (
+              <span className="px-2 py-0.5 rounded bg-sky-100 text-sky-800 text-[9px] font-extrabold uppercase">
+                KARYAWAN ONLY
+              </span>
             )}
           </div>
-        </section>
 
-        {/* 1. Scan QR & GPS Realtime + Quick Punch Anggota */}
-        <section className="bg-white rounded-2xl p-3.5 border-t-4 border-t-blue-500 border border-slate-200/80 shadow-sm space-y-2.5">
-          <h2 className="text-xs font-extrabold text-slate-800">
-            1. Scan QR &amp; GPS Realtime
-          </h2>
-          <div className="flex items-center justify-between gap-2">
-            <span className="text-[11px] text-slate-500">
-              Jadwal Masuk: {adminAccount.shift_start_time || "07.00"}
-            </span>
-            <select
-              value={targetPunchEmpId}
-              onChange={(e) => setTargetPunchEmpId(Number(e.target.value))}
-              className="rounded-lg border border-slate-300 px-2 py-1 text-[11px] font-bold bg-slate-50"
-            >
-              {employees.map((emp) => (
-                <option key={emp.id} value={emp.id}>
-                  {emp.full_name} ({emp.emp_code})
-                </option>
-              ))}
-            </select>
+          <div className="text-[11px] text-slate-500">
+            Jadwal Masuk: {activeEmployee?.shift_start_time || "07.00"} •{" "}
+            {liveIndonesiaClock}
           </div>
           <div className="text-[11px] font-bold text-emerald-600">
             {geofenceLabel}
           </div>
 
+          {employeeCooldown.locked && (
+            <div className="p-2.5 rounded-xl bg-amber-50 border border-amber-300 text-[11px] font-bold text-amber-900">
+              Sudah absen{" "}
+              {employeeCooldown.lastEntry?.entry_type === "CLOCK_IN"
+                ? "MASUK"
+                : "KELUAR"}{" "}
+              pukul {formatTimeInTz(employeeCooldown.lastEntry?.punched_at, indoTz)}.
+              Absen ganda dikunci; kembali normal dalam {employeeCooldown.label}
+              (6 jam).
+            </div>
+          )}
+
+          {/* Manual Klik MASUK / KELUAR */}
           <div className="grid grid-cols-2 gap-2">
             <button
               type="button"
+              disabled={employeeCooldown.locked}
               onClick={() => {
                 setSelectedAction("CLOCK_IN");
-                void submitAdminPunch("CLOCK_IN");
+                void submitAttendance("CLOCK_IN");
               }}
-              className={`py-2 rounded-lg text-xs font-extrabold border ${
-                selectedAction === "CLOCK_IN"
+              className={`py-2 rounded-lg text-xs font-extrabold border disabled:opacity-45 ${
+                selectedAction === "CLOCK_IN" && !employeeCooldown.locked
                   ? "bg-blue-600 text-white border-blue-600"
                   : "bg-white text-slate-700 border-slate-300"
               }`}
             >
-              MASUK
+              MASUK (KLIK)
             </button>
             <button
               type="button"
+              disabled={employeeCooldown.locked}
               onClick={() => {
                 setSelectedAction("CLOCK_OUT");
-                void submitAdminPunch("CLOCK_OUT");
+                void submitAttendance("CLOCK_OUT");
               }}
-              className={`py-2 rounded-lg text-xs font-extrabold border ${
-                selectedAction === "CLOCK_OUT"
+              className={`py-2 rounded-lg text-xs font-extrabold border disabled:opacity-45 ${
+                selectedAction === "CLOCK_OUT" && !employeeCooldown.locked
                   ? "bg-blue-600 text-white border-blue-600"
                   : "bg-white text-slate-700 border-slate-300"
               }`}
             >
-              KELUAR
+              KELUAR (KLIK)
             </button>
           </div>
 
+          {/* Scanner Barcode & QR */}
           <button
             type="button"
-            onClick={() => (qrCameraOn ? stopQrCam() : void startQrCamera())}
-            className="w-full py-2.5 rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-bold"
+            disabled={employeeCooldown.locked}
+            onClick={() =>
+              qrCameraOn ? stopQrCam() : void startScannerCamera()
+            }
+            className="w-full py-2.5 rounded-lg bg-emerald-700 hover:bg-emerald-800 disabled:opacity-45 text-white text-xs font-bold"
           >
-            {qrCameraOn ? "Tutup Kamera Scan QR" : "Buka Kamera Scan QR"}
+            {qrCameraOn
+              ? "Tutup Scanner Barcode / QR"
+              : "Buka Scanner Barcode / QR"}
           </button>
 
           {qrCameraOn && (
@@ -1452,569 +1750,610 @@ export default function AdminJibbleDashboardPage() {
           <div className="flex gap-1.5">
             <input
               type="text"
-              placeholder="Input Kode QR manual jika kamera terkendala"
+              disabled={employeeCooldown.locked}
+              placeholder="Input Kode Barcode / QR manual"
               value={qrInput}
               onChange={(e) => setQrInput(e.target.value)}
-              className="flex-1 rounded-lg border border-slate-300 px-2.5 py-2 text-xs"
+              className="flex-1 rounded-lg border border-slate-300 px-2.5 py-2 text-xs disabled:bg-slate-100"
             />
             <button
               type="button"
-              onClick={() => void submitAdminPunch(selectedAction, qrInput)}
-              className="px-3.5 py-2 rounded-lg bg-slate-900 text-white text-xs font-bold"
+              disabled={employeeCooldown.locked}
+              onClick={() => void submitAttendance(selectedAction, qrInput)}
+              className="px-3.5 py-2 rounded-lg bg-slate-900 disabled:opacity-45 text-white text-xs font-bold"
             >
               Kirim
             </button>
           </div>
-        </section>
 
-        {/* 2. Input Jadwal (.PDF / .XLSX / .CSV) */}
-        <section className="bg-white rounded-2xl p-3.5 border border-slate-200/80 shadow-sm space-y-2">
-          <h2 className="text-xs font-extrabold text-slate-800">
-            2. Input Jadwal (.PDF / .XLSX / .CSV)
-          </h2>
-          <div className="flex items-center gap-2 rounded-lg border border-slate-200 p-1.5 bg-slate-50">
-            <button
-              type="button"
-              onClick={() => scheduleInputRef.current?.click()}
-              className="px-2.5 py-1 rounded bg-slate-200 hover:bg-slate-300 text-slate-800 text-[11px] font-bold shrink-0"
-            >
-              Pilih File
-            </button>
-            <span className="text-[11px] text-slate-500 truncate">
-              {scheduleFileName}
-            </span>
-            <input
-              ref={scheduleInputRef}
-              type="file"
-              accept=".pdf,.xlsx,.xls,.csv,.txt"
-              onChange={(e) => void handleScheduleUpload(e)}
-              className="hidden"
-            />
-          </div>
-          {schedulePreview.length > 0 && (
-            <div className="space-y-1 pt-1">
-              {schedulePreview.map((row, idx) => (
-                <div
-                  key={`${row.emp_code}-${idx}`}
-                  className="text-[10px] bg-emerald-50 text-emerald-900 px-2.5 py-1 rounded flex justify-between font-semibold"
-                >
-                  <span>
-                    {row.full_name} ({row.emp_code})
-                  </span>
-                  <span>Shift {row.shift_time}</span>
-                </div>
-              ))}
-            </div>
-          )}
-        </section>
-
-        {/* 3. Laporan & Data Absensi (Download, Edit Waktu/Jenis, Hapus Absen) */}
-        <section className="bg-white rounded-2xl p-3.5 border border-slate-200/80 shadow-sm space-y-2.5">
-          <div className="flex items-center justify-between gap-1.5">
-            <h2 className="text-xs font-extrabold text-slate-800">
-              3. Laporan &amp; Data Absensi:
-            </h2>
-            <div className="flex gap-1">
-              <select
-                value={empFilterId}
-                onChange={(e) => setEmpFilterId(e.target.value)}
-                className="rounded-lg border border-slate-300 px-1.5 py-1 text-[10px] font-semibold bg-white max-w-[100px]"
-              >
-                <option value="ALL">Semua Staf</option>
-                {employees.map((emp) => (
-                  <option key={emp.id} value={String(emp.id)}>
-                    {emp.full_name}
-                  </option>
-                ))}
-              </select>
-              <select
-                value={reportFilter}
-                onChange={(e) =>
-                  setReportFilter(
-                    e.target.value as "Harian" | "Mingguan" | "Bulanan"
-                  )
-                }
-                className="rounded-lg border border-slate-300 px-2 py-1 text-[11px] font-semibold bg-white"
-              >
-                <option value="Harian">Harian</option>
-                <option value="Mingguan">Mingguan</option>
-                <option value="Bulanan">Bulanan</option>
-              </select>
-            </div>
-          </div>
-
-          <div className="grid grid-cols-3 gap-1.5">
-            <button
-              type="button"
-              onClick={() => downloadReport("XLSX")}
-              className="py-2 rounded-lg bg-emerald-700 text-white text-[11px] font-bold"
-            >
-              Download XLSX
-            </button>
-            <button
-              type="button"
-              onClick={() => downloadReport("PDF")}
-              className="py-2 rounded-lg bg-rose-600 text-white text-[11px] font-bold"
-            >
-              Download PDF
-            </button>
-            <button
-              type="button"
-              onClick={() => downloadReport("CSV")}
-              className="py-2 rounded-lg bg-slate-800 text-white text-[11px] font-bold"
-            >
-              Download CSV
-            </button>
-          </div>
-
-          {editingUuid && (
-            <div className="p-2.5 rounded-xl bg-amber-50 border border-amber-300 space-y-2">
-              <div className="text-[11px] font-extrabold text-amber-900">
-                Edit Waktu &amp; Catatan Absensi
-              </div>
-              <select
-                value={editEmpId}
-                onChange={(e) => setEditEmpId(Number(e.target.value))}
-                className="w-full rounded-lg border px-2 py-1.5 text-xs bg-white"
-              >
-                {employees.map((emp) => (
-                  <option key={emp.id} value={emp.id}>
-                    {emp.full_name} ({emp.emp_code})
-                  </option>
-                ))}
-              </select>
-              <div className="grid grid-cols-2 gap-1.5">
-                <select
-                  value={editType}
-                  onChange={(e) =>
-                    setEditType(e.target.value as "CLOCK_IN" | "CLOCK_OUT")
-                  }
-                  className="rounded-lg border px-2 py-1.5 text-xs bg-white"
-                >
-                  <option value="CLOCK_IN">MASUK</option>
-                  <option value="CLOCK_OUT">KELUAR</option>
-                </select>
-                <input
-                  type="datetime-local"
-                  value={editTimeLocal}
-                  onChange={(e) => setEditTimeLocal(e.target.value)}
-                  className="rounded-lg border px-2 py-1.5 text-xs bg-white"
-                />
-              </div>
-              <input
-                type="text"
-                placeholder="Catatan koreksi admin"
-                value={editNotes}
-                onChange={(e) => setEditNotes(e.target.value)}
-                className="w-full rounded-lg border px-2.5 py-1.5 text-xs bg-white"
-              />
-              <div className="flex gap-1.5">
-                <button
-                  type="button"
-                  onClick={() => void saveEditEntry()}
-                  className="px-3 py-1 rounded-lg bg-emerald-600 text-white text-xs font-bold"
-                >
-                  Simpan Waktu
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setEditingUuid(null)}
-                  className="px-3 py-1 rounded-lg bg-slate-200 text-slate-800 text-xs font-bold"
-                >
-                  Batal
-                </button>
-              </div>
-            </div>
-          )}
-
-          <div className="overflow-x-auto rounded-lg border border-slate-200">
-            <table className="w-full text-left border-collapse text-[10px]">
-              <thead>
-                <tr className="bg-[#0B1220] text-white">
-                  <th className="p-1.5">Tanggal</th>
-                  <th className="p-1.5">Nama</th>
-                  <th className="p-1.5">Jenis</th>
-                  <th className="p-1.5">Scan</th>
-                  <th className="p-1.5">Telat</th>
-                  <th className="p-1.5">Status</th>
-                  <th className="p-1.5">Mode</th>
-                  <th className="p-1.5">Aksi</th>
-                </tr>
-              </thead>
-              <tbody>
-                {filteredEntries.length === 0 ? (
-                  <tr>
-                    <td colSpan={8} className="p-4 text-center text-slate-400">
-                      Belum ada data absensi
-                    </td>
-                  </tr>
-                ) : (
-                  filteredEntries.map((item, idx) => {
-                    const emp = employees.find(
-                      (e) => Number(e.id) === Number(item.employee_id)
-                    );
-                    const lateM = calcLateMinutes(
-                      item.punched_at,
-                      emp?.shift_start_time || "07.00"
-                    );
-                    return (
-                      <tr
-                        key={`${item.client_uuid}-${idx}`}
-                        className="border-t border-slate-100"
-                      >
-                        <td className="p-1.5 whitespace-nowrap">
-                          {getJakartaDateStr(item.punched_at)}
-                        </td>
-                        <td className="p-1.5 font-semibold whitespace-nowrap">
-                          {item.full_name || emp?.full_name || "Karyawan"}
-                        </td>
-                        <td className="p-1.5 whitespace-nowrap">
-                          {item.entry_type === "CLOCK_IN" ? "MASUK" : "KELUAR"}
-                        </td>
-                        <td className="p-1.5 whitespace-nowrap">
-                          {formatTimeWIB(item.punched_at)}
-                        </td>
-                        <td className="p-1.5 whitespace-nowrap">
-                          {lateM > 0 ? `${lateM}m` : "0m"}
-                        </td>
-                        <td className="p-1.5 whitespace-nowrap">
-                          {item.is_within_geofence === false ? "LUAR" : "HADIR"}
-                        </td>
-                        <td className="p-1.5 whitespace-nowrap">
-                          {item.mode || "QR + GPS"}
-                        </td>
-                        <td className="p-1.5 whitespace-nowrap space-x-1">
-                          <button
-                            type="button"
-                            onClick={() => openEditEntry(item)}
-                            className="px-1.5 py-0.5 rounded bg-amber-500 text-white font-bold"
-                          >
-                            Edit
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => void deleteEntry(item)}
-                            className="px-1.5 py-0.5 rounded bg-rose-600 text-white font-bold"
-                          >
-                            Hapus
-                          </button>
-                        </td>
-                      </tr>
-                    );
-                  })
-                )}
-              </tbody>
-            </table>
-          </div>
-        </section>
-
-        {/* 4. QR Code Resmi Kantor Utama */}
-        <section className="bg-white rounded-2xl p-3.5 border-t-4 border-t-emerald-600 border border-slate-200/80 shadow-sm space-y-2.5 text-center">
-          <h2 className="text-xs font-extrabold text-slate-800 text-left">
-            4. QR Code Resmi Kantor Utama
-          </h2>
-          <p className="text-[10px] text-slate-500 text-left leading-relaxed">
-            Cetak atau tampilkan QR Code ini di lokasi kantor. Sistem mengunci
-            pemindaian agar karyawan hanya bisa absen <b>MASUK</b> dan{" "}
-            <b>KELUAR</b> memakai QR resmi ini.
-          </p>
-
-          <input
-            type="text"
-            value={officeQrCode}
-            onChange={(e) => {
-              setOfficeQrCode(e.target.value);
-              localStorage.setItem(QR_CODE_KEY, e.target.value);
-            }}
-            className="w-full rounded-lg border border-slate-200 px-2.5 py-1.5 text-[11px] font-bold text-center"
-          />
-
-          <div className="p-3 rounded-xl border border-slate-200 bg-white inline-block mx-auto">
-            {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img
-              src={qrUrl}
-              alt="QR Code Resmi Kantor Utama"
-              className="w-40 h-40 mx-auto"
-            />
-            <div className="text-xs font-extrabold text-slate-900 mt-1.5">
-              {officeQrCode}
-            </div>
-            <div className="text-[10px] text-slate-400">
-              Radius GPS: Maks. {activeRadiusMeters} meter
-            </div>
-          </div>
-
-          <div className="grid grid-cols-2 gap-2">
-            <a
-              href={qrUrl}
-              download={`${officeQrCode}.png`}
-              target="_blank"
-              rel="noreferrer"
-              className="py-2 rounded-lg bg-emerald-700 text-white text-xs font-bold"
-            >
-              Download PNG
-            </a>
-            <button
-              type="button"
-              onClick={() => window.print()}
-              className="py-2 rounded-lg bg-slate-900 text-white text-xs font-bold"
-            >
-              Cetak QR
-            </button>
-          </div>
-        </section>
-
-        {/* 5. Panel Admin: Data Karyawan & Edit Latitude / Longitude Koordinat */}
-        <section className="bg-white rounded-2xl p-3.5 border border-slate-200/80 shadow-sm space-y-3">
-          <h2 className="text-xs font-extrabold text-slate-800">
-            5. Panel Admin: Data Karyawan
-          </h2>
-
-          <div className="space-y-1.5">
-            <input
-              type="text"
-              placeholder="ID (KRY-005)"
-              value={empForm.emp_code}
-              onChange={(e) =>
-                setEmpForm((p) => ({ ...p, emp_code: e.target.value }))
-              }
-              className="w-full rounded-lg border border-slate-300 px-2.5 py-2 text-xs"
-            />
-            <input
-              type="text"
-              placeholder="Nama Lengkap"
-              value={empForm.full_name}
-              onChange={(e) =>
-                setEmpForm((p) => ({ ...p, full_name: e.target.value }))
-              }
-              className="w-full rounded-lg border border-slate-300 px-2.5 py-2 text-xs"
-            />
-            <div className="grid grid-cols-3 gap-1.5">
-              <select
-                value={empForm.role}
-                onChange={(e) =>
-                  setEmpForm((p) => ({
-                    ...p,
-                    role: e.target.value as RoleType,
-                  }))
-                }
-                className="rounded-lg border border-slate-300 px-2 py-1.5 text-xs bg-white"
-              >
-                <option value="STAFF">STAFF</option>
-                <option value="ADMIN">ADMIN</option>
-                <option value="MANAGER">MANAGER</option>
-              </select>
-              <input
-                type="text"
-                placeholder="PIN"
-                value={empForm.pin_code}
-                onChange={(e) =>
-                  setEmpForm((p) => ({ ...p, pin_code: e.target.value }))
-                }
-                className="rounded-lg border border-slate-300 px-2 py-1.5 text-xs"
-              />
-              <select
-                value={empForm.shift_start_time}
-                onChange={(e) =>
-                  setEmpForm((p) => ({
-                    ...p,
-                    shift_start_time: e.target.value,
-                  }))
-                }
-                className="rounded-lg border border-slate-300 px-2 py-1.5 text-xs bg-white"
-              >
-                {SHIFT_OPTIONS.map((opt) => (
-                  <option key={opt.time} value={opt.time}>
-                    {opt.label}
-                  </option>
-                ))}
-              </select>
-            </div>
-            <button
-              type="button"
-              onClick={() => void saveEmployee()}
-              className="w-full py-2 rounded-lg bg-blue-600 text-white text-xs font-bold"
-            >
-              {empForm.id ? "Simpan Edit Anggota" : "Tambah Anggota Karyawan"}
-            </button>
-          </div>
-
-          <div className="space-y-1.5">
-            {employees.map((emp) => (
-              <div
-                key={emp.id}
-                className="p-2 rounded-lg bg-slate-50 border border-slate-200/70 flex flex-wrap items-center justify-between gap-1.5 text-xs"
-              >
-                <div>
-                  <span className="font-bold">{emp.full_name}</span> (
-                  {emp.emp_code}) • {emp.role} • Shift{" "}
-                  {emp.shift_start_time || "07.00"}
-                </div>
-                <div className="flex gap-1">
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setEmpForm({
-                        id: emp.id,
-                        emp_code: emp.emp_code,
-                        full_name: emp.full_name,
-                        role: emp.role,
-                        department: emp.department,
-                        pin_code: emp.pin_code,
-                        shift_start_time: normalizeShiftTime(
-                          emp.shift_start_time
-                        ),
-                      })
-                    }
-                    className="px-2 py-0.5 rounded bg-amber-500 text-white text-[10px] font-bold"
-                  >
-                    Edit
-                  </button>
-                  {emp.role !== "ADMIN" && (
-                    <button
-                      type="button"
-                      onClick={() => void deleteEmployee(emp)}
-                      className="px-2 py-0.5 rounded bg-rose-600 text-white text-[10px] font-bold"
-                    >
-                      Hapus
-                    </button>
-                  )}
-                </div>
-              </div>
-            ))}
-          </div>
-
-          {/* Edit Koordinat Latitude, Longitude & Radius GPS */}
-          <div className="pt-2.5 border-t border-slate-200 space-y-1.5">
+          {/* Selfie Pendeteksi Wajah */}
+          <div className="pt-2 border-t border-slate-100 space-y-2">
             <div className="flex items-center justify-between">
-              <span className="text-[11px] font-extrabold text-slate-800">
-                Edit Koordinat Latitude, Longitude &amp; Radius GPS
+              <span className="text-[11px] font-extrabold text-slate-700">
+                Selfie Pendeteksi Wajah{" "}
+                {isStaffDeviceLocked ? "(Wajib)" : "(Opsional)"}
               </span>
-              {gpsCoords && (
-                <button
-                  type="button"
-                  onClick={() =>
-                    setLocForm((p) => ({
-                      ...p,
-                      latitude: String(gpsCoords.lat),
-                      longitude: String(gpsCoords.lng),
-                    }))
-                  }
-                  className="text-[10px] font-bold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded"
-                >
-                  Ambil GPS Saat Ini
-                </button>
+              {capturedSelfie && (
+                <span className="text-[10px] font-bold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded">
+                  Wajah Tersimpan
+                </span>
               )}
             </div>
-
-            <input
-              type="text"
-              placeholder="Nama Lokasi Kantor"
-              value={locForm.name}
-              onChange={(e) =>
-                setLocForm((p) => ({ ...p, name: e.target.value }))
-              }
-              className="w-full rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs"
-            />
-            <div className="grid grid-cols-3 gap-1.5">
-              <div>
-                <label className="block text-[9px] font-bold text-slate-500 mb-0.5">
-                  Latitude
-                </label>
-                <input
-                  type="text"
-                  placeholder="-6.910000"
-                  value={locForm.latitude}
-                  onChange={(e) =>
-                    setLocForm((p) => ({ ...p, latitude: e.target.value }))
-                  }
-                  className="w-full rounded-lg border border-slate-300 px-2 py-1.5 text-xs"
-                />
-              </div>
-              <div>
-                <label className="block text-[9px] font-bold text-slate-500 mb-0.5">
-                  Longitude
-                </label>
-                <input
-                  type="text"
-                  placeholder="109.730000"
-                  value={locForm.longitude}
-                  onChange={(e) =>
-                    setLocForm((p) => ({ ...p, longitude: e.target.value }))
-                  }
-                  className="w-full rounded-lg border border-slate-300 px-2 py-1.5 text-xs"
-                />
-              </div>
-              <div>
-                <label className="block text-[9px] font-bold text-slate-500 mb-0.5">
-                  Radius (m)
-                </label>
-                <input
-                  type="number"
-                  placeholder="150"
-                  value={locForm.radius_meters}
-                  onChange={(e) =>
-                    setLocForm((p) => ({
-                      ...p,
-                      radius_meters: e.target.value,
-                    }))
-                  }
-                  className="w-full rounded-lg border border-slate-300 px-2 py-1.5 text-xs"
-                />
-              </div>
-            </div>
-            <button
-              type="button"
-              onClick={() => void saveLocationCoordinates()}
-              className="w-full py-2 rounded-lg bg-emerald-700 text-white text-xs font-bold"
+            <p
+              className={`text-[10px] font-semibold ${
+                faceStatus === "detected"
+                  ? "text-emerald-700"
+                  : faceStatus === "no_face"
+                  ? "text-rose-600"
+                  : "text-slate-500"
+              }`}
             >
-              Simpan Koordinat &amp; Radius
-            </button>
+              {faceText}
+            </p>
 
-            <div className="space-y-1">
-              {locations.map((loc) => (
-                <div
-                  key={loc.id}
-                  className="p-2 rounded-lg bg-slate-50 border border-slate-200/70 flex items-center justify-between text-[11px]"
+            {selfieCameraOn && (
+              <div className="space-y-1.5">
+                <div className="w-44 h-44 mx-auto rounded-xl overflow-hidden bg-black border-2 border-blue-600">
+                  <video
+                    ref={selfieVideoRef}
+                    playsInline
+                    muted
+                    className="w-full h-full object-cover scale-x-[-1]"
+                  />
+                </div>
+                <div className="grid grid-cols-2 gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => void takeSelfiePhoto()}
+                    className="py-2 rounded-lg bg-blue-600 text-white text-xs font-bold"
+                  >
+                    Ambil Selfie Wajah
+                  </button>
+                  <button
+                    type="button"
+                    onClick={stopSelfieCam}
+                    className="py-2 rounded-lg bg-slate-200 text-slate-800 text-xs font-bold"
+                  >
+                    Batal
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {!selfieCameraOn && (
+              <button
+                type="button"
+                disabled={employeeCooldown.locked}
+                onClick={() => void openSelfieCamera()}
+                className="w-full py-2 rounded-lg bg-slate-800 hover:bg-slate-900 disabled:opacity-45 text-white text-xs font-bold"
+              >
+                {capturedSelfie
+                  ? "Ambil Ulang Selfie Wajah"
+                  : "Buka Kamera Selfie Wajah"}
+              </button>
+            )}
+
+            {capturedSelfie && !selfieCameraOn && (
+              <div className="flex items-center gap-2">
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src={capturedSelfie}
+                  alt="Selfie Wajah"
+                  className="w-11 h-11 rounded-lg object-cover border border-emerald-500"
+                />
+                <span className="text-[11px] text-emerald-800 font-semibold">
+                  Selfie siap. Klik MASUK atau KELUAR.
+                </span>
+              </div>
+            )}
+            <canvas ref={selfieCanvasRef} className="hidden" />
+          </div>
+
+          {/* Ringkasan Absen Pribadi di Mode Karyawan */}
+          {isStaffDeviceLocked && (
+            <div className="pt-2 border-t border-slate-100 space-y-1">
+              <div className="text-[10px] font-bold text-slate-500 uppercase">
+                Riwayat Absen Saya
+              </div>
+              {myRecentEntries.length === 0 ? (
+                <div className="text-[11px] text-slate-400">
+                  Belum ada catatan absen.
+                </div>
+              ) : (
+                myRecentEntries.map((row, idx) => (
+                  <div
+                    key={`${row.client_uuid}-${idx}`}
+                    className="flex items-center justify-between text-[11px] bg-slate-50 px-2.5 py-1.5 rounded-lg"
+                  >
+                    <span className="font-bold">
+                      {row.entry_type === "CLOCK_IN" ? "MASUK" : "KELUAR"}
+                    </span>
+                    <span className="text-slate-600">
+                      {formatTimeInTz(row.punched_at, indoTz)}
+                    </span>
+                  </div>
+                ))
+              )}
+            </div>
+          )}
+        </section>
+
+        {/* Fitur Full Akses: Hanya Tampil di Server ADMIN & MANAGER (Tidak Bisa Diakses dari HP Karyawan) */}
+        {hasFullAccessServer && (
+          <>
+            {/* 2. Input Jadwal (.PDF / .XLSX / .CSV) */}
+            <section className="bg-white rounded-2xl p-3.5 border border-slate-200/80 shadow-sm space-y-2">
+              <h2 className="text-xs font-extrabold text-slate-800">
+                2. Input Jadwal (.PDF / .XLSX / .CSV)
+              </h2>
+              <div className="flex items-center gap-2 rounded-lg border border-slate-200 p-1.5 bg-slate-50">
+                <button
+                  type="button"
+                  onClick={() => scheduleInputRef.current?.click()}
+                  className="px-2.5 py-1 rounded bg-slate-200 hover:bg-slate-300 text-slate-800 text-[11px] font-bold shrink-0"
                 >
-                  <div>
-                    <div className="font-bold text-slate-800">{loc.name}</div>
-                    <div className="text-[10px] text-slate-500">
-                      Lat: {loc.latitude}, Lng: {loc.longitude} • Radius{" "}
-                      {loc.radius_meters}m
+                  Pilih File
+                </button>
+                <span className="text-[11px] text-slate-500 truncate">
+                  {scheduleFileName}
+                </span>
+                <input
+                  ref={scheduleInputRef}
+                  type="file"
+                  accept=".pdf,.xlsx,.xls,.csv,.txt"
+                  onChange={(e) => void handleScheduleUpload(e)}
+                  className="hidden"
+                />
+              </div>
+              {schedulePreview.length > 0 && (
+                <div className="space-y-1 pt-1">
+                  {schedulePreview.map((r, idx) => (
+                    <div
+                      key={`${r.emp_code}-${idx}`}
+                      className="text-[10px] bg-emerald-50 text-emerald-900 px-2.5 py-1 rounded flex justify-between font-semibold"
+                    >
+                      <span>
+                        {r.full_name} ({r.emp_code})
+                      </span>
+                      <span>Shift {r.shift_time}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </section>
+
+            {/* 3. Laporan & Data Absensi */}
+            <section className="bg-white rounded-2xl p-3.5 border border-slate-200/80 shadow-sm space-y-2.5">
+              <div className="flex items-center justify-between">
+                <h2 className="text-xs font-extrabold text-slate-800">
+                  3. Laporan &amp; Data Absensi:
+                </h2>
+                <select
+                  value={reportFilter}
+                  onChange={(e) =>
+                    setReportFilter(
+                      e.target.value as "Harian" | "Mingguan" | "Bulanan"
+                    )
+                  }
+                  className="rounded-lg border border-slate-300 px-2 py-1 text-[11px] font-semibold bg-white"
+                >
+                  <option value="Harian">Harian</option>
+                  <option value="Mingguan">Mingguan</option>
+                  <option value="Bulanan">Bulanan</option>
+                </select>
+              </div>
+
+              <div className="grid grid-cols-3 gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => exportReport("XLSX")}
+                  className="py-2 rounded-lg bg-emerald-700 text-white text-[11px] font-bold"
+                >
+                  Download XLSX
+                </button>
+                <button
+                  type="button"
+                  onClick={() => exportReport("PDF")}
+                  className="py-2 rounded-lg bg-rose-600 text-white text-[11px] font-bold"
+                >
+                  Download PDF
+                </button>
+                <button
+                  type="button"
+                  onClick={() => exportReport("CSV")}
+                  className="py-2 rounded-lg bg-slate-800 text-white text-[11px] font-bold"
+                >
+                  Download CSV
+                </button>
+              </div>
+
+              {editingUuid && (
+                <div className="p-2.5 rounded-xl bg-amber-50 border border-amber-300 space-y-2">
+                  <div className="text-[11px] font-extrabold text-amber-900">
+                    Edit Catatan Absensi
+                  </div>
+                  <div className="grid grid-cols-2 gap-1.5">
+                    <select
+                      value={editType}
+                      onChange={(e) =>
+                        setEditType(e.target.value as "CLOCK_IN" | "CLOCK_OUT")
+                      }
+                      className="rounded-lg border px-2 py-1.5 text-xs bg-white"
+                    >
+                      <option value="CLOCK_IN">MASUK</option>
+                      <option value="CLOCK_OUT">KELUAR</option>
+                    </select>
+                    <input
+                      type="datetime-local"
+                      value={editTimeLocal}
+                      onChange={(e) => setEditTimeLocal(e.target.value)}
+                      className="rounded-lg border px-2 py-1.5 text-xs bg-white"
+                    />
+                  </div>
+                  <input
+                    type="text"
+                    placeholder="Catatan edit"
+                    value={editNotes}
+                    onChange={(e) => setEditNotes(e.target.value)}
+                    className="w-full rounded-lg border px-2.5 py-1.5 text-xs bg-white"
+                  />
+                  <div className="flex gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => void commitEditEntry()}
+                      className="px-3 py-1 rounded-lg bg-emerald-600 text-white text-xs font-bold"
+                    >
+                      Simpan
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setEditingUuid(null)}
+                      className="px-3 py-1 rounded-lg bg-slate-200 text-slate-800 text-xs font-bold"
+                    >
+                      Batal
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              <div className="overflow-x-auto rounded-lg border border-slate-200">
+                <table className="w-full text-left border-collapse text-[10px]">
+                  <thead>
+                    <tr className="bg-[#0B1220] text-white">
+                      <th className="p-1.5">Tanggal</th>
+                      <th className="p-1.5">Nama</th>
+                      <th className="p-1.5">Jenis</th>
+                      <th className="p-1.5">Scan</th>
+                      <th className="p-1.5">Telat</th>
+                      <th className="p-1.5">Status</th>
+                      <th className="p-1.5">Mode</th>
+                      <th className="p-1.5">Aksi</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {filteredEntries.length === 0 ? (
+                      <tr>
+                        <td
+                          colSpan={8}
+                          className="p-4 text-center text-slate-400"
+                        >
+                          Belum ada data absensi
+                        </td>
+                      </tr>
+                    ) : (
+                      filteredEntries.map((item, idx) => {
+                        const emp = employees.find(
+                          (e) => Number(e.id) === Number(item.employee_id)
+                        );
+                        const lateM = calcLateMinutes(
+                          item.punched_at,
+                          emp?.shift_start_time || "07.00",
+                          indoTz
+                        );
+                        return (
+                          <tr
+                            key={`${item.client_uuid}-${idx}`}
+                            className="border-t border-slate-100"
+                          >
+                            <td className="p-1.5 whitespace-nowrap">
+                              {getDateStrInTz(item.punched_at, indoTz)}
+                            </td>
+                            <td className="p-1.5 font-semibold whitespace-nowrap">
+                              {item.full_name || emp?.full_name || "Karyawan"}
+                            </td>
+                            <td className="p-1.5 whitespace-nowrap">
+                              {item.entry_type === "CLOCK_IN"
+                                ? "MASUK"
+                                : "KELUAR"}
+                            </td>
+                            <td className="p-1.5 whitespace-nowrap">
+                              {formatTimeInTz(item.punched_at, indoTz)}
+                            </td>
+                            <td className="p-1.5 whitespace-nowrap">
+                              {lateM > 0 ? `${lateM}m` : "0m"}
+                            </td>
+                            <td className="p-1.5 whitespace-nowrap">
+                              {item.is_within_geofence === false
+                                ? "LUAR"
+                                : "HADIR"}
+                            </td>
+                            <td className="p-1.5 whitespace-nowrap">
+                              {item.mode || "BARCODE + KLIK"}
+                            </td>
+                            <td className="p-1.5 whitespace-nowrap space-x-1">
+                              <button
+                                type="button"
+                                onClick={() => startEditEntry(item)}
+                                className="px-1.5 py-0.5 rounded bg-amber-500 text-white font-bold"
+                              >
+                                Edit
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => void removeEntry(item)}
+                                className="px-1.5 py-0.5 rounded bg-rose-600 text-white font-bold"
+                              >
+                                Hapus
+                              </button>
+                            </td>
+                          </tr>
+                        );
+                      })
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </section>
+
+            {/* 4. QR Code Resmi Kantor Utama */}
+            <section className="bg-white rounded-2xl p-3.5 border-t-4 border-t-emerald-600 border border-slate-200/80 shadow-sm space-y-2.5 text-center">
+              <h2 className="text-xs font-extrabold text-slate-800 text-left">
+                4. QR Code Resmi Kantor Utama
+              </h2>
+              <p className="text-[10px] text-slate-500 text-left leading-relaxed">
+                Cetak atau tampilkan QR Code ini di lokasi kantor. Sistem
+                mengunci pemindaian agar karyawan hanya bisa absen{" "}
+                <b>MASUK</b> dan <b>KELUAR</b> memakai QR resmi ini.
+              </p>
+
+              <input
+                type="text"
+                value={officeQrCode}
+                onChange={(e) => {
+                  setOfficeQrCode(e.target.value);
+                  localStorage.setItem(QR_CODE_KEY, e.target.value);
+                }}
+                className="w-full rounded-lg border border-slate-200 px-2.5 py-1.5 text-[11px] font-bold text-center"
+              />
+
+              <div className="p-3 rounded-xl border border-slate-200 bg-white inline-block mx-auto">
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src={qrUrl}
+                  alt="QR Code Resmi Kantor Utama"
+                  className="w-40 h-40 mx-auto"
+                />
+                <div className="text-xs font-extrabold text-slate-900 mt-1.5">
+                  {officeQrCode}
+                </div>
+                <div className="text-[10px] text-slate-400">
+                  Radius GPS: Maks. {activeRadiusMeters} meter
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-2">
+                <a
+                  href={qrUrl}
+                  download={`${officeQrCode}.png`}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="py-2 rounded-lg bg-emerald-700 text-white text-xs font-bold"
+                >
+                  Download PNG
+                </a>
+                <button
+                  type="button"
+                  onClick={() => window.print()}
+                  className="py-2 rounded-lg bg-slate-900 text-white text-xs font-bold"
+                >
+                  Cetak QR
+                </button>
+              </div>
+            </section>
+
+            {/* 5. Panel Admin & Manager: Data Karyawan & Koordinat GPS */}
+            <section className="bg-white rounded-2xl p-3.5 border border-slate-200/80 shadow-sm space-y-2.5">
+              <h2 className="text-xs font-extrabold text-slate-800">
+                5. Panel {isManager ? "Manager" : "Admin"}: Data Karyawan
+              </h2>
+              <div className="space-y-1.5">
+                <input
+                  type="text"
+                  placeholder="ID (KRY-005)"
+                  value={empForm.emp_code}
+                  onChange={(e) =>
+                    setEmpForm((p) => ({ ...p, emp_code: e.target.value }))
+                  }
+                  className="w-full rounded-lg border border-slate-300 px-2.5 py-2 text-xs"
+                />
+                <input
+                  type="text"
+                  placeholder="Nama Lengkap"
+                  value={empForm.full_name}
+                  onChange={(e) =>
+                    setEmpForm((p) => ({ ...p, full_name: e.target.value }))
+                  }
+                  className="w-full rounded-lg border border-slate-300 px-2.5 py-2 text-xs"
+                />
+                <div className="grid grid-cols-3 gap-1.5">
+                  <select
+                    value={empForm.role}
+                    onChange={(e) =>
+                      setEmpForm((p) => ({
+                        ...p,
+                        role: e.target.value as RoleType,
+                      }))
+                    }
+                    className="rounded-lg border border-slate-300 px-2 py-1.5 text-xs bg-white"
+                  >
+                    <option value="STAFF">STAFF</option>
+                    <option value="MANAGER">MANAGER</option>
+                    {isAdmin && <option value="ADMIN">ADMIN</option>}
+                  </select>
+                  <input
+                    type="text"
+                    placeholder="PIN"
+                    value={empForm.pin_code}
+                    onChange={(e) =>
+                      setEmpForm((p) => ({ ...p, pin_code: e.target.value }))
+                    }
+                    className="rounded-lg border border-slate-300 px-2 py-1.5 text-xs"
+                  />
+                  <select
+                    value={empForm.shift_start_time}
+                    onChange={(e) =>
+                      setEmpForm((p) => ({
+                        ...p,
+                        shift_start_time: e.target.value,
+                      }))
+                    }
+                    className="rounded-lg border border-slate-300 px-2 py-1.5 text-xs bg-white"
+                  >
+                    {SHIFT_OPTIONS.map((opt) => (
+                      <option key={opt.time} value={opt.time}>
+                        {opt.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => void saveEmployee()}
+                  className="w-full py-2 rounded-lg bg-blue-600 text-white text-xs font-bold"
+                >
+                  {empForm.id ? "Simpan Edit Karyawan" : "Simpan Karyawan"}
+                </button>
+              </div>
+
+              <div className="space-y-1.5 pt-1">
+                {employees.map((emp) => (
+                  <div
+                    key={emp.id}
+                    className="p-2 rounded-lg bg-slate-50 border border-slate-200/70 flex items-center justify-between gap-1.5 text-xs"
+                  >
+                    <div>
+                      <span className="font-bold">{emp.full_name}</span> (
+                      {emp.emp_code}) • {emp.role} • Shift{" "}
+                      {emp.shift_start_time || "07.00"}
+                    </div>
+                    <div className="flex gap-1">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setEmpForm({
+                            id: emp.id,
+                            emp_code: emp.emp_code,
+                            full_name: emp.full_name,
+                            role: emp.role,
+                            department: emp.department,
+                            pin_code: emp.pin_code,
+                            shift_start_time: normalizeShiftTime(
+                              emp.shift_start_time
+                            ),
+                          })
+                        }
+                        className="px-2 py-0.5 rounded bg-amber-500 text-white text-[10px] font-bold"
+                      >
+                        Edit
+                      </button>
+                      {emp.role === "STAFF" && (
+                        <button
+                          type="button"
+                          onClick={() => void deleteEmployee(emp.id)}
+                          className="px-2 py-0.5 rounded bg-rose-600 text-white text-[10px] font-bold"
+                        >
+                          Hapus
+                        </button>
+                      )}
                     </div>
                   </div>
-                  <div className="flex gap-1">
+                ))}
+              </div>
+
+              {/* Koordinat Latitude, Longitude & Radius GPS */}
+              <div className="pt-2.5 border-t border-slate-200 space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <span className="text-[11px] font-extrabold text-slate-800">
+                    Koordinat Latitude, Longitude &amp; Radius
+                  </span>
+                  {gpsCoords && (
                     <button
                       type="button"
                       onClick={() =>
-                        setLocForm({
-                          id: loc.id,
-                          name: loc.name,
-                          latitude: String(loc.latitude),
-                          longitude: String(loc.longitude),
-                          radius_meters: String(loc.radius_meters),
-                        })
+                        setLocForm((p) => ({
+                          ...p,
+                          latitude: String(gpsCoords.lat),
+                          longitude: String(gpsCoords.lng),
+                        }))
                       }
-                      className="px-2 py-0.5 rounded bg-amber-500 text-white text-[10px] font-bold"
+                      className="text-[10px] font-bold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded"
                     >
-                      Edit
+                      Ambil GPS
                     </button>
-                    {locations.length > 1 && (
-                      <button
-                        type="button"
-                        onClick={() => void deleteLocation(loc.id)}
-                        className="px-2 py-0.5 rounded bg-rose-600 text-white text-[10px] font-bold"
-                      >
-                        Hapus
-                      </button>
-                    )}
-                  </div>
+                  )}
                 </div>
-              ))}
-            </div>
-          </div>
-        </section>
+                <input
+                  type="text"
+                  placeholder="Nama Lokasi"
+                  value={locForm.name}
+                  onChange={(e) =>
+                    setLocForm((p) => ({ ...p, name: e.target.value }))
+                  }
+                  className="w-full rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs"
+                />
+                <div className="grid grid-cols-3 gap-1.5">
+                  <input
+                    type="text"
+                    placeholder="Latitude"
+                    value={locForm.latitude}
+                    onChange={(e) =>
+                      setLocForm((p) => ({ ...p, latitude: e.target.value }))
+                    }
+                    className="rounded-lg border border-slate-300 px-2 py-1.5 text-xs"
+                  />
+                  <input
+                    type="text"
+                    placeholder="Longitude"
+                    value={locForm.longitude}
+                    onChange={(e) =>
+                      setLocForm((p) => ({ ...p, longitude: e.target.value }))
+                    }
+                    className="rounded-lg border border-slate-300 px-2 py-1.5 text-xs"
+                  />
+                  <input
+                    type="number"
+                    placeholder="Radius"
+                    value={locForm.radius_meters}
+                    onChange={(e) =>
+                      setLocForm((p) => ({
+                        ...p,
+                        radius_meters: e.target.value,
+                      }))
+                    }
+                    className="rounded-lg border border-slate-300 px-2 py-1.5 text-xs"
+                  />
+                </div>
+                <button
+                  type="button"
+                  onClick={() => void saveLocation()}
+                  className="w-full py-2 rounded-lg bg-emerald-700 text-white text-xs font-bold"
+                >
+                  Simpan Koordinat &amp; Radius
+                </button>
+              </div>
+            </section>
+          </>
+        )}
       </div>
     </div>
   );
