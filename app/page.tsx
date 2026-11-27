@@ -36,9 +36,9 @@ interface AbsenRecord {
   qr_id: string;
 }
 
-const KANTOR_LAT = -6.914744;
-const KANTOR_LNG = 109.712890;
-const MAX_RADIUS = 150;
+const KANTOR_LAT = -6,9148609;
+const KANTOR_LNG = 109,7446830;
+const MAX_RADIUS = 10;
 
 async function getLocalDB() {
   return openDB('AbsensiNeonDB', 2, {
