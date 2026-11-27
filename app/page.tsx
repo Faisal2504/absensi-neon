@@ -61,10 +61,10 @@ const DEFAULT_RADIUS = 2000;
 const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
 
 const SHIFT_OPTIONS = [
-  { label: "Shift Fleksibel", time: "FLEKSIBEL" },
   { label: "Shift Pagi (07.00)", time: "07.00" },
   { label: "Shift Siang (15.00)", time: "15.00" },
   { label: "Shift Malam (23.00)", time: "23.00" },
+  { label: "Shift Fleksibel", time: "FLEKSIBEL" },
 ];
 
 const CACHE_KEY = "absensi_v11_cache";
@@ -77,9 +77,13 @@ const AUTH_SERVER_KEY = "absensi_v11_auth_server";
 
 function normalizeShiftTime(raw?: string | null): string {
   const s = String(raw || "").trim();
-  if (!s) return "FLEKSIBEL";
+  if (!s) return "07.00";
   const lower = s.toLowerCase();
-  if (lower.includes("flex") || lower.includes("fleks") || lower.includes("bebas")) {
+  if (
+    lower.includes("flex") ||
+    lower.includes("fleks") ||
+    lower.includes("bebas")
+  ) {
     return "FLEKSIBEL";
   }
   if (s.includes("15:00") || s.includes("15.00") || lower.includes("siang")) {
@@ -114,7 +118,7 @@ const DEFAULT_EMPLOYEES: Employee[] = [
     role: "ADMIN",
     department: "Administrator",
     pin_code: "0000",
-    shift_start_time: "FLEKSIBEL",
+    shift_start_time: "07.00",
   },
   {
     id: 2,
@@ -123,7 +127,7 @@ const DEFAULT_EMPLOYEES: Employee[] = [
     role: "MANAGER",
     department: "Manajemen",
     pin_code: "2026",
-    shift_start_time: "FLEKSIBEL",
+    shift_start_time: "07.00",
   },
   {
     id: 3,
@@ -132,7 +136,7 @@ const DEFAULT_EMPLOYEES: Employee[] = [
     role: "STAFF",
     department: "Operasional",
     pin_code: "1111",
-    shift_start_time: "FLEKSIBEL",
+    shift_start_time: "07.00",
   },
 ];
 
@@ -175,25 +179,156 @@ const formatDateTimeLocalWIB = (iso?: string | null) => {
     .replace(" ", "T");
 };
 
-function calcLateMinutes(punchedIso: string, shiftStart = "FLEKSIBEL") {
-  const norm = normalizeShiftTime(shiftStart);
-  if (norm === "FLEKSIBEL") return 0;
-
+function getWibMinutesOfDay(iso: string): number {
   const parts = new Intl.DateTimeFormat("en-GB", {
     timeZone: "Asia/Jakarta",
     hour: "2-digit",
     minute: "2-digit",
     hour12: false,
   })
-    .format(new Date(punchedIso))
+    .format(new Date(iso))
     .split(":");
-  const actualMin = Number(parts[0]) * 60 + Number(parts[1]);
-  const [sh, sm] = norm.replace(".", ":").split(":").map(Number);
-  const startMin = (isNaN(sh) ? 7 : sh) * 60 + (isNaN(sm) ? 0 : sm);
-  return Math.max(0, actualMin - startMin);
+  return Number(parts[0]) * 60 + Number(parts[1]);
 }
 
-function haversineMeters(lat1: number, lon1: number, lat2: number, lon2: number) {
+function getEffectiveShiftStartMinutes(
+  punchedIso: string,
+  shiftStart = "07.00"
+): number | null {
+  const norm = normalizeShiftTime(shiftStart);
+  if (norm === "FLEKSIBEL") return null;
+
+  if (norm === "07.00" || norm === "15.00" || norm === "23.00") {
+    const fixedShifts = [
+      { label: "07.00", min: 7 * 60 },
+      { label: "15.00", min: 15 * 60 },
+      { label: "23.00", min: 23 * 60 },
+    ];
+    const matched = fixedShifts.find((s) => s.label === norm) || fixedShifts[0];
+    return matched.min;
+  }
+
+  const [sh, sm] = norm.replace(".", ":").split(":").map(Number);
+  if (isNaN(sh)) return getWibMinutesOfDay(punchedIso);
+  return sh * 60 + (isNaN(sm) ? 0 : sm);
+}
+
+function calcLateMinutes(punchedIso: string, shiftStart = "07.00"): number {
+  const shiftMin = getEffectiveShiftStartMinutes(punchedIso, shiftStart);
+  if (shiftMin === null) return 0;
+  const actualMin = getWibMinutesOfDay(punchedIso);
+  return Math.max(0, actualMin - shiftMin);
+}
+
+function unlockAudioContext() {
+  if (typeof window === "undefined") return;
+  try {
+    const AudioCtx =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext?: typeof AudioContext })
+        .webkitAudioContext;
+    if (!AudioCtx) return;
+    const ctx = new AudioCtx();
+    if (ctx.state === "suspended") {
+      void ctx.resume();
+    }
+  } catch {
+    // Abaikan jika gagal
+  }
+}
+
+function playMelodicRestChime() {
+  if (typeof window === "undefined") return;
+  try {
+    const AudioCtx =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext?: typeof AudioContext })
+        .webkitAudioContext;
+    if (!AudioCtx) return;
+    const ctx = new AudioCtx();
+    if (ctx.state === "suspended") {
+      void ctx.resume();
+    }
+    const notes = [523.25, 659.25, 783.99, 1046.5];
+    notes.forEach((freq, i) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = "sine";
+      osc.frequency.setValueAtTime(freq, ctx.currentTime + i * 0.14);
+      gain.gain.setValueAtTime(0.001, ctx.currentTime + i * 0.14);
+      gain.gain.exponentialRampToValueAtTime(
+        0.1,
+        ctx.currentTime + i * 0.14 + 0.04
+      );
+      gain.gain.exponentialRampToValueAtTime(
+        0.0001,
+        ctx.currentTime + i * 0.14 + 0.55
+      );
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(ctx.currentTime + i * 0.14);
+      osc.stop(ctx.currentTime + i * 0.14 + 0.6);
+    });
+  } catch {
+    // Abaikan jika audio diblokir
+  }
+}
+
+function speakIndonesian(text: string, opts?: { melodicRest?: boolean }) {
+  if (typeof window === "undefined") return;
+  if (opts?.melodicRest) {
+    playMelodicRestChime();
+  }
+  try {
+    if (!("speechSynthesis" in window)) return;
+    const synth = window.speechSynthesis;
+    synth.cancel();
+
+    const runSpeak = () => {
+      const utter = new SpeechSynthesisUtterance(text);
+      utter.lang = "id-ID";
+      utter.volume = 1;
+      utter.rate = opts?.melodicRest ? 0.92 : 0.98;
+      utter.pitch = opts?.melodicRest ? 1.24 : 1.05;
+
+      const voices = synth.getVoices();
+      const femaleIdVoice =
+        voices.find(
+          (v) =>
+            v.lang.toLowerCase().startsWith("id") &&
+            /female|wanita|gadis|siti|damayanti|ayu|nina|amelia/i.test(v.name)
+        ) ||
+        voices.find((v) => v.lang.toLowerCase().startsWith("id")) ||
+        voices.find((v) =>
+          /female|wanita|google bahasa indonesia/i.test(v.name)
+        );
+
+      if (femaleIdVoice) {
+        utter.voice = femaleIdVoice;
+      }
+      synth.speak(utter);
+    };
+
+    if (synth.getVoices().length === 0) {
+      synth.onvoiceschanged = () => {
+        synth.onvoiceschanged = null;
+        runSpeak();
+      };
+      window.setTimeout(runSpeak, 180);
+    } else {
+      runSpeak();
+    }
+  } catch {
+    // Abaikan jika TTS tidak didukung
+  }
+}
+
+function haversineMeters(
+  lat1: number,
+  lon1: number,
+  lat2: number,
+  lon2: number
+) {
   const R = 6371e3;
   const p1 = (lat1 * Math.PI) / 180;
   const p2 = (lat2 * Math.PI) / 180;
@@ -247,7 +382,7 @@ function parseScheduleLines(
     const timeMatch = line.match(
       /\b(07[:.]00|15[:.]00|23[:.]00|[012]?\d[:.]\d{2})\b/
     );
-    let shiftTime = "FLEKSIBEL";
+    let shiftTime = "07.00";
     if (timeMatch) {
       shiftTime = normalizeShiftTime(timeMatch[1]);
     } else if (lower.includes("siang")) {
@@ -316,7 +451,14 @@ function parseSavedLocation(raw: string | null): LocationItem | null {
     const lat = Number(p.latitude);
     const lng = Number(p.longitude);
     const rad = Math.max(10, Number(p.radius_meters) || DEFAULT_RADIUS);
-    if (!isNaN(lat) && !isNaN(lng) && lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180) {
+    if (
+      !isNaN(lat) &&
+      !isNaN(lng) &&
+      lat >= -90 &&
+      lat <= 90 &&
+      lng >= -180 &&
+      lng <= 180
+    ) {
       return {
         id: Number(p.id) || 1,
         name: String(p.name || "Kantor Utama"),
@@ -490,6 +632,17 @@ export default function AbsensiMultiServerPage() {
     "Arahkan wajah ke kamera depan lalu klik Ambil Foto Selfie."
   );
 
+  const [lateBanner, setLateBanner] = useState<{
+    employeeName: string;
+    lateMinutes: number;
+    shiftLabel: string;
+  } | null>(null);
+
+  const [inspectionMode, setInspectionMode] = useState<
+    "NONE" | "XLSX" | "PDF"
+  >("NONE");
+  const [inspectionNote, setInspectionNote] = useState("");
+
   const [scheduleFileName, setScheduleFileName] = useState(
     "Tidak ada file yang dipilih"
   );
@@ -515,7 +668,7 @@ export default function AbsensiMultiServerPage() {
     role: "STAFF" as RoleType,
     department: "Operasional",
     pin_code: "1234",
-    shift_start_time: "FLEKSIBEL",
+    shift_start_time: "07.00",
   });
   const [latInput, setLatInput] = useState<string>(
     String(boot.locations[0]?.latitude ?? DEFAULT_LAT)
@@ -732,7 +885,9 @@ export default function AbsensiMultiServerPage() {
               setLocations(nextLocs);
               setLatInput(String(nextLocs[0]?.latitude ?? DEFAULT_LAT));
               setLngInput(String(nextLocs[0]?.longitude ?? DEFAULT_LNG));
-              setRadiusInput(String(nextLocs[0]?.radius_meters ?? DEFAULT_RADIUS));
+              setRadiusInput(
+                String(nextLocs[0]?.radius_meters ?? DEFAULT_RADIUS)
+              );
 
               setServerEntries((prevEntries) => {
                 const nextEntries: TimeEntry[] = Array.isArray(data.entries)
@@ -781,7 +936,6 @@ export default function AbsensiMultiServerPage() {
     [notify, syncOfflineQueue]
   );
 
-  // Polling realtime setiap 2 detik di server Admin & Manager
   useEffect(() => {
     if (!isOnline || isKaryawanMode) return;
     const poller = window.setInterval(() => {
@@ -790,7 +944,6 @@ export default function AbsensiMultiServerPage() {
     return () => clearInterval(poller);
   }, [isOnline, isKaryawanMode, refreshServer]);
 
-  // Sinkronisasi cepat tiap 1,5 detik saat ada antrean offline
   useEffect(() => {
     if (!isOnline || offlineQueue.length === 0) return;
     const timer = window.setInterval(() => {
@@ -1112,6 +1265,7 @@ export default function AbsensiMultiServerPage() {
     typeOverride?: "CLOCK_IN" | "CLOCK_OUT",
     manualCodeOverride?: string
   ) => {
+    unlockAudioContext();
     if (!activeUser) return;
     const syncedNow = Date.now() + offsetRef.current;
     setNowMs(syncedNow);
@@ -1195,6 +1349,32 @@ export default function AbsensiMultiServerPage() {
     setFaceStatus("idle");
     setFaceText("Arahkan wajah ke kamera depan lalu klik Ambil Foto Selfie.");
 
+    if (entryType === "CLOCK_IN") {
+      const shiftVal = normalizeShiftTime(activeUser.shift_start_time);
+      const lateMins = calcLateMinutes(punchedAtIso, shiftVal);
+      if (lateMins > 0) {
+        const shiftDisp = shiftVal === "FLEKSIBEL" ? "07.00" : shiftVal;
+        setLateBanner({
+          employeeName: activeUser.full_name,
+          lateMinutes: lateMins,
+          shiftLabel: shiftDisp,
+        });
+        speakIndonesian(
+          `Perhatian, ${activeUser.full_name} terlambat ${lateMins} menit dari jam masuk ${shiftDisp}.`
+        );
+      } else {
+        setLateBanner(null);
+        speakIndonesian(
+          `Absen masuk ${activeUser.full_name} tercatat tepat waktu.`
+        );
+      }
+    } else {
+      setLateBanner(null);
+      speakIndonesian("terima kasih selamat beristirahat", {
+        melodicRest: true,
+      });
+    }
+
     if (navigator.onLine) {
       await syncOfflineQueue(nextQueue, true);
       await refreshServer(true);
@@ -1203,7 +1383,7 @@ export default function AbsensiMultiServerPage() {
       "ok",
       entryType === "CLOCK_IN"
         ? "Absen MASUK tercatat sesuai jam WIB!"
-        : "Absen KELUAR tercatat sesuai jam WIB!"
+        : "Terima kasih selamat beristirahat — Absen KELUAR tercatat!"
     );
   };
 
@@ -1256,10 +1436,8 @@ export default function AbsensiMultiServerPage() {
       if (item.entry_type === "CLOCK_IN") {
         inIds.add(Number(item.employee_id));
         if (
-          calcLateMinutes(
-            item.punched_at,
-            emp?.shift_start_time || "FLEKSIBEL"
-          ) > 0
+          calcLateMinutes(item.punched_at, emp?.shift_start_time || "07.00") >
+          0
         ) {
           lateCount++;
         }
@@ -1338,34 +1516,91 @@ export default function AbsensiMultiServerPage() {
     }
   };
 
+  const buildTimesheetHeaderHtml = () => {
+    const firstRow = filteredEntries[0];
+    const matchedEmp = firstRow
+      ? employees.find((e) => Number(e.id) === Number(firstRow.employee_id))
+      : staffList[0] || employees[0];
+    const memberName =
+      filteredEntries.length === 1
+        ? firstRow?.full_name || matchedEmp?.full_name || "JULDA REKSA ADI"
+        : "SEMUA ANGGOTA / REKAP";
+    const memberCode =
+      filteredEntries.length === 1
+        ? firstRow?.emp_code ||
+          matchedEmp?.emp_code ||
+          "JRA-SCRTY-MPI-22112026-0004"
+        : "ALL-SECURITY-BTG";
+
+    return {
+      memberName,
+      memberCode,
+      monthLabel: `01 November 2026 - 30 November 2026 (${reportFilter})`,
+    };
+  };
+
+  const runInspection = (format: "XLSX" | "PDF") => {
+    if (isKaryawanMode) return;
+    const totalRows = filteredEntries.length;
+    const validGeofence = filteredEntries.filter(
+      (r) => r.is_within_geofence !== false
+    ).length;
+    const totalLateMins = filteredEntries.reduce((acc, item) => {
+      if (item.entry_type !== "CLOCK_IN") return acc;
+      const emp = employees.find(
+        (e) => Number(e.id) === Number(item.employee_id)
+      );
+      return (
+        acc + calcLateMinutes(item.punched_at, emp?.shift_start_time || "07.00")
+      );
+    }, 0);
+
+    setInspectionMode(format);
+    setInspectionNote(
+      `Inspeksi ${format}: ${totalRows} baris data • Geofence valid ${validGeofence}/${totalRows} • Total telat ${totalLateMins} menit • Kop MURINDA - Timesheet Absensi Security Dormitory Batang siap.`
+    );
+    notify(
+      "ok",
+      `Inspeksi ${format} selesai: ${totalRows} baris data diperiksa.`
+    );
+  };
+
   const exportReport = (format: "XLSX" | "CSV" | "PDF") => {
     if (isKaryawanMode) return;
-    if (format === "PDF") {
-      window.print();
-      return;
-    }
+    const meta = buildTimesheetHeaderHtml();
+
     const headers = [
-      "Tanggal",
-      "Nama",
-      "Jenis",
-      "Scan",
-      "Telat",
-      "Status",
-      "Mode",
+      "TANGGAL",
+      "HARI",
+      "JAM MASUK",
+      "TERAKHIR KELUAR",
+      "JAM PENGGAJIAN",
+      "JAM REG",
+      "TELAT",
+      "STATUS",
+      "MODE",
     ];
+
     const rows = filteredEntries.map((item) => {
       const emp = employees.find(
         (e) => Number(e.id) === Number(item.employee_id)
       );
-      const lateMins = calcLateMinutes(
-        item.punched_at,
-        emp?.shift_start_time || "FLEKSIBEL"
-      );
+      const lateMins =
+        item.entry_type === "CLOCK_IN"
+          ? calcLateMinutes(item.punched_at, emp?.shift_start_time || "07.00")
+          : 0;
+      const dayName = new Date(item.punched_at).toLocaleDateString("id-ID", {
+        timeZone: "Asia/Jakarta",
+        weekday: "long",
+      });
+      const isIn = item.entry_type === "CLOCK_IN";
       return [
         getJakartaDateStr(item.punched_at),
-        item.full_name || emp?.full_name || "Karyawan",
-        item.entry_type === "CLOCK_IN" ? "MASUK" : "KELUAR",
-        formatTimeWIB(item.punched_at),
+        dayName,
+        isIn ? formatTimeWIB(item.punched_at) : "-",
+        !isIn ? formatTimeWIB(item.punched_at) : "-",
+        "0j 00m",
+        "0j 00m",
         lateMins > 0 ? `${lateMins}m` : "0m",
         item.is_within_geofence === false ? "LUAR RADIUS" : "HADIR",
         item.mode || "BARCODE + GPS",
@@ -1373,7 +1608,14 @@ export default function AbsensiMultiServerPage() {
     });
 
     if (format === "CSV") {
-      const csv = [headers, ...rows]
+      const csv = [
+        ["MURINDA", "Timesheet Absensi Security Dormitory Batang"],
+        ["Month", meta.monthLabel],
+        ["Anggota", meta.memberName],
+        ["Kode", meta.memberCode],
+        headers,
+        ...rows,
+      ]
         .map((r) =>
           r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(",")
         )
@@ -1382,22 +1624,38 @@ export default function AbsensiMultiServerPage() {
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `Laporan_Absensi_${reportFilter}_${todayStr}.csv`;
+      a.download = `Timesheet_Security_Dormitory_Batang_${reportFilter}_${todayStr}.csv`;
       a.click();
       URL.revokeObjectURL(url);
       return;
     }
 
-    const html = `<table border="1"><tr>${headers
+    const brandLogoSvg = `<svg width="136" height="28" viewBox="0 0 220 44" xmlns="http://www.w3.org/2000/svg"><text x="0" y="30" font-family="Arial Black, Arial, sans-serif" font-weight="900" font-size="28" fill="#111827" letter-spacing="1">MURINDA</text><path d="M148 26 L195 10 L176 28 L205 24 L156 36 Z" fill="#111827"/></svg>`;
+
+    const sheetHtml = `<!DOCTYPE html><html><head><meta charset="utf-8"/><title>Timesheet Absensi Security Dormitory Batang</title><style>body{font-family:Arial,sans-serif;color:#111827;padding:18px}.top{display:flex;align-items:center;gap:18px;border-bottom:2px solid #0f172a;padding-bottom:10px;margin-bottom:12px}.title{font-size:20px;font-weight:800;margin:0}.meta{margin-bottom:14px;font-size:12px;line-height:1.7}.meta td{border:none;padding:2px 10px 2px 0}.grid{width:100%;border-collapse:collapse;font-size:11px}.grid th{background:#0b1220;color:#fff;padding:7px 8px;border:1px solid #334155;text-align:left}.grid td{padding:6px 8px;border:1px solid #cbd5e1}</style></head><body><div class="top"><div>${brandLogoSvg}</div><h1 class="title">Timesheet Absensi Security Dormitory Batang</h1></div><table class="meta"><tr><td><b>Month</b></td><td>${meta.monthLabel}</td></tr><tr><td><b>Anggota</b></td><td>${meta.memberName}</td></tr><tr><td><b>Kode</b></td><td>${meta.memberCode}</td></tr></table><table class="grid"><thead><tr>${headers
       .map((h) => `<th>${h}</th>`)
-      .join("")}</tr>${rows
+      .join("")}</tr></thead><tbody>${rows
       .map((r) => `<tr>${r.map((c) => `<td>${c}</td>`).join("")}</tr>`)
-      .join("")}</table>`;
-    const blob = new Blob([html], { type: "application/vnd.ms-excel" });
+      .join("")}</tbody></table></body></html>`;
+
+    if (format === "PDF") {
+      const printWin = window.open("", "_blank", "width=960,height=700");
+      if (printWin) {
+        printWin.document.write(sheetHtml);
+        printWin.document.close();
+        printWin.focus();
+        printWin.print();
+      } else {
+        window.print();
+      }
+      return;
+    }
+
+    const blob = new Blob([sheetHtml], { type: "application/vnd.ms-excel" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `Laporan_Absensi_${reportFilter}_${todayStr}.xls`;
+    a.download = `MURINDA_Timesheet_Security_Dormitory_Batang_${reportFilter}_${todayStr}.xls`;
     a.click();
     URL.revokeObjectURL(url);
   };
@@ -1529,7 +1787,7 @@ export default function AbsensiMultiServerPage() {
               role: "STAFF",
               department: "Operasional",
               pin_code: "1234",
-              shift_start_time: "FLEKSIBEL",
+              shift_start_time: "07.00",
             });
             notify("ok", "Data karyawan disimpan.");
             return;
@@ -1552,7 +1810,7 @@ export default function AbsensiMultiServerPage() {
       role: "STAFF",
       department: "Operasional",
       pin_code: "1234",
-      shift_start_time: "FLEKSIBEL",
+      shift_start_time: "07.00",
     });
     notify("ok", "Data karyawan diperbarui.");
   };
@@ -1758,6 +2016,24 @@ export default function AbsensiMultiServerPage() {
           </div>
         )}
 
+        {lateBanner && (
+          <div className="p-3.5 rounded-2xl bg-rose-600 text-white shadow-md border-2 border-rose-200 space-y-1">
+            <div className="text-[11px] font-extrabold uppercase tracking-wider text-rose-100">
+              Peringatan Keterlambatan • Jam Masuk {lateBanner.shiftLabel}
+            </div>
+            <div className="text-lg sm:text-xl font-black leading-tight">
+              {lateBanner.employeeName} — Terlambat {lateBanner.lateMinutes} Menit
+            </div>
+            <button
+              type="button"
+              onClick={() => setLateBanner(null)}
+              className="text-[10px] font-bold underline text-rose-100 pt-0.5"
+            >
+              Tutup Pemberitahuan
+            </button>
+          </div>
+        )}
+
         <header className="bg-[#0B1220] text-white rounded-2xl p-3.5 shadow space-y-2.5">
           <div className="flex items-start justify-between gap-2">
             <div>
@@ -1796,8 +2072,12 @@ export default function AbsensiMultiServerPage() {
                 dbConnected ? "bg-emerald-600" : "bg-amber-600"
               }`}
             >
-              {isOnline ? (dbConnected ? "DB NEON AKTIF" : "MODE LOKAL") : "OFFLINE"} •
-              ANTREAN: {offlineQueue.length}
+              {isOnline
+                ? dbConnected
+                  ? "DB NEON AKTIF"
+                  : "MODE LOKAL"
+                : "OFFLINE"}{" "}
+              • ANTREAN: {offlineQueue.length}
             </span>
             <button
               type="button"
@@ -1865,8 +2145,8 @@ export default function AbsensiMultiServerPage() {
             >
               {staffList.map((emp) => (
                 <option key={emp.id} value={emp.id}>
-                  {emp.full_name} ({emp.emp_code}) • Shift{" "}
-                  {emp.shift_start_time || "FLEKSIBEL"}
+                  {emp.full_name} ({emp.emp_code}) • Jam Masuk{" "}
+                  {emp.shift_start_time || "07.00"}
                 </option>
               ))}
             </select>
@@ -1927,7 +2207,8 @@ export default function AbsensiMultiServerPage() {
           </div>
 
           <div className="text-[11px] text-slate-500">
-            Jadwal Masuk: {activeUser?.shift_start_time || "FLEKSIBEL"}
+            Jam Masuk: 07.00 / 15.00 / 23.00 • Jadwal:{" "}
+            {activeUser?.shift_start_time || "07.00"}
           </div>
           <div className="text-[11px] font-bold text-emerald-700">
             {geofenceLabel}
@@ -1953,6 +2234,7 @@ export default function AbsensiMultiServerPage() {
               type="button"
               disabled={cooldownInfo.locked}
               onClick={() => {
+                unlockAudioContext();
                 setSelectedAction("CLOCK_IN");
                 void submitAttendance("CLOCK_IN");
               }}
@@ -1968,6 +2250,7 @@ export default function AbsensiMultiServerPage() {
               type="button"
               disabled={cooldownInfo.locked}
               onClick={() => {
+                unlockAudioContext();
                 setSelectedAction("CLOCK_OUT");
                 void submitAttendance("CLOCK_OUT");
               }}
@@ -2196,6 +2479,48 @@ export default function AbsensiMultiServerPage() {
                 </select>
               </div>
 
+              <div className="p-2 rounded-xl bg-slate-50 border border-slate-200 space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <span className="text-[10px] font-extrabold text-slate-700 uppercase">
+                    Inspeksi Laporan (MURINDA • Security Dormitory Batang)
+                  </span>
+                  <span className="text-[9px] font-bold text-emerald-700 bg-emerald-100 px-1.5 py-0.5 rounded">
+                    ADMIN INSPEKSI
+                  </span>
+                </div>
+                <div className="grid grid-cols-2 gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => runInspection("XLSX")}
+                    className="py-1.5 rounded-lg bg-teal-700 text-white text-[10px] font-bold"
+                  >
+                    Inspeksi XLSX
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => runInspection("PDF")}
+                    className="py-1.5 rounded-lg bg-indigo-700 text-white text-[10px] font-bold"
+                  >
+                    Inspeksi PDF
+                  </button>
+                </div>
+                {inspectionMode !== "NONE" && (
+                  <div className="p-2 rounded-lg bg-white border border-slate-200 text-[10px] text-slate-700 space-y-1">
+                    <div className="font-extrabold text-slate-900">
+                      MURINDA — Timesheet Absensi Security Dormitory Batang
+                    </div>
+                    <div>{inspectionNote}</div>
+                    <button
+                      type="button"
+                      onClick={() => setInspectionMode("NONE")}
+                      className="text-[9px] font-bold underline text-slate-500"
+                    >
+                      Tutup Inspeksi
+                    </button>
+                  </div>
+                )}
+              </div>
+
               <div className="grid grid-cols-3 gap-1.5">
                 <button
                   type="button"
@@ -2298,10 +2623,13 @@ export default function AbsensiMultiServerPage() {
                         const emp = employees.find(
                           (e) => Number(e.id) === Number(item.employee_id)
                         );
-                        const lateM = calcLateMinutes(
-                          item.punched_at,
-                          emp?.shift_start_time || "FLEKSIBEL"
-                        );
+                        const lateM =
+                          item.entry_type === "CLOCK_IN"
+                            ? calcLateMinutes(
+                                item.punched_at,
+                                emp?.shift_start_time || "07.00"
+                              )
+                            : 0;
                         return (
                           <tr
                             key={`${item.client_uuid}-${idx}`}
@@ -2321,7 +2649,7 @@ export default function AbsensiMultiServerPage() {
                             <td className="p-1.5 whitespace-nowrap">
                               {formatTimeWIB(item.punched_at)}
                             </td>
-                            <td className="p-1.5 whitespace-nowrap">
+                            <td className="p-1.5 whitespace-nowrap font-bold text-rose-600">
                               {lateM > 0 ? `${lateM}m` : "0m"}
                             </td>
                             <td className="p-1.5 whitespace-nowrap">
@@ -2495,8 +2823,8 @@ export default function AbsensiMultiServerPage() {
                   >
                     <div>
                       <span className="font-bold">{emp.full_name}</span> (
-                      {emp.emp_code}) • {emp.role} • Shift{" "}
-                      {emp.shift_start_time || "FLEKSIBEL"}
+                      {emp.emp_code}) • {emp.role} • Jam Masuk{" "}
+                      {emp.shift_start_time || "07.00"}
                     </div>
                     <div className="flex gap-1">
                       <button
