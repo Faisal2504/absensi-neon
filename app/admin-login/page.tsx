@@ -17,6 +17,8 @@ interface PrivilegedAccount {
 const CACHE_KEY = "absensi_v11_cache";
 const AUTH_SERVER_KEY = "absensi_v11_auth_server";
 const PRIVILEGED_SESSION_KEY = "absensi_v11_privileged_session";
+const DEVICE_LOCK_KEY = "absensi_v11_device_locked_karyawan";
+const STAFF_SESSION_KEY = "absensi_v11_staff_logged_in";
 
 const DEFAULT_PRIVILEGED_ACCOUNTS: PrivilegedAccount[] = [
   {
@@ -202,6 +204,7 @@ export default function AdminManagerLoginPage() {
     );
     setPinInput("");
     setErrorMsg("");
+    setIsSubmitting(false);
   };
 
   const wibClockText = useMemo(
@@ -251,6 +254,9 @@ export default function AdminManagerLoginPage() {
     }
 
     try {
+      // Hapus kunci mode karyawan di browser ini agar tidak memblokir masuk Admin/Manager
+      localStorage.removeItem(DEVICE_LOCK_KEY);
+      localStorage.removeItem(STAFF_SESSION_KEY);
       localStorage.setItem(AUTH_SERVER_KEY, selectedRole);
       localStorage.setItem(
         PRIVILEGED_SESSION_KEY,
@@ -268,8 +274,8 @@ export default function AdminManagerLoginPage() {
     }
 
     const destination =
-      selectedRole === "MANAGER" ? "/?server=manager" : "/";
-    window.location.assign(destination);
+      selectedRole === "MANAGER" ? "/?server=manager" : "/?server=admin";
+    window.location.replace(destination);
   };
 
   return (
@@ -399,7 +405,7 @@ export default function AdminManagerLoginPage() {
               Buka Login Karyawan
             </a>
             <a
-              href="/"
+              href="/?server=admin"
               className="font-bold text-slate-600 hover:underline"
             >
               Kembali ke Utama
