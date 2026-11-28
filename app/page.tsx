@@ -1589,41 +1589,78 @@ export default function AbsensiMultiServerPage() {
     );
   }, [serverEntries, offlineQueue]);
 
-  const cooldownInfo = useMemo(() => {
+  const todayStr = getJakartaDateStr(syncedIsoNow);
+
+  // Aturan: setiap anggota & Admin hanya bisa absen MASUK 1x dan KELUAR 1x per hari (kecuali dihapus Admin),
+  // serta tetap terkena jeda minimal 6 jam setelah absen.
+  const attendanceGuard = useMemo(() => {
     if (!activeUser) {
       return {
-        lockedSameAction: false,
+        hasClockInToday: false,
+        hasClockOutToday: false,
+        inCooldown: false,
         remainingText: "",
         lastEntry: null as TimeEntry | null,
       };
     }
-    const mine = allEntries
+
+    const mineAll = allEntries
       .filter((e) => Number(e.employee_id) === Number(activeUser.id))
       .sort(
         (a, b) =>
           new Date(b.punched_at).getTime() - new Date(a.punched_at).getTime()
       );
-    const last = mine[0] || null;
+
+    const mineToday = mineAll.filter(
+      (e) => getJakartaDateStr(e.punched_at) === todayStr
+    );
+
+    const hasClockInToday = mineToday.some((e) => e.entry_type === "CLOCK_IN");
+    const hasClockOutToday = mineToday.some((e) => e.entry_type === "CLOCK_OUT");
+
+    const last = mineAll[0] || null;
     if (!last) {
-      return { lockedSameAction: false, remainingText: "", lastEntry: null };
+      return {
+        hasClockInToday,
+        hasClockOutToday,
+        inCooldown: false,
+        remainingText: "",
+        lastEntry: null,
+      };
     }
+
     const diff = nowMs - new Date(last.punched_at).getTime();
     if (diff >= 0 && diff < SIX_HOURS_MS) {
       const remMins = Math.ceil((SIX_HOURS_MS - diff) / 60000);
       const h = Math.floor(remMins / 60);
       const m = remMins % 60;
       return {
-        lockedSameAction: true,
+        hasClockInToday,
+        hasClockOutToday,
+        inCooldown: true,
         remainingText: h > 0 ? `${h} jam ${m} menit` : `${m} menit`,
         lastEntry: last,
       };
     }
-    return { lockedSameAction: false, remainingText: "", lastEntry: last };
-  }, [activeUser, allEntries, nowMs]);
 
-  const isActionLocked = (actionType: "CLOCK_IN" | "CLOCK_OUT") =>
-    cooldownInfo.lockedSameAction &&
-    cooldownInfo.lastEntry?.entry_type === actionType;
+    return {
+      hasClockInToday,
+      hasClockOutToday,
+      inCooldown: false,
+      remainingText: "",
+      lastEntry: last,
+    };
+  }, [activeUser, allEntries, todayStr, nowMs]);
+
+  const isActionLocked = (actionType: "CLOCK_IN" | "CLOCK_OUT") => {
+    if (actionType === "CLOCK_IN" && attendanceGuard.hasClockInToday) {
+      return true;
+    }
+    if (actionType === "CLOCK_OUT" && attendanceGuard.hasClockOutToday) {
+      return true;
+    }
+    return attendanceGuard.inCooldown;
+  };
 
   const startScannerCamera = async () => {
     try {
@@ -1822,12 +1859,32 @@ export default function AbsensiMultiServerPage() {
 
     const entryType = typeOverride || selectedAction;
 
-    if (isActionLocked(entryType)) {
+    if (
+      entryType === "CLOCK_IN" &&
+      attendanceGuard.hasClockInToday
+    ) {
       notify(
         "err",
-        `Sudah absen ${
-          entryType === "CLOCK_IN" ? "MASUK" : "KELUAR"
-        }. Ulangi setelah 6 jam (sisa ${cooldownInfo.remainingText}).`
+        "Sudah absen MASUK 1 kali hari ini (tidak bisa absen ganda). Hubungi Admin jika perlu reset/hapus data."
+      );
+      return;
+    }
+
+    if (
+      entryType === "CLOCK_OUT" &&
+      attendanceGuard.hasClockOutToday
+    ) {
+      notify(
+        "err",
+        "Sudah absen KELUAR 1 kali hari ini (tidak bisa absen ganda). Hubungi Admin jika perlu reset/hapus data."
+      );
+      return;
+    }
+
+    if (attendanceGuard.inCooldown) {
+      notify(
+        "err",
+        `Harus menunggu 6 jam setelah absen terakhir (sisa ${attendanceGuard.remainingText}).`
       );
       return;
     }
@@ -1991,8 +2048,6 @@ export default function AbsensiMultiServerPage() {
       notify("err", `PIN ${serverMode} salah.`);
     }
   };
-
-  const todayStr = getJakartaDateStr(syncedIsoNow);
 
   const latestLateAlertToday = useMemo(() => {
     const todayIns = allEntries
@@ -2489,17 +2544,34 @@ export default function AbsensiMultiServerPage() {
 
   const removeEntry = async (item: TimeEntry) => {
     if (isKaryawanMode) return;
-    setServerEntries((prev) =>
-      prev.filter(
-        (x) =>
-          x.client_uuid !== item.client_uuid && (!item.id || x.id !== item.id)
-      )
+    const nextServer = serverEntries.filter(
+      (x) =>
+        x.client_uuid !== item.client_uuid && (!item.id || x.id !== item.id)
     );
-    setOfflineQueue((prev) => {
-      const next = prev.filter((x) => x.client_uuid !== item.client_uuid);
-      localStorage.setItem(QUEUE_KEY, JSON.stringify(next));
-      return next;
-    });
+    const nextQueue = offlineQueue.filter(
+      (x) => x.client_uuid !== item.client_uuid
+    );
+
+    setServerEntries(nextServer);
+    setOfflineQueue(nextQueue);
+    localStorage.setItem(QUEUE_KEY, JSON.stringify(nextQueue));
+
+    try {
+      const rawCache = localStorage.getItem(CACHE_KEY);
+      if (rawCache) {
+        const parsedCache = JSON.parse(rawCache);
+        localStorage.setItem(
+          CACHE_KEY,
+          JSON.stringify({
+            ...parsedCache,
+            entries: nextServer,
+          })
+        );
+      }
+    } catch {
+      // Abaikan error cache
+    }
+
     if (navigator.onLine) {
       try {
         await fetch("/api/absen", {
@@ -2515,7 +2587,10 @@ export default function AbsensiMultiServerPage() {
         // Abaikan error
       }
     }
-    notify("ok", "Data absen dihapus.");
+    notify(
+      "ok",
+      "Data absen dihapus — status absen anggota tersebut terbuka kembali."
+    );
   };
 
   const saveEmployee = async () => {
@@ -3137,16 +3212,23 @@ export default function AbsensiMultiServerPage() {
             {targetLocation.longitude} • Radius {targetLocation.radius_meters}m
           </div>
 
-          {cooldownInfo.lockedSameAction && (
+          {(attendanceGuard.hasClockInToday ||
+            attendanceGuard.hasClockOutToday ||
+            attendanceGuard.inCooldown) && (
             <div className="p-2 rounded-xl bg-amber-50 border border-amber-300 text-[11px] font-bold text-amber-900">
-              Terakhir absen{" "}
-              {cooldownInfo.lastEntry?.entry_type === "CLOCK_IN"
-                ? "MASUK"
-                : "KELUAR"}
+              Status Hari Ini ({activeUser?.full_name}):{" "}
+              {attendanceGuard.hasClockInToday ? "MASUK (1/1)" : "MASUK (0/1)"} •{" "}
+              {attendanceGuard.hasClockOutToday
+                ? "KELUAR (1/1)"
+                : "KELUAR (0/1)"}
+              {attendanceGuard.inCooldown
+                ? ` • Jeda 6 jam: sisa ${attendanceGuard.remainingText}`
+                : ""}
               .{" "}
-              {cooldownInfo.lastEntry?.entry_type === "CLOCK_IN"
-                ? "Silakan buka kamera depan & klik KELUAR saat jam pulang."
-                : `Absen KELUAR ulang tersedia setelah 6 jam (sisa ${cooldownInfo.remainingText}).`}
+              {attendanceGuard.hasClockInToday &&
+              attendanceGuard.hasClockOutToday
+                ? "Absen masuk & keluar hari ini sudah lengkap (tidak bisa ganda, kecuali dihapus Admin)."
+                : ""}
             </div>
           )}
 
