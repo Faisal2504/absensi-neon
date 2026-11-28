@@ -7,11 +7,11 @@ export const metadata: Metadata = {
   manifest: "/manifest.json?v=6",
   icons: {
     icon: [
-      { url: "/Logo%20Absensi%20Cepat%20Emas%20Pink.png?v=6", sizes: "192x192", type: "image/png" },
-      { url: "/Logo%20Absensi%20Cepat%20Emas%20Pink.png?v=6", sizes: "512x512", type: "image/png" },
+      { url: "/fast-absensi-pro-mfr.png?v=6", sizes: "192x192", type: "image/png" },
+      { url: "/fast-absensi-pro-mfr.png?v=6", sizes: "512x512", type: "image/png" },
     ],
-    shortcut: [{ url: "/Logo%20Absensi%20Cepat%20Emas%20Pink.png?v=6", type: "image/png" }],
-    apple: [{ url: "/Logo%20Absensi%20Cepat%20Emas%20Pink.png?v=6", sizes: "180x180", type: "image/png" }],
+    shortcut: [{ url: "/fast-absensi-pro-mfr.png?v=6", type: "image/png" }],
+    apple: [{ url: "/fast-absensi-pro-mfr.png?v=6", sizes: "180x180", type: "image/png" }],
   },
 };
 
