@@ -70,6 +70,15 @@ interface ParsedScheduleItem {
   weekly?: Partial<WeeklyScheduleMap>;
 }
 
+interface UploadedSchedulePoster {
+  fileName: string;
+  uploadedAt: string;
+  uploadedBy: string;
+  imageDataUrl: string;
+  pdfDataUrl?: string;
+  summaryRows: ParsedScheduleItem[];
+}
+
 interface FaceDetectorInstance {
   detect: (
     image: HTMLVideoElement | HTMLCanvasElement | HTMLImageElement
@@ -91,7 +100,7 @@ const APP_LOGO_SRC = "/fast-absensi-pro-mfr.png";
 
 const DEFAULT_LAT = -6.9148609;
 const DEFAULT_LNG = 109.744683;
-const DEFAULT_RADIUS = 800;
+const DEFAULT_RADIUS = 2000;
 const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
 const LATE_GRACE_MINUTES = 5;
 
@@ -158,6 +167,7 @@ const QUEUE_KEY = "absensi_v11_queue";
 const QR_CODE_KEY = "absensi_v11_qr";
 const LOC_KEY = "absensi_v11_custom_loc";
 const WEEKLY_SCHED_KEY = "absensi_v11_weekly_sched";
+const SCHEDULE_POSTER_KEY = "absensi_v11_schedule_poster";
 const DEVICE_LOCK_KEY = "absensi_v11_device_locked_karyawan";
 const STAFF_EMP_KEY = "absensi_v11_staff_emp_id";
 const STAFF_SESSION_KEY = "absensi_v11_staff_logged_in";
@@ -247,6 +257,21 @@ function loadDeviceRegistry(): Record<string, DeviceSystemInfo> {
   } catch {
     return {};
   }
+}
+
+function loadSchedulePoster(): UploadedSchedulePoster | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = localStorage.getItem(SCHEDULE_POSTER_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && parsed.imageDataUrl) {
+      return parsed as UploadedSchedulePoster;
+    }
+  } catch {
+    // Abaikan
+  }
+  return null;
 }
 
 function buildDefaultWeeklySchedule(defaultCode: ShiftCode = "P"): WeeklyScheduleMap {
@@ -813,6 +838,157 @@ function parseScheduleLines(lines: string[]): ParsedScheduleItem[] {
   return parsed;
 }
 
+// Render gambar poster/board jadwal keberangkatan mingguan dari PDF yang diunggah Admin
+function renderDepartureBoardPosterDataUrl(
+  fileName: string,
+  uploadedAtLabel: string,
+  staffEmployees: Employee[],
+  parsedItems: ParsedScheduleItem[]
+): string {
+  if (typeof document === "undefined") return "";
+  const width = 920;
+  const rowH = 44;
+  const headerH = 142;
+  const footerH = 46;
+  const rowsToDraw =
+    staffEmployees.length > 0
+      ? staffEmployees
+      : DEFAULT_EMPLOYEES.filter((e) => e.role === "STAFF");
+  const height = headerH + rowsToDraw.length * rowH + footerH;
+
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return "";
+
+  ctx.fillStyle = "#FFFFFF";
+  ctx.fillRect(0, 0, width, height);
+
+  ctx.fillStyle = "#082A63";
+  ctx.fillRect(0, 0, width, 86);
+
+  ctx.fillStyle = "#FFFFFF";
+  ctx.font = "900 22px sans-serif";
+  ctx.fillText("JADWAL KEBERANGKATAN MINGGUAN KARYAWAN", 22, 34);
+
+  ctx.fillStyle = "#BAE6FD";
+  ctx.font = "bold 13px sans-serif";
+  ctx.fillText(
+    `SECURITY DORMITORY BATANG • Sumber PDF Admin: ${fileName}`,
+    22,
+    58
+  );
+
+  ctx.fillStyle = "#93C5FD";
+  ctx.font = "11px monospace";
+  ctx.fillText(`Diunggah Admin: ${uploadedAtLabel}`, 22, 76);
+
+  ctx.fillStyle = "#F1F5F9";
+  ctx.fillRect(0, 86, width, 24);
+  ctx.fillStyle = "#0F172A";
+  ctx.font = "bold 11px sans-serif";
+  ctx.fillText(
+    "KETERANGAN SHIFT:   [ P ] Pagi: 07.00 - 15.00 WIB   |   [ S ] Siang: 15.00 - 23.00 WIB   |   [ M ] Malam: 23.00 - 07.00 WIB   |   [ OFF ] Libur",
+    22,
+    102
+  );
+
+  const colNameW = 290;
+  const dayColW = (width - colNameW) / 7;
+  const tblHeaderY = 110;
+  ctx.fillStyle = "#0F172A";
+  ctx.fillRect(0, tblHeaderY, width, 32);
+
+  ctx.fillStyle = "#FFFFFF";
+  ctx.font = "bold 12px sans-serif";
+  ctx.fillText("NAMA & ID ANGGOTA", 18, tblHeaderY + 20);
+
+  DAYS_OF_WEEK.forEach((day, idx) => {
+    const x = colNameW + idx * dayColW;
+    ctx.fillText(day.toUpperCase(), x + 16, tblHeaderY + 20);
+  });
+
+  rowsToDraw.forEach((emp, rIdx) => {
+    const y = headerH + rIdx * rowH;
+    ctx.fillStyle = rIdx % 2 === 0 ? "#FFFFFF" : "#F8FAFC";
+    ctx.fillRect(0, y, width, rowH);
+
+    ctx.strokeStyle = "#CBD5E1";
+    ctx.lineWidth = 1;
+    ctx.strokeRect(0, y, width, rowH);
+
+    ctx.fillStyle = "#0F172A";
+    ctx.font = "bold 13px sans-serif";
+    ctx.fillText(emp.full_name, 16, y + 19);
+
+    ctx.fillStyle = "#475569";
+    ctx.font = "10px monospace";
+    ctx.fillText(emp.emp_code, 16, y + 34);
+
+    const matchedParsed = parsedItems.find(
+      (p) =>
+        p.emp_code.toUpperCase() === emp.emp_code.toUpperCase() ||
+        p.full_name.toLowerCase() === emp.full_name.toLowerCase()
+    );
+    const wk: WeeklyScheduleMap = {
+      ...(emp.weekly_schedule ||
+        buildDefaultWeeklySchedule(shiftTimeToCode(emp.shift_start_time))),
+      ...(matchedParsed?.weekly || {}),
+    };
+
+    DAYS_OF_WEEK.forEach((day, dIdx) => {
+      const code: ShiftCode = wk[day] || "P";
+      const cellX = colNameW + dIdx * dayColW;
+      ctx.strokeRect(cellX, y, dayColW, rowH);
+
+      const badgeX = cellX + 12;
+      const badgeY = y + 8;
+      const badgeW = dayColW - 24;
+      const badgeH = rowH - 16;
+
+      if (code === "OFF") {
+        ctx.fillStyle = "#FEE2E2";
+      } else if (code === "P") {
+        ctx.fillStyle = "#DBEAFE";
+      } else if (code === "S") {
+        ctx.fillStyle = "#FEF3C7";
+      } else {
+        ctx.fillStyle = "#E0E7FF";
+      }
+      ctx.fillRect(badgeX, badgeY, badgeW, badgeH);
+
+      ctx.fillStyle =
+        code === "OFF"
+          ? "#B91C1C"
+          : code === "P"
+          ? "#1D4ED8"
+          : code === "S"
+          ? "#B45309"
+          : "#3730A3";
+      ctx.font = "900 12px sans-serif";
+      const label =
+        code === "OFF"
+          ? "OFF"
+          : `${code} (${SHIFT_PRESETS[code].start})`;
+      ctx.fillText(label, badgeX + 8, badgeY + 18);
+    });
+  });
+
+  const footerY = headerH + rowsToDraw.length * rowH;
+  ctx.fillStyle = "#082A63";
+  ctx.fillRect(0, footerY, width, footerH);
+  ctx.fillStyle = "#E2E8F0";
+  ctx.font = "bold 11px sans-serif";
+  ctx.fillText(
+    "Tampil Otomatis di Board Aplikasi Admin & Aplikasi Karyawan • Wajib Hadir Maksimal +5 Menit Toleransi",
+    22,
+    footerY + 27
+  );
+
+  return canvas.toDataURL("image/png");
+}
+
 function parseSavedLocation(raw: string | null): LocationItem | null {
   if (!raw) return null;
   try {
@@ -867,6 +1043,7 @@ function getInitialBoot() {
       employees: DEFAULT_EMPLOYEES,
       locations: DEFAULT_LOCATIONS,
       entries: [] as TimeEntry[],
+      schedulePoster: null as UploadedSchedulePoster | null,
     };
   }
 
@@ -882,6 +1059,7 @@ function getInitialBoot() {
   let isDeviceLockedKaryawan = false;
   let serverMode: ServerMode = "ADMIN";
   let isAuthenticatedPrivileged = false;
+  const schedulePoster = loadSchedulePoster();
 
   try {
     const params = new URLSearchParams(window.location.search);
@@ -967,6 +1145,7 @@ function getInitialBoot() {
     employees,
     locations,
     entries,
+    schedulePoster,
   };
 }
 
@@ -1039,11 +1218,15 @@ export default function AbsensiMultiServerPage() {
   const [inspectionNote, setInspectionNote] = useState("");
 
   const [scheduleFileName, setScheduleFileName] = useState(
-    "Tidak ada file yang dipilih"
+    boot.schedulePoster?.fileName || "Tidak ada file yang dipilih"
   );
   const [schedulePreview, setSchedulePreview] = useState<ParsedScheduleItem[]>(
-    []
+    boot.schedulePoster?.summaryRows || []
   );
+  const [schedulePoster, setSchedulePoster] =
+    useState<UploadedSchedulePoster | null>(boot.schedulePoster);
+  const [scheduleImageZoomOpen, setScheduleImageZoomOpen] =
+    useState<boolean>(false);
 
   const [reportFilter, setReportFilter] = useState<
     "Harian" | "Mingguan" | "Bulanan"
@@ -1178,6 +1361,13 @@ export default function AbsensiMultiServerPage() {
     [activeUser, syncedIsoNow]
   );
 
+  const activeUserWeeklySchedule = useMemo<WeeklyScheduleMap>(() => {
+    return (
+      activeUser?.weekly_schedule ||
+      buildDefaultWeeklySchedule(shiftTimeToCode(activeUser?.shift_start_time))
+    );
+  }, [activeUser]);
+
   const isKaryawanMode = isDeviceLockedKaryawan || serverMode === "KARYAWAN";
   const isManagerServer = !isKaryawanMode && serverMode === "MANAGER";
   const isAdminServer = !isKaryawanMode && serverMode === "ADMIN";
@@ -1256,6 +1446,11 @@ export default function AbsensiMultiServerPage() {
 
   const refreshServer = useCallback(
     async (silent = false) => {
+      const latestPoster = loadSchedulePoster();
+      if (latestPoster) {
+        setSchedulePoster(latestPoster);
+      }
+
       if (!navigator.onLine) {
         setNowMs(Date.now() + offsetRef.current);
         if (!silent) notify("warn", "Offline: jam WIB tersinkronisasi lokal.");
@@ -1283,6 +1478,13 @@ export default function AbsensiMultiServerPage() {
           const data = await res.json();
           if (data?.ok) {
             setDbConnected(Boolean(data.dbConnected));
+            if (data.schedulePoster && data.schedulePoster.imageDataUrl) {
+              setSchedulePoster(data.schedulePoster);
+              localStorage.setItem(
+                SCHEDULE_POSTER_KEY,
+                JSON.stringify(data.schedulePoster)
+              );
+            }
             const weeklyMap = loadWeeklySchedulesMap();
             const devReg = loadDeviceRegistry();
             setEmployees((prevEmps) => {
@@ -1451,11 +1653,27 @@ export default function AbsensiMultiServerPage() {
         flushNow();
       }
     };
+    const onStorageSync = (ev: StorageEvent) => {
+      if (ev.key === SCHEDULE_POSTER_KEY && ev.newValue) {
+        try {
+          setSchedulePoster(JSON.parse(ev.newValue));
+        } catch {
+          // Abaikan
+        }
+      }
+      if (ev.key === WEEKLY_SCHED_KEY) {
+        const wm = loadWeeklySchedulesMap();
+        setEmployees((prev) =>
+          ensureLockedEmployees(prev, wm, loadDeviceRegistry())
+        );
+      }
+    };
 
     window.addEventListener("online", onOnline);
     window.addEventListener("offline", onOffline);
     window.addEventListener("focus", flushNow);
     window.addEventListener("pageshow", flushNow);
+    window.addEventListener("storage", onStorageSync);
     document.addEventListener("visibilitychange", onVisibilityOrFocus);
 
     const t = window.setTimeout(() => {
@@ -1469,6 +1687,7 @@ export default function AbsensiMultiServerPage() {
       window.removeEventListener("offline", onOffline);
       window.removeEventListener("focus", flushNow);
       window.removeEventListener("pageshow", flushNow);
+      window.removeEventListener("storage", onStorageSync);
       document.removeEventListener("visibilitychange", onVisibilityOrFocus);
       stopQrCam();
       stopSelfieCam();
@@ -2234,67 +2453,111 @@ export default function AbsensiMultiServerPage() {
     }
   };
 
+  // Hanya Admin yang bisa mengunggah file jadwal PDF dan menghasilkan gambar board jadwal keberangkatan untuk Admin & Karyawan
   const handleScheduleFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (!isAdminServer) {
+      notify(
+        "err",
+        "Akses ditolak: hanya Admin yang dapat memasukkan file jadwal PDF di dasbor Admin."
+      );
+      return;
+    }
     const file = e.target.files?.[0];
     if (!file) return;
+
+    const isPdf =
+      file.type === "application/pdf" ||
+      file.name.toLowerCase().endsWith(".pdf");
+
+    if (!isPdf) {
+      notify(
+        "err",
+        "Gunakan file PDF jadwal resmi yang dibuat Admin (.pdf)."
+      );
+      if (scheduleInputRef.current) scheduleInputRef.current.value = "";
+      return;
+    }
+
     setScheduleFileName(file.name);
     try {
-      const isPdf =
-        file.type === "application/pdf" ||
-        file.name.toLowerCase().endsWith(".pdf");
-      let parsed: ParsedScheduleItem[] = [];
-
-      if (isPdf) {
-        const bytes = new Uint8Array(await file.arrayBuffer());
-        parsed = parseScheduleLines(extractLinesFromPdfBytes(bytes));
-      } else {
-        const text = await file.text();
-        parsed = parseScheduleLines(
-          text
-            .split(/\r?\n/)
-            .map((l) => l.trim())
-            .filter(Boolean)
-        );
-      }
-
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      const parsed = parseScheduleLines(extractLinesFromPdfBytes(bytes));
       setSchedulePreview(parsed);
-      if (parsed.length > 0) {
-        const weeklyMap = loadWeeklySchedulesMap();
-        const updated = employees.map((emp) => {
-          const match = parsed.find(
-            (r) =>
-              r.emp_code.toLowerCase() === emp.emp_code.toLowerCase() ||
-              r.full_name.toLowerCase() === emp.full_name.toLowerCase()
-          );
-          if (!match) return emp;
-          const nextWeekly: WeeklyScheduleMap = {
-            ...(emp.weekly_schedule || buildDefaultWeeklySchedule(match.shift_code)),
-            ...(match.weekly || {}),
-          };
-          if (!match.weekly) {
-            DAYS_OF_WEEK.forEach((d) => {
-              if (d !== "Minggu") nextWeekly[d] = match.shift_code;
-            });
-          }
-          weeklyMap[emp.emp_code] = nextWeekly;
-          return {
-            ...emp,
-            full_name: match.full_name || emp.full_name,
-            shift_start_time: match.shift_time,
-            weekly_schedule: nextWeekly,
-          };
-        });
-        localStorage.setItem(WEEKLY_SCHED_KEY, JSON.stringify(weeklyMap));
-        setEmployees(updated);
-        notify(
-          "ok",
-          `${parsed.length} jadwal PDF disesuaikan otomatis (P/S/M/OFF) dari ${file.name}.`
+
+      const weeklyMap = loadWeeklySchedulesMap();
+      const updatedEmployees = employees.map((emp) => {
+        const match = parsed.find(
+          (r) =>
+            r.emp_code.toLowerCase() === emp.emp_code.toLowerCase() ||
+            r.full_name.toLowerCase() === emp.full_name.toLowerCase()
         );
-      } else {
-        notify("warn", `File ${file.name} dibaca tanpa baris jadwal cocok.`);
+        if (!match) return emp;
+        const nextWeekly: WeeklyScheduleMap = {
+          ...(emp.weekly_schedule ||
+            buildDefaultWeeklySchedule(match.shift_code)),
+          ...(match.weekly || {}),
+        };
+        if (!match.weekly) {
+          DAYS_OF_WEEK.forEach((d) => {
+            if (d !== "Minggu") nextWeekly[d] = match.shift_code;
+          });
+        }
+        weeklyMap[emp.emp_code] = nextWeekly;
+        return {
+          ...emp,
+          full_name: match.full_name || emp.full_name,
+          shift_start_time: match.shift_time,
+          weekly_schedule: nextWeekly,
+        };
+      });
+
+      localStorage.setItem(WEEKLY_SCHED_KEY, JSON.stringify(weeklyMap));
+      setEmployees(updatedEmployees);
+
+      const staffOnly = updatedEmployees.filter((emp) => emp.role === "STAFF");
+      const uploadedAtLabel = formatFullTimestampWIB(nowMs);
+      const posterDataUrl = renderDepartureBoardPosterDataUrl(
+        file.name,
+        uploadedAtLabel,
+        staffOnly,
+        parsed
+      );
+
+      const posterObj: UploadedSchedulePoster = {
+        fileName: file.name,
+        uploadedAt: uploadedAtLabel,
+        uploadedBy: activeUser?.full_name || "Admin Operasional",
+        imageDataUrl: posterDataUrl,
+        summaryRows: parsed,
+      };
+
+      setSchedulePoster(posterObj);
+      localStorage.setItem(SCHEDULE_POSTER_KEY, JSON.stringify(posterObj));
+
+      if (navigator.onLine) {
+        try {
+          await fetch("/api/absen", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              action: "SAVE_SCHEDULE_POSTER",
+              payload: {
+                poster: posterObj,
+                weeklySchedules: weeklyMap,
+              },
+            }),
+          });
+        } catch {
+          // Tetap tersimpan lokal dan tampil di board
+        }
       }
+
+      notify(
+        "ok",
+        `File PDF ${file.name} berhasil diunggah Admin! Gambar Jadwal Keberangkatan otomatis tampil di board Admin & Karyawan.`
+      );
     } catch {
-      notify("err", `Gagal memproses ${file.name}.`);
+      notify("err", `Gagal memproses file PDF ${file.name}.`);
     } finally {
       if (scheduleInputRef.current) scheduleInputRef.current.value = "";
     }
@@ -3270,6 +3533,166 @@ export default function AbsensiMultiServerPage() {
           </div>
         </header>
 
+        {/* BOARD JADWAL MINGGUAN PER KARYAWAN & GAMBAR JADWAL KEBERANGKATAN (TAMPIL DI DASHBOARD ADMIN & ANGGOTA) */}
+        <section className="bg-white rounded-2xl p-3.5 border-t-4 border-t-indigo-600 border border-slate-200/80 shadow-sm space-y-2.5">
+          <div className="flex items-center justify-between gap-2">
+            <div>
+              <h2 className="text-xs font-extrabold text-slate-800">
+                Jadwal Mingguan &amp; Keberangkatan Karyawan
+              </h2>
+              <p className="text-[10px] text-slate-500">
+                {isKaryawanMode
+                  ? `Jadwal Mingguan: ${activeUser?.full_name} (${activeUser?.emp_code})`
+                  : "Sinkron ke Board Admin & Board Setiap Anggota"}
+              </p>
+            </div>
+            <span className="px-2 py-0.5 rounded bg-indigo-100 text-indigo-800 text-[9px] font-extrabold uppercase shrink-0">
+              {schedulePoster ? "PDF ADMIN AKTIF" : "JADWAL MINGGUAN"}
+            </span>
+          </div>
+
+          {/* Kartu Jadwal Mingguan Anggota Aktif (Selalu tampil di Dashboard Anggota maupun Admin) */}
+          <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200 space-y-1.5">
+            <div className="flex items-center justify-between text-[10px]">
+              <span className="font-extrabold text-slate-800">
+                {activeUser?.full_name} ({activeUser?.emp_code})
+              </span>
+              <span className="text-slate-500 font-semibold">
+                P: 07.00 • S: 15.00 • M: 23.00 • OFF: Libur
+              </span>
+            </div>
+            <div className="grid grid-cols-7 gap-1 text-center">
+              {DAYS_OF_WEEK.map((day) => {
+                const code = activeUserWeeklySchedule[day] || "P";
+                const isTodayCol = getJakartaDayKey(syncedIsoNow) === day;
+                return (
+                  <div
+                    key={day}
+                    className={`rounded-lg p-1 border ${
+                      isTodayCol
+                        ? "border-blue-600 ring-1 ring-blue-300 bg-white"
+                        : "border-slate-200 bg-white"
+                    }`}
+                  >
+                    <div className="text-[9px] font-bold text-slate-500">
+                      {day.slice(0, 3)}
+                    </div>
+                    <div
+                      className={`mt-0.5 rounded py-0.5 text-[10px] font-black ${
+                        code === "OFF"
+                          ? "bg-rose-100 text-rose-700"
+                          : code === "P"
+                          ? "bg-blue-100 text-blue-800"
+                          : code === "S"
+                          ? "bg-amber-100 text-amber-800"
+                          : "bg-indigo-100 text-indigo-800"
+                      }`}
+                    >
+                      {code}
+                    </div>
+                    <div className="text-[8px] font-mono text-slate-500 mt-0.5">
+                      {code === "OFF" ? "LIBUR" : SHIFT_PRESETS[code].start}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Ringkasan Jadwal Mingguan Semua Anggota di Dashboard Admin */}
+          {!isKaryawanMode && (
+            <div className="overflow-x-auto rounded-lg border border-slate-200">
+              <table className="w-full text-left border-collapse text-[10px]">
+                <thead>
+                  <tr className="bg-[#082A63] text-white">
+                    <th className="p-1.5">Anggota</th>
+                    {DAYS_OF_WEEK.map((d) => (
+                      <th key={d} className="p-1.5 text-center">
+                        {d.slice(0, 3)}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {staffList.map((emp) => {
+                    const wk =
+                      emp.weekly_schedule ||
+                      buildDefaultWeeklySchedule(
+                        shiftTimeToCode(emp.shift_start_time)
+                      );
+                    return (
+                      <tr key={emp.id} className="border-t border-slate-100">
+                        <td className="p-1.5 font-bold whitespace-nowrap">
+                          {emp.full_name}
+                        </td>
+                        {DAYS_OF_WEEK.map((d) => {
+                          const c = wk[d] || "P";
+                          return (
+                            <td key={d} className="p-1 text-center">
+                              <span
+                                className={`inline-block px-1.5 py-0.5 rounded font-extrabold text-[9px] ${
+                                  c === "OFF"
+                                    ? "bg-rose-100 text-rose-700"
+                                    : c === "P"
+                                    ? "bg-blue-100 text-blue-800"
+                                    : c === "S"
+                                    ? "bg-amber-100 text-amber-800"
+                                    : "bg-indigo-100 text-indigo-800"
+                                }`}
+                              >
+                                {c}
+                              </span>
+                            </td>
+                          );
+                        })}
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {/* Gambar Jadwal Keberangkatan Karyawan dari File PDF yang Dimasukkan Admin */}
+          {schedulePoster?.imageDataUrl && (
+            <div className="p-2.5 rounded-xl bg-blue-50/70 border border-blue-200 space-y-1.5">
+              <div className="flex items-center justify-between gap-2">
+                <div className="text-[10px] font-extrabold text-[#082A63]">
+                  Gambar Jadwal Keberangkatan Resmi ({schedulePoster.fileName})
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setScheduleImageZoomOpen((prev) => !prev)}
+                  className="text-[10px] font-bold text-blue-700 underline shrink-0"
+                >
+                  {scheduleImageZoomOpen ? "Perkecil" : "Perbesar Gambar"}
+                </button>
+              </div>
+              <div className="rounded-lg overflow-hidden border border-slate-300 bg-white">
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src={schedulePoster.imageDataUrl}
+                  alt="Gambar Jadwal Keberangkatan Karyawan"
+                  onClick={() => setScheduleImageZoomOpen((prev) => !prev)}
+                  className={`w-full object-contain cursor-pointer transition-all ${
+                    scheduleImageZoomOpen ? "max-h-[560px]" : "max-h-52"
+                  }`}
+                />
+              </div>
+              <div className="flex items-center justify-between text-[9px] text-slate-600">
+                <span>Diunggah Admin: {schedulePoster.uploadedAt}</span>
+                <a
+                  href={schedulePoster.imageDataUrl}
+                  download={`Jadwal_Keberangkatan_${todayStr}.png`}
+                  className="font-bold text-emerald-700 underline"
+                >
+                  Simpan Gambar
+                </a>
+              </div>
+            </div>
+          )}
+        </section>
+
         {!isKaryawanMode && (
           <section className="bg-white rounded-2xl p-3.5 border-t-4 border-t-blue-600 border border-slate-200/80 shadow-sm space-y-2.5">
             <div className="flex items-center justify-between">
@@ -3557,28 +3980,48 @@ export default function AbsensiMultiServerPage() {
         {!isKaryawanMode && (
           <>
             <section className="bg-white rounded-2xl p-3.5 border border-slate-200/80 shadow-sm space-y-2">
-              <h2 className="text-xs font-extrabold text-slate-800">
-                2. Input Jadwal (.PDF / .XLSX / .CSV)
-              </h2>
-              <div className="flex items-center gap-2 rounded-lg border border-slate-200 p-1.5 bg-slate-50">
-                <button
-                  type="button"
-                  onClick={() => scheduleInputRef.current?.click()}
-                  className="px-2.5 py-1 rounded bg-slate-200 hover:bg-slate-300 text-slate-800 text-[11px] font-bold shrink-0"
-                >
-                  Pilih File
-                </button>
-                <span className="text-[11px] text-slate-500 truncate">
-                  {scheduleFileName}
+              <div className="flex items-center justify-between gap-2">
+                <h2 className="text-xs font-extrabold text-slate-800">
+                  2. Input Jadwal Mingguan Karyawan (File .PDF Khusus Admin)
+                </h2>
+                <span className="px-2 py-0.5 rounded bg-indigo-100 text-indigo-800 text-[9px] font-extrabold">
+                  KHUSUS ADMIN
                 </span>
-                <input
-                  ref={scheduleInputRef}
-                  type="file"
-                  accept=".pdf,.xlsx,.xls,.csv,.txt"
-                  onChange={(e) => void handleScheduleFile(e)}
-                  className="hidden"
-                />
               </div>
+              {isAdminServer ? (
+                <>
+                  <p className="text-[10px] text-slate-500">
+                    Unggah file <b>.PDF</b> jadwal yang dibuat Admin. Setelah
+                    diunggah, <b>Gambar Jadwal Keberangkatan Karyawan</b>{" "}
+                    otomatis muncul di board dasbor Admin maupun setiap dasbor
+                    Karyawan.
+                  </p>
+                  <div className="flex items-center gap-2 rounded-lg border border-slate-200 p-1.5 bg-slate-50">
+                    <button
+                      type="button"
+                      onClick={() => scheduleInputRef.current?.click()}
+                      className="px-2.5 py-1 rounded bg-blue-600 hover:bg-blue-700 text-white text-[11px] font-bold shrink-0"
+                    >
+                      Pilih File PDF
+                    </button>
+                    <span className="text-[11px] text-slate-500 truncate">
+                      {scheduleFileName}
+                    </span>
+                    <input
+                      ref={scheduleInputRef}
+                      type="file"
+                      accept=".pdf,application/pdf"
+                      onChange={(e) => void handleScheduleFile(e)}
+                      className="hidden"
+                    />
+                  </div>
+                </>
+              ) : (
+                <div className="p-2.5 rounded-lg bg-amber-50 border border-amber-200 text-[11px] text-amber-900 font-semibold">
+                  Hanya Admin yang dapat memasukkan file jadwal PDF melalui
+                  dasbor Admin.
+                </div>
+              )}
               {schedulePreview.length > 0 && (
                 <div className="space-y-1 pt-1">
                   {schedulePreview.map((r, idx) => (
