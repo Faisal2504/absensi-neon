@@ -4,14 +4,14 @@ import "./globals.css";
 export const metadata: Metadata = {
   title: "Fast Absensi Pro MFR",
   description: "Aplikasi absensi online dan offline dengan QR Code, GPS & selfie",
-  manifest: "/manifest.json",
+  manifest: "/manifest.json?v=6",
   icons: {
     icon: [
-      { url: "/fast-absensi-pro-mfr.png?v=3", sizes: "192x192", type: "image/png" },
-      { url: "/fast-absensi-pro-mfr.png?v=3", sizes: "512x512", type: "image/png" },
+      { url: "/Logo%20Absensi%20Cepat%20Emas%20Pink.png?v=6", sizes: "192x192", type: "image/png" },
+      { url: "/Logo%20Absensi%20Cepat%20Emas%20Pink.png?v=6", sizes: "512x512", type: "image/png" },
     ],
-    shortcut: [{ url: "/fast-absensi-pro-mfr.png?v=3", type: "image/png" }],
-    apple: [{ url: "/fast-absensi-pro-mfr.png?v=3", sizes: "180x180", type: "image/png" }],
+    shortcut: [{ url: "/Logo%20Absensi%20Cepat%20Emas%20Pink.png?v=6", type: "image/png" }],
+    apple: [{ url: "/Logo%20Absensi%20Cepat%20Emas%20Pink.png?v=6", sizes: "180x180", type: "image/png" }],
   },
 };
 
