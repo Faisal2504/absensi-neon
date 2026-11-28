@@ -858,7 +858,7 @@ function getInitialBoot() {
       serverMode: "ADMIN" as ServerMode,
       isDeviceLockedKaryawan: false,
       isStaffLoggedIn: false,
-      isAuthenticatedPrivileged: true,
+      isAuthenticatedPrivileged: false,
       qrCode: "ABSENSI-KANTOR-MPI-BTG",
       staffEmpId: 3,
       queue: [] as TimeEntry[],
@@ -879,11 +879,12 @@ function getInitialBoot() {
   let entries: TimeEntry[] = [];
   let isDeviceLockedKaryawan = false;
   let serverMode: ServerMode = "ADMIN";
-  let isAuthenticatedPrivileged = true;
+  let isAuthenticatedPrivileged = false;
 
   try {
     const params = new URLSearchParams(window.location.search);
     const qServer = (params.get("server") || "").toLowerCase();
+    const authedRole = localStorage.getItem(AUTH_SERVER_KEY);
 
     if (
       qServer === "karyawan" ||
@@ -897,11 +898,10 @@ function getInitialBoot() {
       isAuthenticatedPrivileged = false;
     } else if (qServer === "manager") {
       serverMode = "MANAGER";
-      isAuthenticatedPrivileged =
-        localStorage.getItem(AUTH_SERVER_KEY) === "MANAGER";
+      isAuthenticatedPrivileged = authedRole === "MANAGER";
     } else {
       serverMode = "ADMIN";
-      isAuthenticatedPrivileged = true;
+      isAuthenticatedPrivileged = authedRole === "ADMIN";
     }
 
     const savedQr = localStorage.getItem(QR_CODE_KEY);
@@ -1029,7 +1029,6 @@ export default function AbsensiMultiServerPage() {
     "Arahkan wajah ke kamera depan lalu klik Ambil Foto Selfie."
   );
 
-  // State modal lihat & download foto sekali klik untuk Admin/Manager
   const [previewPhoto, setPreviewPhoto] = useState<{
     src: string;
     title: string;
@@ -1110,9 +1109,10 @@ export default function AbsensiMultiServerPage() {
       try {
         const a = document.createElement("a");
         a.href = dataUrl;
-        a.download = fileName.endsWith(".jpg") || fileName.endsWith(".png")
-          ? fileName
-          : `${fileName}.jpg`;
+        a.download =
+          fileName.endsWith(".jpg") || fileName.endsWith(".png")
+            ? fileName
+            : `${fileName}.jpg`;
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
@@ -1501,7 +1501,6 @@ export default function AbsensiMultiServerPage() {
     };
   }, [refreshServer, requestCurrentGps, notify, stopQrCam, stopSelfieCam]);
 
-  // Login anggota karyawan: wajib ID Karyawan & PIN yang dibuat Admin di server utama
   const handleStaffMemberLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     const codeClean = staffLoginCode.trim().toUpperCase();
@@ -1576,7 +1575,6 @@ export default function AbsensiMultiServerPage() {
     );
   };
 
-  // Keluar dari sesi anggota saat ini (wajib login ulang dengan ID & PIN sendiri)
   const handleStaffMemberLogout = () => {
     stopQrCam();
     stopSelfieCam();
@@ -1833,7 +1831,6 @@ export default function AbsensiMultiServerPage() {
     }
   };
 
-  // Membuat foto selfie dengan cap verifikasi asli ala TimeMark (Waktu WIB, Nama/Kode, GPS + Geofence, Device)
   const takeSelfiePhoto = async () => {
     if (!selfieVideoRef.current || !selfieCanvasRef.current) return;
     const FD = (
@@ -2152,6 +2149,7 @@ export default function AbsensiMultiServerPage() {
     const expectedPin =
       activeUser?.pin_code || (isManagerServer ? "2026" : "0000");
     if (pinEntry.trim() === expectedPin) {
+      localStorage.removeItem(DEVICE_LOCK_KEY);
       localStorage.setItem(AUTH_SERVER_KEY, serverMode);
       setIsPrivilegedAuthed(true);
       setPinEntry("");
@@ -2944,8 +2942,7 @@ export default function AbsensiMultiServerPage() {
           )}
 
           <p className="text-xs text-slate-500">
-            Masukkan PIN {serverMode} ({activeUser?.full_name}) untuk akses penuh
-            dasbor.
+            Silakan login dulu menggunakan PIN {serverMode} ({activeUser?.full_name}) untuk membuka dasbor.
           </p>
 
           <input
@@ -2966,7 +2963,7 @@ export default function AbsensiMultiServerPage() {
             onClick={verifyPrivilegedLogin}
             className="w-full py-2.5 rounded-lg bg-blue-600 text-white text-xs font-extrabold"
           >
-            Buka Server {serverMode}
+            Login &amp; Buka Server {serverMode}
           </button>
 
           <div className="grid grid-cols-2 gap-1.5 pt-2 border-t border-slate-100">
@@ -2978,7 +2975,7 @@ export default function AbsensiMultiServerPage() {
               }}
               className="py-1.5 rounded-lg bg-slate-100 text-slate-700 text-[11px] font-bold"
             >
-              {isManagerServer ? "Ke Server Admin" : "Ke Server Manager"}
+              {isManagerServer ? "Ganti ke Admin" : "Ganti ke Manager"}
             </button>
             <button
               type="button"
