@@ -827,24 +827,8 @@ function extractLinesFromPdfBytes(bytes: Uint8Array): string[] {
       .replace(/[^\x20-\x7E]/g, " ")
       .replace(/\s+/g, " ")
       .trim();
-    if (cleaned.length >= 1 && /[a-zA-Z0-9]/.test(cleaned)) {
+    if (cleaned.length >= 2 && /[a-zA-Z]{2,}/.test(cleaned)) {
       lines.push(cleaned);
-    }
-  }
-
-  const hexMatches = raw.match(/<([0-9A-Fa-f\s]{4,240})>/g) || [];
-  for (const hm of hexMatches) {
-    const hex = hm.slice(1, -1).replace(/\s+/g, "");
-    if (hex.length >= 4 && hex.length % 2 === 0) {
-      let decoded = "";
-      for (let i = 0; i < hex.length; i += 2) {
-        const code = parseInt(hex.slice(i, i + 2), 16);
-        if (code >= 32 && code <= 126) decoded += String.fromCharCode(code);
-      }
-      const cleaned = decoded.replace(/\s+/g, " ").trim();
-      if (cleaned.length >= 2 && /[a-zA-Z0-9]/.test(cleaned)) {
-        lines.push(cleaned);
-      }
     }
   }
 
@@ -883,27 +867,31 @@ function detectShiftCodeFromText(text: string): ShiftCode {
   return "P";
 }
 
-function parseScheduleLines(lines: string[]): ParsedScheduleItem[] {
+function parseScheduleLines(
+  lines: string[],
+  knownEmployees: Employee[]
+): ParsedScheduleItem[] {
   const parsed: ParsedScheduleItem[] = [];
+  const staffCandidates = knownEmployees.filter((e) => e.role === "STAFF");
+  const joinedText = lines.join(" \n ");
 
-  for (const rawLine of lines) {
-    const line = rawLine.trim();
-    if (!line) continue;
-    const lower = line.toLowerCase();
-    if (
-      lower.includes("emp_code") ||
-      (lower.includes("jadwal") && lower.length < 22) ||
-      (lower.includes("nama") && lower.includes("shift") && lower.length < 34)
-    ) {
-      continue;
-    }
+  for (const emp of staffCandidates) {
+    const codeUpper = emp.emp_code.toUpperCase();
+    const nameUpper = emp.full_name.toUpperCase();
+    const matchedLine = lines.find((l) => {
+      const u = l.toUpperCase();
+      return u.includes(codeUpper) || u.includes(nameUpper);
+    });
 
-    const shiftCode = detectShiftCodeFromText(line);
-    const codeMatch = line.match(
-      /\b([A-Z]{2,6}-SCRTY-MPI\.\d{8}\.\d{4}|[A-Z]{2,6}[-_]\d{1,6})\b/i
-    );
+    const hasMention =
+      joinedText.toUpperCase().includes(codeUpper) ||
+      joinedText.toUpperCase().includes(nameUpper);
 
-    const dayTokens = line.match(/\b(P\/M|OFF|P|S|M)\b/gi);
+    if (!matchedLine && !hasMention) continue;
+
+    const contextText = matchedLine || joinedText;
+    const shiftCode = detectShiftCodeFromText(contextText);
+    const dayTokens = contextText.match(/\b(P\/M|OFF|P|S|M)\b/gi);
     const weekly: Partial<WeeklyScheduleMap> = {};
     if (dayTokens && dayTokens.length >= 7) {
       DAYS_OF_WEEK.forEach((d, idx) => {
@@ -912,54 +900,14 @@ function parseScheduleLines(lines: string[]): ParsedScheduleItem[] {
       });
     }
 
-    let cols = line
-      .split(/[,;|]+/)
-      .map((c) => c.trim())
-      .filter(Boolean);
-    if (cols.length === 1 && /\s{2,}|\s+[-–—]\s+/.test(line)) {
-      cols = line
-        .split(/\s{2,}|\s+[-–—]\s+/)
-        .map((c) => c.trim())
-        .filter(Boolean);
-    }
-
-    const empCode = codeMatch ? codeMatch[1].toUpperCase() : "";
-    let fullName = "";
-
-    if (cols.length >= 2) {
-      if (!empCode && /^[A-Z0-9_.-]{2,32}$/i.test(cols[0])) {
-        fullName = cols[1];
-      } else {
-        fullName = cols[0];
-      }
-    } else {
-      fullName = line;
-    }
-
-    fullName = fullName
-      .replace(
-        /\b([A-Z]{2,6}-SCRTY-MPI\.\d{8}\.\d{4}|[A-Z]{2,6}[-_]\d{1,6})\b/gi,
-        " "
-      )
-      .replace(/\b(P\/M|OFF|P|S|M)\b/g, " ")
-      .replace(/shift\s*(pagi|siang|malam|libur|off)/gi, " ")
-      .replace(/\b(pagi|siang|malam|libur)\b/gi, " ")
-      .replace(/\b([012]?\d[:.]\d{2})\b/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
-
-    if (fullName || empCode) {
-      const code =
-        empCode || `KRY-${String(parsed.length + 1).padStart(3, "0")}`;
-      parsed.push({
-        emp_code: code,
-        full_name: fullName || code,
-        shift_code: shiftCode,
-        shift_label: shiftCodeToLabel(shiftCode),
-        shift_time: shiftCodeToStartTime(shiftCode),
-        weekly: Object.keys(weekly).length > 0 ? weekly : undefined,
-      });
-    }
+    parsed.push({
+      emp_code: emp.emp_code,
+      full_name: emp.full_name,
+      shift_code: shiftCode,
+      shift_label: shiftCodeToLabel(shiftCode),
+      shift_time: shiftCodeToStartTime(shiftCode),
+      weekly: Object.keys(weekly).length > 0 ? weekly : undefined,
+    });
   }
 
   return parsed;
@@ -1569,7 +1517,13 @@ export default function AbsensiMultiServerPage() {
       ) {
         const poster = data.schedulePoster as UploadedSchedulePoster;
         setSchedulePoster(poster);
+        setScheduleFileName(poster.fileName || "Jadwal PDF");
         localStorage.setItem(SCHEDULE_POSTER_KEY, JSON.stringify(poster));
+      } else if (data.clearSchedulePoster) {
+        setSchedulePoster(null);
+        setSchedulePreview([]);
+        setScheduleFileName("Tidak ada file yang dipilih");
+        localStorage.removeItem(SCHEDULE_POSTER_KEY);
       }
 
       const weeklyMap = loadWeeklySchedulesMap();
@@ -1867,7 +1821,9 @@ export default function AbsensiMultiServerPage() {
       if (ev.key === SCHEDULE_POSTER_KEY) {
         if (ev.newValue) {
           try {
-            setSchedulePoster(JSON.parse(ev.newValue));
+            const parsed = JSON.parse(ev.newValue) as UploadedSchedulePoster;
+            setSchedulePoster(parsed);
+            setScheduleFileName(parsed.fileName || "Jadwal PDF");
           } catch {
             // Abaikan
           }
@@ -1875,6 +1831,7 @@ export default function AbsensiMultiServerPage() {
           setSchedulePoster(null);
           setSchedulePreview([]);
           setScheduleFileName("Tidak ada file yang dipilih");
+          setScheduleImageZoomOpen(false);
         }
       }
       if (ev.key === WEEKLY_SCHED_KEY) {
@@ -2819,7 +2776,7 @@ export default function AbsensiMultiServerPage() {
     if (!isAdminServer) {
       notify(
         "err",
-        "Akses ditolak: hanya Admin yang dapat menghapus file input jadwal PDF."
+        "Akses ditolak: hanya Admin yang dapat menghapus file input jadwal PDF & gambar jadwal."
       );
       return;
     }
@@ -2844,14 +2801,17 @@ export default function AbsensiMultiServerPage() {
         });
         if (res.ok) {
           const data = await res.json();
-          applyServerState(data);
+          applyServerState({ ...data, clearSchedulePoster: true });
         }
       } catch {
         // Tetap terhapus lokal
       }
     }
 
-    notify("ok", "File input data PDF jadwal mingguan berhasil dihapus.");
+    notify(
+      "ok",
+      "File input PDF & gambar jadwal keberangkatan di dasbor berhasil dihapus."
+    );
   };
 
   const handleScheduleFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -2881,7 +2841,10 @@ export default function AbsensiMultiServerPage() {
     setScheduleFileName(file.name);
     try {
       const bytes = new Uint8Array(await file.arrayBuffer());
-      const parsed = parseScheduleLines(extractLinesFromPdfBytes(bytes));
+      const parsed = parseScheduleLines(
+        extractLinesFromPdfBytes(bytes),
+        employees
+      );
       setSchedulePreview(parsed);
 
       const weeklyMap = loadWeeklySchedulesMap();
@@ -2963,7 +2926,7 @@ export default function AbsensiMultiServerPage() {
 
       notify(
         "ok",
-        `File PDF ${file.name} berhasil diunggah Admin & tersinkron ke database Neon!`
+        `File PDF ${file.name} berhasil diunggah Admin & gambar jadwal tampil di dasbor!`
       );
     } catch {
       notify("err", `Gagal memproses file PDF ${file.name}.`);
@@ -4155,16 +4118,27 @@ export default function AbsensiMultiServerPage() {
           {schedulePoster?.imageDataUrl && (
             <div className="p-2.5 rounded-xl bg-blue-50/70 border border-blue-200 space-y-1.5">
               <div className="flex items-center justify-between gap-2">
-                <div className="text-[10px] font-extrabold text-[#082A63]">
+                <div className="text-[10px] font-extrabold text-[#082A63] truncate">
                   Gambar Jadwal Keberangkatan Resmi ({schedulePoster.fileName})
                 </div>
-                <button
-                  type="button"
-                  onClick={() => setScheduleImageZoomOpen((prev) => !prev)}
-                  className="text-[10px] font-bold text-blue-700 underline shrink-0"
-                >
-                  {scheduleImageZoomOpen ? "Perkecil" : "Perbesar Gambar"}
-                </button>
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => setScheduleImageZoomOpen((prev) => !prev)}
+                    className="text-[10px] font-bold text-blue-700 underline"
+                  >
+                    {scheduleImageZoomOpen ? "Perkecil" : "Perbesar Gambar"}
+                  </button>
+                  {isAdminServer && (
+                    <button
+                      type="button"
+                      onClick={() => void handleDeleteSchedulePdf()}
+                      className="px-2 py-0.5 rounded bg-rose-600 hover:bg-rose-700 text-white text-[9px] font-bold"
+                    >
+                      Hapus Gambar
+                    </button>
+                  )}
+                </div>
               </div>
               <div className="rounded-lg overflow-hidden border border-slate-300 bg-white">
                 {/* eslint-disable-next-line @next/next/no-img-element */}
@@ -4254,333 +4228,284 @@ export default function AbsensiMultiServerPage() {
                 className="rounded-lg border border-slate-300 px-2 py-1.5 text-[10px] font-semibold bg-white"
               >
                 <option value="ALL">Semua Anggota ({staffList.length})</option>
-                {staffList.map((emp) => (
-                  <option key={emp.id} value={String(emp.id)}>
-                    {emp.full_name}
+                {staffList.map((s) => (
+                  <option key={s.id} value={String(s.id)}>
+                    {s.full_name} ({s.emp_code})
                   </option>
                 ))}
               </select>
-              <input
-                type="date"
-                value={photoDateFilter || todayStr}
-                onChange={(e) => setPhotoDateFilter(e.target.value)}
-                className="rounded-lg border border-slate-300 px-2 py-1.5 text-[10px] font-mono bg-white"
-              />
-            </div>
 
-            <div className="space-y-2.5">
-              {employeePhotoCards.map((card) => {
-                const primaryEntry = card.outEntry || card.inEntry;
-                return (
-                  <div
-                    key={card.emp.emp_code}
-                    className="p-2.5 rounded-xl bg-slate-50 border border-slate-200 space-y-2"
-                  >
-                    <div className="flex items-start justify-between gap-2">
-                      <div>
-                        <div className="text-xs font-extrabold text-slate-900">
-                          {card.emp.full_name}
-                        </div>
-                        <div className="text-[10px] font-mono text-slate-600">
-                          ID: {card.emp.emp_code}
-                        </div>
-                      </div>
-                      <span
-                        className={`px-2 py-0.5 rounded text-[9px] font-extrabold uppercase shrink-0 ${
-                          card.isAuthentic
-                            ? "bg-emerald-100 text-emerald-800"
-                            : "bg-amber-100 text-amber-800"
-                        }`}
-                      >
-                        {card.authStatus}
-                      </span>
-                    </div>
-
-                    <div className="grid grid-cols-2 gap-2">
-                      <div className="p-2 rounded-lg bg-white border border-slate-200 space-y-1.5">
-                        <div className="flex items-center justify-between text-[10px] font-bold">
-                          <span className="text-blue-700">FOTO MASUK</span>
-                          <span className="font-mono text-slate-700">
-                            {card.inTimeWib}
-                          </span>
-                        </div>
-                        {card.inEntry?.selfie_data ? (
-                          <>
-                            {/* eslint-disable-next-line @next/next/no-img-element */}
-                            <img
-                              src={card.inEntry.selfie_data}
-                              alt={`Foto Masuk ${card.emp.full_name}`}
-                              className="w-full h-28 object-cover rounded-md border border-slate-300"
-                            />
-                            <div className="grid grid-cols-2 gap-1">
-                              <button
-                                type="button"
-                                onClick={() =>
-                                  setInspectedPhotoModal({
-                                    entry: card.inEntry!,
-                                    empName: card.emp.full_name,
-                                    empCode: card.emp.emp_code,
-                                    inTimeWib: card.inTimeWib,
-                                    outTimeWib: card.outTimeWib,
-                                    dayName: card.dayName,
-                                    dateYearLabel: card.dateYearLabel,
-                                    coordsLabel: `${
-                                      card.inEntry?.latitude ??
-                                      targetLocation.latitude
-                                    }, ${
-                                      card.inEntry?.longitude ??
-                                      targetLocation.longitude
-                                    }`,
-                                    authStatus: card.authStatus,
-                                    authSeal:
-                                      card.inEntry?.auth_seal || card.authSeal,
-                                  })
-                                }
-                                className="py-1 rounded bg-slate-800 text-white text-[10px] font-bold"
-                              >
-                                Cek Foto
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() =>
-                                  handleDownloadPhotoAsset({
-                                    dataUrl: card.inEntry!.selfie_data!,
-                                    empCode: card.emp.emp_code,
-                                    typeLabel: "MASUK",
-                                    dateStr: card.dateStr,
-                                    timeWib: card.inTimeWib,
-                                    coordsLabel: `${
-                                      card.inEntry?.latitude ??
-                                      targetLocation.latitude
-                                    }, ${
-                                      card.inEntry?.longitude ??
-                                      targetLocation.longitude
-                                    }`,
-                                    authSeal:
-                                      card.inEntry?.auth_seal || card.authSeal,
-                                  })
-                                }
-                                className="py-1 rounded bg-emerald-700 text-white text-[10px] font-bold"
-                              >
-                                Download
-                              </button>
-                            </div>
-                          </>
-                        ) : (
-                          <div className="h-28 rounded-md bg-slate-100 border border-dashed border-slate-300 flex items-center justify-center text-[10px] text-slate-400">
-                            Belum ada foto masuk
-                          </div>
-                        )}
-                      </div>
-
-                      <div className="p-2 rounded-lg bg-white border border-slate-200 space-y-1.5">
-                        <div className="flex items-center justify-between text-[10px] font-bold">
-                          <span className="text-indigo-700">FOTO KELUAR</span>
-                          <span className="font-mono text-slate-700">
-                            {card.outTimeWib}
-                          </span>
-                        </div>
-                        {card.outEntry?.selfie_data ? (
-                          <>
-                            {/* eslint-disable-next-line @next/next/no-img-element */}
-                            <img
-                              src={card.outEntry.selfie_data}
-                              alt={`Foto Keluar ${card.emp.full_name}`}
-                              className="w-full h-28 object-cover rounded-md border border-slate-300"
-                            />
-                            <div className="grid grid-cols-2 gap-1">
-                              <button
-                                type="button"
-                                onClick={() =>
-                                  setInspectedPhotoModal({
-                                    entry: card.outEntry!,
-                                    empName: card.emp.full_name,
-                                    empCode: card.emp.emp_code,
-                                    inTimeWib: card.inTimeWib,
-                                    outTimeWib: card.outTimeWib,
-                                    dayName: card.dayName,
-                                    dateYearLabel: card.dateYearLabel,
-                                    coordsLabel: `${
-                                      card.outEntry?.latitude ??
-                                      targetLocation.latitude
-                                    }, ${
-                                      card.outEntry?.longitude ??
-                                      targetLocation.longitude
-                                    }`,
-                                    authStatus: card.authStatus,
-                                    authSeal:
-                                      card.outEntry?.auth_seal || card.authSeal,
-                                  })
-                                }
-                                className="py-1 rounded bg-slate-800 text-white text-[10px] font-bold"
-                              >
-                                Cek Foto
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() =>
-                                  handleDownloadPhotoAsset({
-                                    dataUrl: card.outEntry!.selfie_data!,
-                                    empCode: card.emp.emp_code,
-                                    typeLabel: "KELUAR",
-                                    dateStr: card.dateStr,
-                                    timeWib: card.outTimeWib,
-                                    coordsLabel: `${
-                                      card.outEntry?.latitude ??
-                                      targetLocation.latitude
-                                    }, ${
-                                      card.outEntry?.longitude ??
-                                      targetLocation.longitude
-                                    }`,
-                                    authSeal:
-                                      card.outEntry?.auth_seal || card.authSeal,
-                                  })
-                                }
-                                className="py-1 rounded bg-emerald-700 text-white text-[10px] font-bold"
-                              >
-                                Download
-                              </button>
-                            </div>
-                          </>
-                        ) : (
-                          <div className="h-28 rounded-md bg-slate-100 border border-dashed border-slate-300 flex items-center justify-center text-[10px] text-slate-400">
-                            Belum ada foto keluar
-                          </div>
-                        )}
-                      </div>
-                    </div>
-
-                    <div className="p-2 rounded-lg bg-white border border-slate-200 text-[10px] text-slate-700 space-y-0.5 font-mono">
-                      <div>
-                        <b>Hari / Tanggal / Tahun:</b> {card.dayName},{" "}
-                        {card.dateYearLabel}
-                      </div>
-                      <div>
-                        <b>Jam Masuk / Keluar:</b> {card.inTimeWib} WIB /{" "}
-                        {card.outTimeWib} WIB
-                      </div>
-                      <div>
-                        <b>Titik Koordinat:</b> {card.coordsLabel}
-                      </div>
-                      <div>
-                        <b>ID Karyawan:</b> {card.emp.emp_code}
-                      </div>
-                      <div className="text-[9px] text-emerald-800 break-all">
-                        <b>Segel Autentikasi:</b> {card.authSeal} •{" "}
-                        {primaryEntry?.mode || "TIMEMARK + WAJAH"}
-                      </div>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-
-            {inspectedPhotoModal && (
-              <div className="p-3 rounded-xl bg-[#0B1220] text-white border border-cyan-400 space-y-2">
-                <div className="flex items-center justify-between gap-2">
-                  <span className="text-[11px] font-extrabold text-cyan-300 uppercase">
-                    Verifikasi Autentik Foto Server
-                  </span>
+              <div className="flex items-center gap-1">
+                <input
+                  type="date"
+                  value={photoDateFilter || todayStr}
+                  onChange={(e) => setPhotoDateFilter(e.target.value)}
+                  className="w-full rounded-lg border border-slate-300 px-2 py-1.5 text-[10px] bg-white"
+                />
+                {photoDateFilter && photoDateFilter !== todayStr && (
                   <button
                     type="button"
-                    onClick={() => setInspectedPhotoModal(null)}
-                    className="px-2 py-0.5 rounded bg-rose-600 text-white text-[10px] font-bold"
+                    onClick={() => setPhotoDateFilter("")}
+                    className="px-2 py-1.5 rounded-lg bg-slate-100 text-[9px] font-bold text-slate-700 shrink-0"
                   >
-                    Tutup
+                    Hari Ini
                   </button>
-                </div>
-                {inspectedPhotoModal.entry.selfie_data && (
-                  /* eslint-disable-next-line @next/next/no-img-element */
-                  <img
-                    src={inspectedPhotoModal.entry.selfie_data}
-                    alt="Preview Verifikasi Foto"
-                    className="w-full max-h-64 object-contain rounded-lg bg-black border border-slate-700"
-                  />
                 )}
-                <div className="text-[10px] font-mono space-y-0.5 text-slate-200">
-                  <div>
-                    <b>Nama:</b> {inspectedPhotoModal.empName}
-                  </div>
-                  <div>
-                    <b>ID Karyawan:</b> {inspectedPhotoModal.empCode}
-                  </div>
-                  <div>
-                    <b>Hari / Tanggal / Tahun:</b>{" "}
-                    {inspectedPhotoModal.dayName},{" "}
-                    {inspectedPhotoModal.dateYearLabel}
-                  </div>
-                  <div>
-                    <b>Jam Masuk / Keluar:</b>{" "}
-                    {inspectedPhotoModal.inTimeWib} WIB /{" "}
-                    {inspectedPhotoModal.outTimeWib} WIB
-                  </div>
-                  <div>
-                    <b>Titik Koordinat:</b> {inspectedPhotoModal.coordsLabel}
-                  </div>
-                  <div className="text-emerald-300 break-all">
-                    <b>Status &amp; Segel:</b> {inspectedPhotoModal.authStatus}{" "}
-                    • {inspectedPhotoModal.authSeal}
-                  </div>
-                </div>
               </div>
-            )}
+            </div>
+
+            <div className="space-y-2.5 max-h-[540px] overflow-y-auto pr-0.5">
+              {employeePhotoCards.map((card) => (
+                <div
+                  key={card.emp.emp_code}
+                  className="p-2.5 rounded-xl bg-slate-50 border border-slate-200 space-y-2"
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <div>
+                      <div className="text-xs font-extrabold text-slate-900">
+                        {card.emp.full_name}
+                      </div>
+                      <div className="text-[10px] font-mono text-slate-600">
+                        ID: {card.emp.emp_code}
+                      </div>
+                      <div className="text-[10px] font-semibold text-blue-700">
+                        {card.dayName}, {card.dateYearLabel}
+                      </div>
+                    </div>
+                    <span
+                      className={`px-2 py-0.5 rounded text-[9px] font-extrabold uppercase shrink-0 ${
+                        card.isAuthentic
+                          ? "bg-emerald-100 text-emerald-800 border border-emerald-300"
+                          : "bg-amber-100 text-amber-800 border border-amber-300"
+                      }`}
+                    >
+                      {card.authStatus}
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-2">
+                    <div className="p-1.5 rounded-lg bg-white border border-slate-200 space-y-1">
+                      <div className="flex items-center justify-between text-[9px] font-extrabold">
+                        <span className="text-emerald-700">FOTO MASUK</span>
+                        <span className="font-mono text-slate-700">
+                          {card.inTimeWib}
+                        </span>
+                      </div>
+                      {card.inEntry?.selfie_data ? (
+                        // eslint-disable-next-line @next/next/no-img-element
+                        <img
+                          src={card.inEntry.selfie_data}
+                          alt={`Foto Masuk ${card.emp.full_name}`}
+                          className="w-full h-24 object-cover rounded border border-slate-200"
+                        />
+                      ) : (
+                        <div className="w-full h-24 rounded bg-slate-100 border border-dashed border-slate-300 flex items-center justify-center text-[9px] text-slate-400">
+                          Belum Absen Masuk
+                        </div>
+                      )}
+                      {card.inEntry?.selfie_data && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            handleDownloadPhotoAsset({
+                              dataUrl: card.inEntry!.selfie_data!,
+                              empCode: card.emp.emp_code,
+                              typeLabel: "MASUK",
+                              dateStr: card.dateStr,
+                              timeWib: card.inTimeWib,
+                              coordsLabel: card.coordsLabel,
+                              authSeal: card.authSeal,
+                            })
+                          }
+                          className="w-full py-1 rounded bg-emerald-700 text-white text-[9px] font-bold"
+                        >
+                          Unduh Foto Masuk
+                        </button>
+                      )}
+                    </div>
+
+                    <div className="p-1.5 rounded-lg bg-white border border-slate-200 space-y-1">
+                      <div className="flex items-center justify-between text-[9px] font-extrabold">
+                        <span className="text-rose-700">FOTO KELUAR</span>
+                        <span className="font-mono text-slate-700">
+                          {card.outTimeWib}
+                        </span>
+                      </div>
+                      {card.outEntry?.selfie_data ? (
+                        // eslint-disable-next-line @next/next/no-img-element
+                        <img
+                          src={card.outEntry.selfie_data}
+                          alt={`Foto Keluar ${card.emp.full_name}`}
+                          className="w-full h-24 object-cover rounded border border-slate-200"
+                        />
+                      ) : (
+                        <div className="w-full h-24 rounded bg-slate-100 border border-dashed border-slate-300 flex items-center justify-center text-[9px] text-slate-400">
+                          Belum Absen Keluar
+                        </div>
+                      )}
+                      {card.outEntry?.selfie_data && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            handleDownloadPhotoAsset({
+                              dataUrl: card.outEntry!.selfie_data!,
+                              empCode: card.emp.emp_code,
+                              typeLabel: "KELUAR",
+                              dateStr: card.dateStr,
+                              timeWib: card.outTimeWib,
+                              coordsLabel: card.coordsLabel,
+                              authSeal: card.authSeal,
+                            })
+                          }
+                          className="w-full py-1 rounded bg-rose-700 text-white text-[9px] font-bold"
+                        >
+                          Unduh Foto Keluar
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="p-2 rounded-lg bg-white border border-slate-200 text-[9.5px] text-slate-700 space-y-0.5">
+                    <div>
+                      <b>Jam Masuk / Keluar:</b> {card.inTimeWib} WIB /{" "}
+                      {card.outTimeWib} WIB
+                    </div>
+                    <div>
+                      <b>Koordinat Lokasi:</b> {card.coordsLabel}
+                    </div>
+                    <div>
+                      <b>Hari, Tanggal &amp; Tahun:</b> {card.dayName},{" "}
+                      {card.dateYearLabel}
+                    </div>
+                    <div>
+                      <b>Perangkat HP:</b> {card.deviceSummary}
+                    </div>
+                    <div className="font-mono text-[9px] text-slate-500">
+                      Kode Verifikasi: {card.authSeal}
+                    </div>
+                  </div>
+
+                  {(card.inEntry || card.outEntry) && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setInspectedPhotoModal({
+                          entry: (card.outEntry || card.inEntry)! as TimeEntry,
+                          empName: card.emp.full_name,
+                          empCode: card.emp.emp_code,
+                          inTimeWib: card.inTimeWib,
+                          outTimeWib: card.outTimeWib,
+                          dayName: card.dayName,
+                          dateYearLabel: card.dateYearLabel,
+                          coordsLabel: card.coordsLabel,
+                          authStatus: card.authStatus,
+                          authSeal: card.authSeal,
+                        })
+                      }
+                      className="w-full py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-white text-[10px] font-bold"
+                    >
+                      Lihat Detail Verifikasi Autentik Foto
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
           </section>
         )}
 
-        <section className="bg-white rounded-2xl p-3.5 border-t-4 border-t-blue-500 border border-slate-200/80 shadow-sm space-y-2.5">
+        {inspectedPhotoModal && (
+          <div className="fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-3">
+            <div className="max-w-md w-full bg-white rounded-2xl p-4 space-y-3 shadow-xl border border-slate-200">
+              <div className="flex items-center justify-between">
+                <h3 className="text-xs font-extrabold uppercase text-slate-900">
+                  Verifikasi Autentik Foto Absensi
+                </h3>
+                <button
+                  type="button"
+                  onClick={() => setInspectedPhotoModal(null)}
+                  className="px-2.5 py-1 rounded bg-slate-200 text-slate-800 text-[10px] font-bold"
+                >
+                  Tutup
+                </button>
+              </div>
+
+              {inspectedPhotoModal.entry.selfie_data && (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img
+                  src={inspectedPhotoModal.entry.selfie_data}
+                  alt="Foto Verifikasi"
+                  className="w-full max-h-72 object-contain rounded-xl border border-slate-200 bg-slate-950"
+                />
+              )}
+
+              <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200 text-[11px] space-y-1 text-slate-700">
+                <div>
+                  <b>Nama &amp; ID:</b> {inspectedPhotoModal.empName} (
+                  {inspectedPhotoModal.empCode})
+                </div>
+                <div>
+                  <b>Hari, Tanggal &amp; Tahun:</b>{" "}
+                  {inspectedPhotoModal.dayName},{" "}
+                  {inspectedPhotoModal.dateYearLabel}
+                </div>
+                <div>
+                  <b>Jam Masuk / Keluar:</b> {inspectedPhotoModal.inTimeWib}{" "}
+                  WIB / {inspectedPhotoModal.outTimeWib} WIB
+                </div>
+                <div>
+                  <b>Koordinat GPS:</b> {inspectedPhotoModal.coordsLabel}
+                </div>
+                <div>
+                  <b>Status Autentikasi:</b>{" "}
+                  <span className="font-extrabold text-emerald-700">
+                    {inspectedPhotoModal.authStatus}
+                  </span>
+                </div>
+                <div className="font-mono text-[10px] text-slate-500">
+                  Segel Autentikasi: {inspectedPhotoModal.authSeal}
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        <section className="bg-white rounded-2xl p-3.5 border-t-4 border-t-emerald-600 border border-slate-200/80 shadow-sm space-y-3">
           <div className="flex items-center justify-between">
             <h2 className="text-xs font-extrabold text-slate-800">
-              1. Scan Barcode/QR &amp; GPS Realtime
+              1. Absen Masuk &amp; Keluar (Barcode/QR + Foto TimeMark + GPS)
             </h2>
-            <button
-              type="button"
-              onClick={requestCurrentGps}
-              className="px-2 py-0.5 rounded bg-slate-100 hover:bg-slate-200 text-slate-700 text-[10px] font-bold"
-            >
-              Ambil GPS
-            </button>
+            <span className="text-[10px] font-bold text-slate-500">
+              Shift: {activeUserTodayShift.code} (
+              {activeUserTodayShift.rangeLabel})
+            </span>
           </div>
 
-          <div className="text-[11px] text-slate-600">
-            Jadwal Hari Ini ({getJakartaDayKey(syncedIsoNow)}):{" "}
-            {activeUserTodayShift.code === "OFF" ? (
-              <span className="font-extrabold text-rose-600">OFF (Libur)</span>
-            ) : (
-              <span
-                className={`inline-block px-1.5 py-0.5 rounded text-[10px] font-extrabold ${
-                  SHIFT_PRESETS[activeUserTodayShift.code]?.badgeClass || ""
-                }`}
-              >
-                {activeUserTodayShift.code} ({activeUserTodayShift.rangeLabel})
-              </span>
-            )}{" "}
-            • Toleransi telat 5 menit
-          </div>
-          <div className="text-[11px] font-bold text-emerald-700">
-            {geofenceLabel}
-          </div>
-          <div className="text-[10px] text-slate-500">
-            Titik Kantor Aktif: Lat {targetLocation.latitude}, Lng{" "}
-            {targetLocation.longitude} • Radius {targetLocation.radius_meters}m
+          <div className="p-2 rounded-lg bg-slate-50 border border-slate-200 text-[10px] text-slate-600">
+            Aturan anti-ganda: <b>1x Absen Masuk</b> &amp;{" "}
+            <b>1x Absen Keluar</b> per hari, dengan jeda minimal <b>6 jam</b>{" "}
+            antar absen. Toleransi keterlambatan: <b>5 menit</b>.
           </div>
 
           {(attendanceGuard.hasClockInToday ||
             attendanceGuard.hasClockOutToday ||
             attendanceGuard.inCooldown) && (
-            <div className="p-2 rounded-xl bg-amber-50 border border-amber-300 text-[11px] font-bold text-amber-900">
-              Status Hari Ini ({activeUser?.full_name}):{" "}
-              {attendanceGuard.hasClockInToday ? "MASUK (1/1)" : "MASUK (0/1)"} •{" "}
-              {attendanceGuard.hasClockOutToday
-                ? "KELUAR (1/1)"
-                : "KELUAR (0/1)"}
-              {attendanceGuard.inCooldown
-                ? ` • Jeda 6 jam: sisa ${attendanceGuard.remainingText}`
-                : ""}
-              .{" "}
-              {attendanceGuard.hasClockInToday &&
-              attendanceGuard.hasClockOutToday
-                ? "Absen masuk & keluar hari ini sudah lengkap (tidak bisa ganda, kecuali dihapus Admin)."
-                : ""}
+            <div className="p-2.5 rounded-xl bg-amber-50 border border-amber-200 text-[10px] text-amber-900 space-y-0.5">
+              {attendanceGuard.hasClockInToday && (
+                <div>
+                  • Sudah absen <b>MASUK</b> hari ini.
+                </div>
+              )}
+              {attendanceGuard.hasClockOutToday && (
+                <div>
+                  • Sudah absen <b>KELUAR</b> hari ini.
+                </div>
+              )}
+              {attendanceGuard.inCooldown && (
+                <div>
+                  • Menunggu jeda 6 jam sejak absen terakhir (sisa{" "}
+                  <b>{attendanceGuard.remainingText}</b>).
+                </div>
+              )}
             </div>
           )}
 
@@ -4589,185 +4514,213 @@ export default function AbsensiMultiServerPage() {
               type="button"
               disabled={isActionLocked("CLOCK_IN")}
               onClick={() => {
-                unlockAudioContext();
                 setSelectedAction("CLOCK_IN");
-                void submitAttendance("CLOCK_IN");
+                if (isKaryawanMode) {
+                  void openSelfieCamera("CLOCK_IN");
+                } else {
+                  void submitAttendance("CLOCK_IN");
+                }
               }}
-              className={`py-2 rounded-lg text-xs font-extrabold border disabled:opacity-45 ${
-                selectedAction === "CLOCK_IN" && !isActionLocked("CLOCK_IN")
-                  ? "bg-blue-600 text-white border-blue-600"
-                  : "bg-white text-slate-700 border-slate-300"
+              className={`py-2.5 rounded-xl text-xs font-extrabold shadow-sm ${
+                isActionLocked("CLOCK_IN")
+                  ? "bg-slate-200 text-slate-400 cursor-not-allowed"
+                  : selectedAction === "CLOCK_IN"
+                  ? "bg-emerald-600 text-white"
+                  : "bg-emerald-50 text-emerald-700 border border-emerald-200"
               }`}
             >
-              MASUK
+              {attendanceGuard.hasClockInToday
+                ? "Sudah Absen Masuk"
+                : isKaryawanMode
+                ? "Foto & Absen Masuk"
+                : "Absen Masuk"}
             </button>
             <button
               type="button"
               disabled={isActionLocked("CLOCK_OUT")}
               onClick={() => {
-                unlockAudioContext();
                 setSelectedAction("CLOCK_OUT");
-                void submitAttendance("CLOCK_OUT");
+                if (isKaryawanMode) {
+                  void openSelfieCamera("CLOCK_OUT");
+                } else {
+                  void submitAttendance("CLOCK_OUT");
+                }
               }}
-              className={`py-2 rounded-lg text-xs font-extrabold border disabled:opacity-45 ${
-                selectedAction === "CLOCK_OUT" && !isActionLocked("CLOCK_OUT")
-                  ? "bg-blue-600 text-white border-blue-600"
-                  : "bg-white text-slate-700 border-slate-300"
+              className={`py-2.5 rounded-xl text-xs font-extrabold shadow-sm ${
+                isActionLocked("CLOCK_OUT")
+                  ? "bg-slate-200 text-slate-400 cursor-not-allowed"
+                  : selectedAction === "CLOCK_OUT"
+                  ? "bg-rose-600 text-white"
+                  : "bg-rose-50 text-rose-700 border border-rose-200"
               }`}
             >
-              KELUAR
+              {attendanceGuard.hasClockOutToday
+                ? "Sudah Absen Keluar"
+                : isKaryawanMode
+                ? "Foto & Absen Keluar"
+                : "Absen Keluar"}
+            </button>
+          </div>
+
+          <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200 space-y-2">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[11px] font-bold text-slate-700">
+                Kamera Foto TimeMark (Depan + Cap Waktu &amp; Lokasi)
+              </span>
+              <div className="flex items-center gap-1.5">
+                {!selfieCameraOn ? (
+                  <button
+                    type="button"
+                    onClick={() => void openSelfieCamera()}
+                    className="px-2.5 py-1 rounded-lg bg-indigo-600 text-white text-[10px] font-bold"
+                  >
+                    Buka Kamera Selfie
+                  </button>
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => void takeSelfiePhoto()}
+                      className="px-2.5 py-1 rounded-lg bg-emerald-600 text-white text-[10px] font-bold"
+                    >
+                      Ambil Foto Selfie
+                    </button>
+                    <button
+                      type="button"
+                      onClick={stopSelfieCam}
+                      className="px-2 py-1 rounded-lg bg-rose-600 text-white text-[10px] font-bold"
+                    >
+                      Tutup
+                    </button>
+                  </>
+                )}
+              </div>
+            </div>
+
+            <div
+              className={`text-[10px] font-semibold px-2 py-1 rounded ${
+                faceStatus === "detected"
+                  ? "bg-emerald-100 text-emerald-800"
+                  : faceStatus === "no_face"
+                  ? "bg-rose-100 text-rose-800"
+                  : "bg-white text-slate-600 border border-slate-200"
+              }`}
+            >
+              {faceText}
+            </div>
+
+            <video
+              ref={selfieVideoRef}
+              playsInline
+              muted
+              className={`w-full max-h-52 rounded-lg bg-black object-cover -scale-x-100 ${
+                selfieCameraOn ? "block" : "hidden"
+              }`}
+            />
+            <canvas ref={selfieCanvasRef} className="hidden" />
+
+            {capturedSelfie && (
+              <div className="space-y-1.5">
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src={capturedSelfie}
+                  alt="Preview Selfie TimeMark"
+                  className="w-full max-h-52 object-cover rounded-lg border border-emerald-300"
+                />
+                <div className="flex items-center justify-between">
+                  <span className="text-[10px] text-emerald-700 font-bold">
+                    Foto TimeMark siap dikirim bersama absen{" "}
+                    {selectedAction === "CLOCK_OUT" ? "KELUAR" : "MASUK"}.
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => void openSelfieCamera(selectedAction)}
+                    className="text-[10px] text-blue-700 underline font-bold"
+                  >
+                    Foto Ulang
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+
+          <div className="flex gap-1.5">
+            <input
+              type="text"
+              placeholder="Scan / ketik kode Barcode atau QR kantor..."
+              value={qrInput}
+              onChange={(e) => setQrInput(e.target.value)}
+              className="flex-1 min-w-0 rounded-lg border border-slate-300 px-3 py-2 text-xs uppercase"
+            />
+            <button
+              type="button"
+              onClick={() =>
+                qrCameraOn ? stopQrCam() : void startScannerCamera()
+              }
+              className="px-3 py-2 rounded-lg bg-slate-900 text-white text-xs font-bold shrink-0"
+            >
+              {qrCameraOn ? "Stop" : "Scan QR"}
+            </button>
+          </div>
+
+          <video
+            ref={qrVideoRef}
+            playsInline
+            muted
+            className={`w-full max-h-44 rounded-lg bg-black object-cover ${
+              qrCameraOn ? "block" : "hidden"
+            }`}
+          />
+
+          <div className="flex items-center justify-between gap-2 text-[11px] text-slate-600 bg-slate-50 px-2.5 py-2 rounded-lg border border-slate-200">
+            <span className="truncate">{geofenceLabel}</span>
+            <button
+              type="button"
+              onClick={requestCurrentGps}
+              className="px-2 py-1 rounded bg-white border border-slate-300 text-[10px] font-bold text-slate-700 shrink-0"
+            >
+              Ambil GPS
             </button>
           </div>
 
           <button
             type="button"
-            onClick={() =>
-              qrCameraOn ? stopQrCam() : void startScannerCamera()
-            }
-            className="w-full py-2.5 rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-bold"
+            disabled={isActionLocked(selectedAction)}
+            onClick={() => void submitAttendance()}
+            className={`w-full py-2.5 rounded-xl text-white text-xs font-extrabold shadow-sm ${
+              isActionLocked(selectedAction)
+                ? "bg-slate-400 cursor-not-allowed"
+                : "bg-blue-600 hover:bg-blue-700"
+            }`}
           >
-            {qrCameraOn
-              ? "Tutup Scanner Barcode/QR"
-              : "Buka Scanner Barcode / QR"}
+            {isActionLocked(selectedAction)
+              ? "Absen Hari Ini Sudah Tercatat / Menunggu Jeda 6 Jam"
+              : `Kirim Absen ${
+                  selectedAction === "CLOCK_OUT" ? "KELUAR" : "MASUK"
+                }`}
           </button>
 
-          {qrCameraOn && (
-            <div className="w-44 h-44 mx-auto rounded-xl overflow-hidden bg-black border-2 border-emerald-600">
-              <video
-                ref={qrVideoRef}
-                playsInline
-                muted
-                className="w-full h-full object-cover"
-              />
-            </div>
-          )}
-
-          <div className="flex gap-1.5">
-            <input
-              type="text"
-              placeholder="Input Kode Barcode/QR manual jika kamera terkendala"
-              value={qrInput}
-              onChange={(e) => setQrInput(e.target.value)}
-              className="flex-1 rounded-lg border border-slate-300 px-2.5 py-2 text-xs"
-            />
-            <button
-              type="button"
-              disabled={isActionLocked(selectedAction)}
-              onClick={() => void submitAttendance(selectedAction, qrInput)}
-              className="px-3.5 py-2 rounded-lg bg-slate-900 disabled:opacity-45 text-white text-xs font-bold"
-            >
-              Kirim
-            </button>
-          </div>
-
-          <div className="pt-2 border-t border-slate-100 space-y-2">
-            <div className="flex items-center justify-between">
-              <span className="text-[11px] font-extrabold text-slate-700">
-                Selfie Kamera Depan + TimeMark (Masuk &amp; Keluar)
-              </span>
-              {capturedSelfie && (
-                <span className="text-[10px] font-bold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded">
-                  Siap ({selectedAction === "CLOCK_OUT" ? "KELUAR" : "MASUK"})
-                </span>
-              )}
-            </div>
-            <p
-              className={`text-[10px] font-semibold ${
-                faceStatus === "detected"
-                  ? "text-emerald-700"
-                  : faceStatus === "no_face"
-                  ? "text-rose-600"
-                  : "text-slate-500"
-              }`}
-            >
-              {faceText}
-            </p>
-
-            {selfieCameraOn && (
-              <div className="space-y-1.5">
-                <div className="w-44 h-44 mx-auto rounded-xl overflow-hidden bg-black border-2 border-blue-600">
-                  <video
-                    ref={selfieVideoRef}
-                    playsInline
-                    muted
-                    className="w-full h-full object-cover scale-x-[-1]"
-                  />
-                </div>
-                <div className="grid grid-cols-2 gap-1.5">
-                  <button
-                    type="button"
-                    onClick={() => void takeSelfiePhoto()}
-                    className="py-2 rounded-lg bg-blue-600 text-white text-xs font-bold"
-                  >
-                    Ambil Foto Selfie
-                  </button>
-                  <button
-                    type="button"
-                    onClick={stopSelfieCam}
-                    className="py-2 rounded-lg bg-slate-200 text-slate-800 text-xs font-bold"
-                  >
-                    Batal
-                  </button>
-                </div>
-              </div>
-            )}
-
-            {!selfieCameraOn && (
-              <div className="grid grid-cols-2 gap-1.5">
-                <button
-                  type="button"
-                  onClick={() => void openSelfieCamera("CLOCK_IN")}
-                  className="py-2 rounded-lg bg-slate-800 hover:bg-slate-900 text-white text-[11px] font-bold"
-                >
-                  Kamera Depan (Masuk)
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void openSelfieCamera("CLOCK_OUT")}
-                  className="py-2 rounded-lg bg-indigo-700 hover:bg-indigo-800 text-white text-[11px] font-bold"
-                >
-                  Kamera Depan (Keluar)
-                </button>
-              </div>
-            )}
-
-            {capturedSelfie && !selfieCameraOn && (
-              <div className="flex items-center gap-2.5">
-                {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img
-                  src={capturedSelfie}
-                  alt="Selfie Wajah TimeMark"
-                  className="w-16 h-16 rounded-lg object-cover border border-emerald-500"
-                />
-                <span className="text-[11px] text-emerald-800 font-semibold">
-                  Foto TimeMark (waktu, GPS &amp; verifikasi) tersimpan. Klik{" "}
-                  {selectedAction === "CLOCK_OUT" ? "KELUAR" : "MASUK"}.
-                </span>
-              </div>
-            )}
-            <canvas ref={selfieCanvasRef} className="hidden" />
-          </div>
-
           {isKaryawanMode && (
-            <div className="pt-2 border-t border-slate-100 space-y-1">
+            <div className="pt-1 space-y-1">
               <div className="text-[10px] font-bold text-slate-500 uppercase">
-                Riwayat Absen Saya (WIB)
+                Riwayat Absen Anda (Terbaru)
               </div>
               {myRecentEntries.length === 0 ? (
-                <div className="text-[11px] text-slate-400">
+                <div className="text-[11px] text-slate-400 italic">
                   Belum ada catatan absen.
                 </div>
               ) : (
-                myRecentEntries.map((row, idx) => (
+                myRecentEntries.map((item) => (
                   <div
-                    key={`${row.client_uuid}-${idx}`}
-                    className="flex items-center justify-between text-[11px] bg-slate-50 px-2.5 py-1.5 rounded-lg"
+                    key={item.client_uuid}
+                    className="flex items-center justify-between text-[11px] py-1.5 px-2.5 rounded-lg bg-slate-50 border border-slate-100"
                   >
                     <span className="font-bold">
-                      {row.entry_type === "CLOCK_IN" ? "MASUK" : "KELUAR"}
+                      {item.entry_type === "CLOCK_IN" ? "MASUK" : "KELUAR"} •{" "}
+                      {formatTimeWIB(item.punched_at)} WIB
                     </span>
-                    <span className="text-slate-600">
-                      {formatTimeWIB(row.punched_at)} WIB
+                    <span className="text-[10px] text-slate-500">
+                      {item.is_offline_sync ? "Antrean" : "Tersimpan"}
                     </span>
                   </div>
                 ))
@@ -4778,43 +4731,25 @@ export default function AbsensiMultiServerPage() {
 
         {!isKaryawanMode && (
           <>
-            <section className="bg-white rounded-2xl p-3.5 border border-slate-200/80 shadow-sm space-y-2">
-              <div className="flex items-center justify-between gap-2">
-                <h2 className="text-xs font-extrabold text-slate-800">
-                  2. Input Jadwal Mingguan Karyawan (File .PDF Khusus Admin)
-                </h2>
-                <span className="px-2 py-0.5 rounded bg-indigo-100 text-indigo-800 text-[9px] font-extrabold">
-                  KHUSUS ADMIN
-                </span>
-              </div>
-              {isAdminServer ? (
-                <>
-                  <p className="text-[10px] text-slate-500">
-                    Unggah file <b>.PDF</b> jadwal yang dibuat Admin. Setelah
-                    diunggah, <b>Gambar Jadwal Keberangkatan Karyawan</b>{" "}
-                    otomatis muncul di board dasbor Admin maupun setiap dasbor
-                    Karyawan.
-                  </p>
-                  <div className="flex items-center gap-1.5 rounded-lg border border-slate-200 p-1.5 bg-slate-50">
-                    <button
-                      type="button"
-                      onClick={() => scheduleInputRef.current?.click()}
-                      className="px-2.5 py-1 rounded bg-blue-600 hover:bg-blue-700 text-white text-[11px] font-bold shrink-0"
-                    >
-                      Pilih File PDF
-                    </button>
-                    <span className="flex-1 text-[11px] text-slate-500 truncate">
-                      {scheduleFileName}
-                    </span>
-                    {(schedulePoster || schedulePreview.length > 0) && (
-                      <button
-                        type="button"
-                        onClick={() => void handleDeleteSchedulePdf()}
-                        className="px-2 py-1 rounded bg-rose-600 hover:bg-rose-700 text-white text-[10px] font-bold shrink-0"
-                      >
-                        Hapus File PDF
-                      </button>
-                    )}
+            {isAdminServer && (
+              <section className="bg-white rounded-2xl p-3.5 border-t-4 border-t-amber-500 border border-slate-200/80 shadow-sm space-y-2.5">
+                <div className="flex items-center justify-between">
+                  <h2 className="text-xs font-extrabold text-slate-800">
+                    2. Input Jadwal Mingguan Karyawan (File .PDF Khusus Admin)
+                  </h2>
+                  <span className="px-2 py-0.5 rounded bg-amber-100 text-amber-800 text-[9px] font-extrabold uppercase">
+                    KHUSUS ADMIN
+                  </span>
+                </div>
+                <p className="text-[10px] text-slate-500">
+                  Unggah file <b>.PDF</b> jadwal yang dibuat Admin. Setelah
+                  diunggah, <b>Gambar Jadwal Keberangkatan Karyawan</b>{" "}
+                  otomatis muncul di board dasbor Admin maupun setiap dasbor
+                  Karyawan.
+                </p>
+                <div className="flex flex-wrap items-center gap-2">
+                  <label className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold cursor-pointer shrink-0">
+                    Pilih File PDF
                     <input
                       ref={scheduleInputRef}
                       type="file"
@@ -4822,658 +4757,627 @@ export default function AbsensiMultiServerPage() {
                       onChange={(e) => void handleScheduleFile(e)}
                       className="hidden"
                     />
-                  </div>
-                </>
-              ) : (
-                <div className="p-2.5 rounded-lg bg-amber-50 border border-amber-200 text-[11px] text-amber-900 font-semibold">
-                  Hanya Admin yang dapat memasukkan file jadwal PDF melalui
-                  dasbor Admin.
+                  </label>
+                  <span className="text-[11px] text-slate-600 truncate flex-1 min-w-0">
+                    {scheduleFileName}
+                  </span>
+                  {(schedulePoster || schedulePreview.length > 0) && (
+                    <button
+                      type="button"
+                      onClick={() => void handleDeleteSchedulePdf()}
+                      className="px-2.5 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-700 text-white text-[10px] font-bold shrink-0"
+                    >
+                      Hapus File PDF
+                    </button>
+                  )}
                 </div>
-              )}
-              {schedulePreview.length > 0 && (
-                <div className="space-y-1 pt-1">
-                  {schedulePreview.map((r, idx) => {
-                    const p = SHIFT_PRESETS[r.shift_code] || SHIFT_PRESETS.P;
-                    return (
+
+                {schedulePreview.length > 0 && (
+                  <div className="space-y-1 pt-1 max-h-40 overflow-y-auto">
+                    {schedulePreview.map((r, i) => (
                       <div
-                        key={`${r.emp_code}-${idx}`}
-                        className="text-[10px] bg-emerald-50 text-emerald-900 px-2.5 py-1 rounded flex justify-between items-center font-semibold"
+                        key={i}
+                        className="flex items-center justify-between text-[11px] bg-slate-50 px-2.5 py-1.5 rounded-lg border border-slate-100"
                       >
-                        <span>
+                        <span className="font-bold">
                           {r.full_name} ({r.emp_code})
                         </span>
                         <span
-                          className={`px-1.5 py-0.5 rounded text-[9px] font-extrabold ${p.badgeClass}`}
+                          className={`px-2 py-0.5 rounded text-[10px] font-extrabold ${
+                            r.shift_code === "OFF"
+                              ? "bg-rose-100 text-rose-700"
+                              : "bg-emerald-100 text-emerald-800"
+                          }`}
                         >
                           {r.shift_label}
                         </span>
                       </div>
-                    );
-                  })}
-                </div>
-              )}
-            </section>
-
-            <section className="bg-white rounded-2xl p-3.5 border border-slate-200/80 shadow-sm space-y-2.5">
-              <div className="flex items-center justify-between gap-1.5">
-                <h2 className="text-xs font-extrabold text-slate-800">
-                  3. Laporan &amp; Data Absensi:
-                </h2>
-                <div className="flex items-center gap-1">
-                  <select
-                    value={reportEmpFilter}
-                    onChange={(e) => {
-                      setReportEmpFilter(e.target.value);
-                      setSelectedReportUuids([]);
-                    }}
-                    className="rounded-lg border border-slate-300 px-1.5 py-1 text-[10px] font-semibold bg-white max-w-[115px]"
-                  >
-                    <option value="ALL">Semua Anggota</option>
-                    {employees.map((emp) => (
-                      <option key={emp.id} value={String(emp.id)}>
-                        {emp.full_name}
-                      </option>
                     ))}
-                  </select>
-                  <select
-                    value={reportFilter}
-                    onChange={(e) => {
-                      setReportFilter(
-                        e.target.value as "Harian" | "Mingguan" | "Bulanan"
-                      );
-                      setSelectedReportUuids([]);
-                    }}
-                    className="rounded-lg border border-slate-300 px-1.5 py-1 text-[10px] font-semibold bg-white"
-                  >
-                    <option value="Harian">Harian</option>
-                    <option value="Mingguan">Mingguan</option>
-                    <option value="Bulanan">Bulanan</option>
-                  </select>
+                  </div>
+                )}
+              </section>
+            )}
+
+            <section className="bg-white rounded-2xl p-3.5 border-t-4 border-t-purple-600 border border-slate-200/80 shadow-sm space-y-2.5">
+              <div className="flex items-center justify-between gap-2">
+                <h2 className="text-xs font-extrabold text-slate-800">
+                  3. Rekap &amp; Laporan Absensi (Pilih/Edit/Hapus/Unduh)
+                </h2>
+                <div className="flex gap-1">
+                  {(["Harian", "Mingguan", "Bulanan"] as const).map((p) => (
+                    <button
+                      key={p}
+                      type="button"
+                      onClick={() => setReportFilter(p)}
+                      className={`px-2 py-1 rounded-md text-[10px] font-bold ${
+                        reportFilter === p
+                          ? "bg-blue-600 text-white"
+                          : "bg-slate-100 text-slate-600"
+                      }`}
+                    >
+                      {p}
+                    </button>
+                  ))}
                 </div>
               </div>
 
-              <div className="flex items-center justify-between text-[10px] bg-slate-50 px-2.5 py-1.5 rounded-lg border border-slate-200">
-                <span className="font-semibold text-slate-600">
-                  Tercentang:{" "}
-                  <b className="text-[#082A63]">
-                    {selectedReportUuids.length > 0
-                      ? `${selectedReportUuids.length} baris terpilih`
-                      : `Semua (${filteredEntries.length} baris)`}
-                  </b>
-                </span>
+              <div className="flex items-center justify-between gap-2">
+                <select
+                  value={reportEmpFilter}
+                  onChange={(e) => setReportEmpFilter(e.target.value)}
+                  className="flex-1 rounded-lg border border-slate-300 px-2.5 py-1.5 text-[11px] font-semibold bg-white"
+                >
+                  <option value="ALL">
+                    Semua Anggota ({staffList.length} Karyawan)
+                  </option>
+                  {staffList.map((s) => (
+                    <option key={s.id} value={String(s.id)}>
+                      {s.full_name} ({s.emp_code})
+                    </option>
+                  ))}
+                </select>
                 <button
                   type="button"
                   onClick={toggleSelectAllReport}
-                  className="font-bold text-blue-700 underline"
+                  className="px-2.5 py-1.5 rounded-lg bg-slate-100 text-slate-700 text-[10px] font-bold shrink-0"
                 >
-                  {selectedReportUuids.length === filteredEntries.length &&
-                  filteredEntries.length > 0
-                    ? "Batal Centang"
-                    : "Centang Semua"}
+                  {filteredEntries.length > 0 &&
+                  selectedReportUuids.length === filteredEntries.length
+                    ? "Batal Pilih"
+                    : `Pilih Semua (${filteredEntries.length})`}
                 </button>
-              </div>
-
-              <div className="p-2 rounded-xl bg-slate-50 border border-slate-200 space-y-1.5">
-                <div className="flex items-center justify-between">
-                  <span className="text-[10px] font-extrabold text-[#082A63] uppercase">
-                    Inspeksi Laporan (MURINDA • Security Dormitory Batang)
-                  </span>
-                  <span className="text-[9px] font-bold text-[#0B3B8C] bg-blue-100 px-1.5 py-0.5 rounded">
-                    ADMIN INSPEKSI
-                  </span>
-                </div>
-                <div className="grid grid-cols-2 gap-1.5">
-                  <button
-                    type="button"
-                    onClick={() => runInspection("XLSX")}
-                    className="py-1.5 rounded-lg bg-[#082A63] text-white text-[10px] font-bold"
-                  >
-                    Inspeksi XLSX
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => runInspection("PDF")}
-                    className="py-1.5 rounded-lg bg-[#0B3B8C] text-white text-[10px] font-bold"
-                  >
-                    Inspeksi PDF
-                  </button>
-                </div>
-                {inspectionMode !== "NONE" && (
-                  <div className="p-2 rounded-lg bg-white border border-blue-200 text-[10px] text-slate-700 space-y-1">
-                    <div className="font-extrabold text-[#082A63]">
-                      MURINDA — Timesheet Absensi Security Dormitory Batang
-                    </div>
-                    <div>{inspectionNote}</div>
-                    <button
-                      type="button"
-                      onClick={() => setInspectionMode("NONE")}
-                      className="text-[9px] font-bold underline text-slate-500"
-                    >
-                      Tutup Inspeksi
-                    </button>
-                  </div>
-                )}
               </div>
 
               <div className="grid grid-cols-3 gap-1.5">
                 <button
                   type="button"
                   onClick={() => exportReport("XLSX")}
-                  className="py-2 rounded-lg bg-emerald-700 text-white text-[11px] font-bold"
+                  className="py-2 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-[11px] font-bold"
                 >
-                  Download XLSX
-                </button>
-                <button
-                  type="button"
-                  onClick={() => exportReport("PDF")}
-                  className="py-2 rounded-lg bg-rose-600 text-white text-[11px] font-bold"
-                >
-                  Download PDF
+                  Unduh Excel
                 </button>
                 <button
                   type="button"
                   onClick={() => exportReport("CSV")}
-                  className="py-2 rounded-lg bg-slate-800 text-white text-[11px] font-bold"
+                  className="py-2 rounded-lg bg-sky-600 hover:bg-sky-700 text-white text-[11px] font-bold"
                 >
-                  Download CSV
+                  Unduh CSV
+                </button>
+                <button
+                  type="button"
+                  onClick={() => exportReport("PDF")}
+                  className="py-2 rounded-lg bg-rose-600 hover:bg-rose-700 text-white text-[11px] font-bold"
+                >
+                  Unduh PDF
                 </button>
               </div>
 
-              {editingUuid && (
-                <div className="p-2.5 rounded-xl bg-amber-50 border border-amber-300 space-y-2">
-                  <div className="text-[11px] font-extrabold text-amber-900">
-                    Edit Catatan Absensi
-                  </div>
-                  <div className="grid grid-cols-2 gap-1.5">
-                    <select
-                      value={editType}
-                      onChange={(e) =>
-                        setEditType(e.target.value as "CLOCK_IN" | "CLOCK_OUT")
-                      }
-                      className="rounded-lg border px-2 py-1.5 text-xs bg-white"
-                    >
-                      <option value="CLOCK_IN">MASUK</option>
-                      <option value="CLOCK_OUT">KELUAR</option>
-                    </select>
-                    <input
-                      type="datetime-local"
-                      value={editTimeLocal}
-                      onChange={(e) => setEditTimeLocal(e.target.value)}
-                      className="rounded-lg border px-2 py-1.5 text-xs bg-white"
-                    />
-                  </div>
-                  <input
-                    type="text"
-                    placeholder="Catatan edit"
-                    value={editNotes}
-                    onChange={(e) => setEditNotes(e.target.value)}
-                    className="w-full rounded-lg border px-2.5 py-1.5 text-xs bg-white"
-                  />
-                  <div className="flex gap-1.5">
-                    <button
-                      type="button"
-                      onClick={() => void commitEditEntry()}
-                      className="px-3 py-1 rounded-lg bg-emerald-600 text-white text-xs font-bold"
-                    >
-                      Simpan
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setEditingUuid(null)}
-                      className="px-3 py-1 rounded-lg bg-slate-200 text-slate-800 text-xs font-bold"
-                    >
-                      Batal
-                    </button>
-                  </div>
+              {isAdminServer && (
+                <div className="grid grid-cols-2 gap-1.5 pt-0.5">
+                  <button
+                    type="button"
+                    onClick={() => runInspection("XLSX")}
+                    className="py-1.5 rounded-lg bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-200 text-[10px] font-bold"
+                  >
+                    Inspeksi Laporan Excel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => runInspection("PDF")}
+                    className="py-1.5 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-800 border border-rose-200 text-[10px] font-bold"
+                  >
+                    Inspeksi Laporan PDF
+                  </button>
                 </div>
               )}
 
-              <div className="overflow-x-auto rounded-lg border border-slate-200">
-                <table className="w-full text-left border-collapse text-[10px]">
-                  <thead>
-                    <tr className="bg-[#0B1220] text-white">
-                      <th className="p-1.5 text-center">
-                        <input
-                          type="checkbox"
-                          checked={
-                            filteredEntries.length > 0 &&
-                            selectedReportUuids.length === filteredEntries.length
-                          }
-                          onChange={toggleSelectAllReport}
-                        />
-                      </th>
-                      <th className="p-1.5">Tanggal</th>
-                      <th className="p-1.5">Nama</th>
-                      <th className="p-1.5">Shift</th>
-                      <th className="p-1.5">Jenis</th>
-                      <th className="p-1.5">Scan</th>
-                      <th className="p-1.5">Telat</th>
-                      <th className="p-1.5">Aksi</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {filteredEntries.length === 0 ? (
-                      <tr>
-                        <td
-                          colSpan={8}
-                          className="p-4 text-center text-slate-400"
-                        >
-                          Belum ada data absensi
-                        </td>
-                      </tr>
-                    ) : (
-                      filteredEntries.map((item, idx) => {
-                        const emp = employees.find(
-                          (e) =>
-                            Number(e.id) === Number(item.employee_id) ||
-                            (item.emp_code &&
-                              e.emp_code.toUpperCase() ===
-                                item.emp_code.toUpperCase())
-                        );
-                        const shift = getEmployeeShiftForIso(
-                          emp,
-                          item.punched_at
-                        );
-                        const shiftPreset =
-                          SHIFT_PRESETS[shift.code] || SHIFT_PRESETS.P;
-                        const lateDetail =
-                          item.entry_type === "CLOCK_IN"
-                            ? calcLateDetail(item.punched_at, shift.startTime)
-                            : { lateMinutes: 0, isLate: false, statusNote: "" };
-                        return (
-                          <tr
-                            key={`${item.client_uuid}-${idx}`}
-                            className="border-t border-slate-100"
-                          >
-                            <td className="p-1.5 text-center">
-                              <input
-                                type="checkbox"
-                                checked={selectedReportUuids.includes(
-                                  item.client_uuid
+              {inspectionMode !== "NONE" && (
+                <div className="p-2.5 rounded-xl bg-slate-900 text-emerald-300 text-[10px] font-mono space-y-1">
+                  <div className="flex items-center justify-between text-white font-sans font-bold text-[11px]">
+                    <span>Hasil Inspeksi {inspectionMode}</span>
+                    <button
+                      type="button"
+                      onClick={() => setInspectionMode("NONE")}
+                      className="text-[10px] text-rose-300 underline"
+                    >
+                      Tutup
+                    </button>
+                  </div>
+                  <div>{inspectionNote}</div>
+                </div>
+              )}
+
+              <div className="space-y-1.5 max-h-72 overflow-y-auto">
+                {filteredEntries.length === 0 ? (
+                  <p className="text-xs text-slate-400 text-center py-4">
+                    Belum ada data absensi pada periode ini.
+                  </p>
+                ) : (
+                  filteredEntries.map((item) => {
+                    const isEditing = editingUuid === item.client_uuid;
+                    const isChecked = selectedReportUuids.includes(
+                      item.client_uuid
+                    );
+                    const emp = employees.find(
+                      (e) =>
+                        Number(e.id) === Number(item.employee_id) ||
+                        (item.emp_code &&
+                          e.emp_code.toUpperCase() ===
+                            item.emp_code.toUpperCase())
+                    );
+                    const shiftToday = getEmployeeShiftForIso(
+                      emp,
+                      item.punched_at
+                    );
+                    const lateInfo =
+                      item.entry_type === "CLOCK_IN"
+                        ? calcLateDetail(item.punched_at, shiftToday.startTime)
+                        : {
+                            lateMinutes: 0,
+                            isLate: false,
+                            statusNote: "",
+                          };
+
+                    return (
+                      <div
+                        key={item.client_uuid}
+                        className="p-2.5 rounded-xl bg-slate-50 border border-slate-200 space-y-1.5"
+                      >
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="flex items-start gap-2 min-w-0">
+                            <input
+                              type="checkbox"
+                              checked={isChecked}
+                              onChange={() => toggleReportUuid(item.client_uuid)}
+                              className="mt-0.5 rounded border-slate-300 shrink-0"
+                            />
+                            <div className="min-w-0">
+                              <div className="text-xs font-bold text-slate-800 truncate">
+                                {item.full_name || emp?.full_name || "Karyawan"}{" "}
+                                •{" "}
+                                <span
+                                  className={
+                                    item.entry_type === "CLOCK_IN"
+                                      ? "text-emerald-700"
+                                      : "text-rose-700"
+                                  }
+                                >
+                                  {item.entry_type === "CLOCK_IN"
+                                    ? "MASUK"
+                                    : "KELUAR"}
+                                </span>
+                                {lateInfo.isLate && (
+                                  <span className="ml-1.5 px-1.5 py-0.5 rounded bg-rose-100 text-rose-700 text-[9px] font-extrabold">
+                                    TELAT {lateInfo.lateMinutes}m
+                                  </span>
                                 )}
-                                onChange={() =>
-                                  toggleReportUuid(item.client_uuid)
+                              </div>
+                              <div className="text-[10px] text-slate-500">
+                                {getJakartaDateStr(item.punched_at)} •{" "}
+                                {formatTimeWIB(item.punched_at)} WIB • Shift{" "}
+                                {shiftToday.code} ({shiftToday.rangeLabel})
+                              </div>
+                              <div className="text-[10px] text-slate-500 truncate">
+                                {item.device_info ||
+                                  emp?.last_device?.summary ||
+                                  "Perangkat HP"}{" "}
+                                • {item.mode || "MANUAL KLIK"}
+                              </div>
+                              {item.notes && (
+                                <div className="text-[10px] text-slate-600 truncate">
+                                  {item.notes}
+                                </div>
+                              )}
+                            </div>
+                          </div>
+
+                          <div className="flex items-center gap-1 shrink-0">
+                            <button
+                              type="button"
+                              onClick={() => startEditEntry(item)}
+                              className="px-2 py-1 rounded bg-amber-100 text-amber-800 text-[10px] font-bold"
+                            >
+                              Edit
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => void removeEntry(item)}
+                              className="px-2 py-1 rounded bg-rose-100 text-rose-700 text-[10px] font-bold"
+                            >
+                              Hapus
+                            </button>
+                          </div>
+                        </div>
+
+                        {isEditing && (
+                          <div className="pt-2 border-t border-slate-200 space-y-1.5">
+                            <div className="grid grid-cols-2 gap-1.5">
+                              <select
+                                value={editType}
+                                onChange={(e) =>
+                                  setEditType(
+                                    e.target.value as "CLOCK_IN" | "CLOCK_OUT"
+                                  )
                                 }
-                              />
-                            </td>
-                            <td className="p-1.5 whitespace-nowrap">
-                              {getJakartaDateStr(item.punched_at)}
-                            </td>
-                            <td className="p-1.5 font-semibold whitespace-nowrap">
-                              {item.full_name || emp?.full_name || "Karyawan"}
-                            </td>
-                            <td className="p-1.5 whitespace-nowrap">
-                              <span
-                                className={`inline-block px-1.5 py-0.5 rounded font-extrabold text-[9px] ${shiftPreset.badgeClass}`}
+                                className="rounded border border-slate-300 px-2 py-1 text-[11px] bg-white"
                               >
-                                {shift.code}
-                              </span>
-                            </td>
-                            <td className="p-1.5 whitespace-nowrap">
-                              {item.entry_type === "CLOCK_IN"
-                                ? "MASUK"
-                                : "KELUAR"}
-                            </td>
-                            <td className="p-1.5 whitespace-nowrap">
-                              {formatTimeWIB(item.punched_at)}
-                            </td>
-                            <td className="p-1.5 whitespace-nowrap font-bold text-rose-600">
-                              {lateDetail.isLate
-                                ? `${lateDetail.lateMinutes}m`
-                                : "0m"}
-                            </td>
-                            <td className="p-1.5 whitespace-nowrap space-x-1">
+                                <option value="CLOCK_IN">MASUK</option>
+                                <option value="CLOCK_OUT">KELUAR</option>
+                              </select>
+                              <input
+                                type="datetime-local"
+                                value={editTimeLocal}
+                                onChange={(e) =>
+                                  setEditTimeLocal(e.target.value)
+                                }
+                                className="rounded border border-slate-300 px-2 py-1 text-[11px] bg-white"
+                              />
+                            </div>
+                            <input
+                              type="text"
+                              placeholder="Catatan / keterangan..."
+                              value={editNotes}
+                              onChange={(e) => setEditNotes(e.target.value)}
+                              className="w-full rounded border border-slate-300 px-2 py-1 text-[11px] bg-white"
+                            />
+                            <div className="flex justify-end gap-1.5">
                               <button
                                 type="button"
-                                onClick={() => startEditEntry(item)}
-                                className="px-1.5 py-0.5 rounded bg-amber-500 text-white font-bold"
+                                onClick={() => setEditingUuid(null)}
+                                className="px-2.5 py-1 rounded bg-slate-200 text-slate-700 text-[10px] font-bold"
+                              >
+                                Batal
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => void commitEditEntry()}
+                                className="px-2.5 py-1 rounded bg-blue-600 text-white text-[10px] font-bold"
+                              >
+                                Simpan
+                              </button>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+            </section>
+
+            {isAdminServer && (
+              <>
+                <section
+                  ref={empFormSectionRef}
+                  className="bg-white rounded-2xl p-3.5 border-t-4 border-t-teal-600 border border-slate-200/80 shadow-sm space-y-2.5"
+                >
+                  <div className="flex items-center justify-between">
+                    <h2 className="text-xs font-extrabold text-slate-800">
+                      4. Kelola Akun, PIN &amp; Jadwal Mingguan Karyawan
+                    </h2>
+                    <span className="px-2 py-0.5 rounded bg-teal-100 text-teal-800 text-[9px] font-extrabold uppercase">
+                      KHUSUS ADMIN
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-1.5">
+                    <input
+                      type="text"
+                      placeholder="ID Karyawan (cth: KRY-005)"
+                      value={empForm.emp_code}
+                      onChange={(e) =>
+                        setEmpForm({ ...empForm, emp_code: e.target.value })
+                      }
+                      className="rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs"
+                    />
+                    <input
+                      type="text"
+                      placeholder="Nama Lengkap"
+                      value={empForm.full_name}
+                      onChange={(e) =>
+                        setEmpForm({ ...empForm, full_name: e.target.value })
+                      }
+                      className="rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs"
+                    />
+                    <input
+                      type="text"
+                      placeholder="PIN Login Anggota (cth: 1001)"
+                      value={empForm.pin_code}
+                      onChange={(e) =>
+                        setEmpForm({ ...empForm, pin_code: e.target.value })
+                      }
+                      className="rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs"
+                    />
+                    <select
+                      value={empForm.shift_start_time}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        const code = shiftTimeToCode(val);
+                        const nextWk = { ...empForm.weekly_schedule };
+                        DAYS_OF_WEEK.forEach((d) => {
+                          if (d !== "Minggu") nextWk[d] = code;
+                        });
+                        setEmpForm({
+                          ...empForm,
+                          shift_start_time: val,
+                          weekly_schedule: nextWk,
+                        });
+                      }}
+                      className="rounded-lg border border-slate-300 px-2 py-1.5 text-xs bg-white"
+                    >
+                      {SHIFT_OPTIONS.map((opt) => (
+                        <option key={opt.label} value={opt.time}>
+                          {opt.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="p-2 rounded-xl bg-slate-50 border border-slate-200 space-y-1.5">
+                    <div className="text-[10px] font-extrabold text-slate-700">
+                      Jadwal Mingguan per Hari (Senin – Minggu):
+                    </div>
+                    <div className="grid grid-cols-2 gap-1.5">
+                      {DAYS_OF_WEEK.map((day) => {
+                        const code = empForm.weekly_schedule[day] || "P";
+                        const preset =
+                          SHIFT_PRESETS[code] || SHIFT_PRESETS.P;
+                        return (
+                          <div
+                            key={day}
+                            className="flex items-center justify-between gap-1 bg-white p-1.5 rounded-lg border border-slate-200"
+                          >
+                            <span className="text-[10px] font-bold text-slate-700">
+                              {day}
+                            </span>
+                            <select
+                              value={code}
+                              onChange={(e) => {
+                                const nextCode = e.target.value as ShiftCode;
+                                const nextWk = {
+                                  ...empForm.weekly_schedule,
+                                  [day]: nextCode,
+                                };
+                                setEmpForm({
+                                  ...empForm,
+                                  weekly_schedule: nextWk,
+                                  shift_start_time:
+                                    day === "Senin"
+                                      ? shiftCodeToStartTime(nextCode)
+                                      : empForm.shift_start_time,
+                                });
+                              }}
+                              className={`rounded border px-1.5 py-0.5 text-[10px] font-extrabold ${preset.selectClass}`}
+                            >
+                              <option value="P">P • 07.00-15.00</option>
+                              <option value="S">S • 15.00-23.00</option>
+                              <option value="M">M • 23.00-07.00</option>
+                              <option value="P/M">P/M • Pagi &amp; Malam</option>
+                              <option value="OFF">OFF • Libur</option>
+                            </select>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  <div className="flex gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => void saveEmployee()}
+                      className="flex-1 py-2 rounded-lg bg-teal-600 hover:bg-teal-700 text-white text-xs font-bold"
+                    >
+                      {empForm.id
+                        ? "Simpan Edit Karyawan & Jadwal"
+                        : "Tambah Karyawan & Jadwal"}
+                    </button>
+                    {empForm.id !== 0 && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setEmpForm({
+                            id: 0,
+                            emp_code: "",
+                            full_name: "",
+                            role: "STAFF",
+                            department: "Security Dormitory Batang",
+                            pin_code: "1001",
+                            shift_start_time: "07.00",
+                            weekly_schedule: buildDefaultWeeklySchedule("P"),
+                          })
+                        }
+                        className="px-3 py-2 rounded-lg bg-slate-200 text-slate-700 text-xs font-bold"
+                      >
+                        Batal
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="space-y-1.5 pt-1 max-h-60 overflow-y-auto">
+                    {staffList.map((emp) => {
+                      const wk = sanitizeWeeklySchedule(
+                        emp.weekly_schedule,
+                        shiftTimeToCode(emp.shift_start_time)
+                      );
+                      return (
+                        <div
+                          key={emp.id}
+                          className="p-2 rounded-lg bg-slate-50 border border-slate-200 space-y-1"
+                        >
+                          <div className="flex items-center justify-between gap-2 text-xs">
+                            <div className="truncate">
+                              <span className="font-bold">{emp.full_name}</span>{" "}
+                              <span className="text-[10px] text-slate-500">
+                                ({emp.emp_code} • PIN: {emp.pin_code})
+                              </span>
+                            </div>
+                            <div className="flex gap-1 shrink-0">
+                              <button
+                                type="button"
+                                onClick={() => beginEditEmployeeCard(emp)}
+                                className="px-2 py-0.5 rounded bg-amber-100 text-amber-800 text-[10px] font-bold"
                               >
                                 Edit
                               </button>
                               <button
                                 type="button"
-                                onClick={() => void removeEntry(item)}
-                                className="px-1.5 py-0.5 rounded bg-rose-600 text-white font-bold"
+                                onClick={() => void deleteEmployee(emp)}
+                                className="px-2 py-0.5 rounded bg-rose-100 text-rose-700 text-[10px] font-bold"
                               >
                                 Hapus
                               </button>
-                            </td>
-                          </tr>
-                        );
-                      })
-                    )}
-                  </tbody>
-                </table>
-              </div>
-            </section>
-
-            <section className="bg-white rounded-2xl p-3.5 border-t-4 border-t-emerald-600 border border-slate-200/80 shadow-sm space-y-2.5 text-center">
-              <h2 className="text-xs font-extrabold text-slate-800 text-left">
-                4. QR Code Resmi Kantor Utama
-              </h2>
-              <p className="text-[10px] text-slate-500 text-left leading-relaxed">
-                Cetak atau tampilkan QR Code ini di lokasi kantor. Sistem
-                mengunci pemindaian agar karyawan hanya bisa absen{" "}
-                <b>MASUK</b> dan <b>KELUAR</b> memakai QR resmi ini.
-              </p>
-
-              <input
-                type="text"
-                value={officeQrCode}
-                onChange={(e) => void saveOfficeQrToServer(e.target.value)}
-                className="w-full rounded-lg border border-slate-200 px-2.5 py-1.5 text-[11px] font-bold text-center"
-              />
-
-              <div className="p-3 rounded-xl border border-slate-200 bg-white inline-block mx-auto">
-                {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img
-                  src={qrUrl}
-                  alt="QR Code Resmi Kantor Utama"
-                  className="w-40 h-40 mx-auto"
-                />
-                <div className="text-xs font-extrabold text-slate-900 mt-1.5">
-                  {officeQrCode}
-                </div>
-                <div className="text-[10px] text-slate-400">
-                  Titik: {targetLocation.latitude}, {targetLocation.longitude} •
-                  Radius {targetLocation.radius_meters}m
-                </div>
-              </div>
-
-              <div className="grid grid-cols-2 gap-2">
-                <a
-                  href={qrUrl}
-                  download={`${officeQrCode}.png`}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="py-2 rounded-lg bg-emerald-700 text-white text-xs font-bold"
-                >
-                  Download PNG
-                </a>
-                <button
-                  type="button"
-                  onClick={() => window.print()}
-                  className="py-2 rounded-lg bg-slate-900 text-white text-xs font-bold"
-                >
-                  Cetak QR
-                </button>
-              </div>
-            </section>
-
-            <section
-              ref={empFormSectionRef}
-              className="bg-white rounded-2xl p-3.5 border border-slate-200/80 shadow-sm space-y-2.5"
-            >
-              <div className="flex items-center justify-between gap-2">
-                <h2 className="text-xs font-extrabold text-slate-800">
-                  5. Panel {isAdminServer ? "Admin" : "Manager"}: Data Karyawan
-                  &amp; Koordinat
-                </h2>
-                {empForm.id > 0 && (
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setEmpForm({
-                        id: 0,
-                        emp_code: "",
-                        full_name: "",
-                        role: "STAFF",
-                        department: "Security Dormitory Batang",
-                        pin_code: "1001",
-                        shift_start_time: "07.00",
-                        weekly_schedule: buildDefaultWeeklySchedule("P"),
-                      })
-                    }
-                    className="px-2 py-0.5 rounded bg-slate-200 text-slate-700 text-[10px] font-bold"
-                  >
-                    Batal Edit
-                  </button>
-                )}
-              </div>
-
-              {empForm.id > 0 && (
-                <div className="px-2.5 py-1.5 rounded-lg bg-amber-50 border border-amber-300 text-[10px] font-bold text-amber-900">
-                  Sedang Mengedit: {empForm.full_name} ({empForm.emp_code})
-                </div>
-              )}
-
-              <div className="space-y-1.5">
-                <input
-                  type="text"
-                  placeholder="ID (cth: LJ-SCRTY-MPI.22112026.0004)"
-                  value={empForm.emp_code}
-                  onChange={(e) =>
-                    setEmpForm((p) => ({ ...p, emp_code: e.target.value }))
-                  }
-                  className="w-full rounded-lg border border-slate-300 px-2.5 py-2 text-xs font-bold uppercase"
-                />
-                <input
-                  type="text"
-                  placeholder="Nama Lengkap"
-                  value={empForm.full_name}
-                  onChange={(e) =>
-                    setEmpForm((p) => ({ ...p, full_name: e.target.value }))
-                  }
-                  className="w-full rounded-lg border border-slate-300 px-2.5 py-2 text-xs"
-                />
-                <div className="grid grid-cols-3 gap-1.5">
-                  <select
-                    value={empForm.role}
-                    onChange={(e) =>
-                      setEmpForm((p) => ({
-                        ...p,
-                        role: e.target.value as RoleType,
-                      }))
-                    }
-                    className="rounded-lg border border-slate-300 px-2 py-1.5 text-xs bg-white"
-                  >
-                    <option value="STAFF">STAFF</option>
-                    <option value="MANAGER">MANAGER</option>
-                    {isAdminServer && <option value="ADMIN">ADMIN</option>}
-                  </select>
-                  <input
-                    type="text"
-                    inputMode="numeric"
-                    placeholder="PIN"
-                    value={empForm.pin_code}
-                    onChange={(e) =>
-                      setEmpForm((p) => ({ ...p, pin_code: e.target.value }))
-                    }
-                    className="rounded-lg border border-blue-400 bg-blue-50/40 px-2 py-1.5 text-xs font-bold text-center"
-                  />
-                  <select
-                    value={empForm.shift_start_time}
-                    onChange={(e) => {
-                      const val = e.target.value;
-                      const code = shiftTimeToCode(val);
-                      setEmpForm((p) => ({
-                        ...p,
-                        shift_start_time: val,
-                        weekly_schedule: p.id
-                          ? { ...p.weekly_schedule, Senin: code }
-                          : buildDefaultWeeklySchedule(code),
-                      }));
-                    }}
-                    className="rounded-lg border border-slate-300 px-2 py-1.5 text-xs bg-white"
-                  >
-                    {SHIFT_OPTIONS.map((opt) => (
-                      <option key={opt.label} value={opt.time}>
-                        {opt.label}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-
-                <div className="p-2 rounded-xl bg-slate-50 border border-slate-200 space-y-1.5">
-                  <div className="text-[9.5px] font-extrabold text-slate-700 leading-relaxed">
-                    Jadwal Senin–Minggu:{" "}
-                    <span className="text-emerald-700">P (07.00–15.00)</span> •{" "}
-                    <span className="text-amber-700">S (15.00–23.00)</span> •{" "}
-                    <span className="text-blue-700">M (23.00–07.00)</span> •{" "}
-                    <span className="text-purple-700">
-                      P/M (07–15 &amp; 23–07)
-                    </span>{" "}
-                    • <span className="text-rose-600">OFF (Libur)</span>
-                  </div>
-                  <div className="grid grid-cols-7 gap-1 text-center">
-                    {DAYS_OF_WEEK.map((day) => {
-                      const code = empForm.weekly_schedule[day] || "P";
-                      const preset = SHIFT_PRESETS[code] || SHIFT_PRESETS.P;
-                      return (
-                        <div key={day} className="space-y-0.5">
-                          <div className="text-[9px] font-bold text-slate-600">
-                            {day.slice(0, 3)}
+                            </div>
                           </div>
-                          <select
-                            value={code}
-                            onChange={(e) => {
-                              const nextCode = e.target.value as ShiftCode;
-                              setEmpForm((p) => ({
-                                ...p,
-                                weekly_schedule: {
-                                  ...p.weekly_schedule,
-                                  [day]: nextCode,
-                                },
-                              }));
-                            }}
-                            className={`w-full rounded border px-0.5 py-1 text-[9.5px] font-extrabold text-center ${preset.selectClass}`}
-                          >
-                            <option value="P">P</option>
-                            <option value="S">S</option>
-                            <option value="M">M</option>
-                            <option value="P/M">P/M</option>
-                            <option value="OFF">OFF</option>
-                          </select>
+
+                          <div className="flex flex-wrap gap-1">
+                            {DAYS_OF_WEEK.map((d) => {
+                              const c = wk[d] || "P";
+                              const p = SHIFT_PRESETS[c] || SHIFT_PRESETS.P;
+                              return (
+                                <span
+                                  key={d}
+                                  className={`px-1.5 py-0.5 rounded text-[9px] font-extrabold ${p.badgeClass}`}
+                                >
+                                  {d.slice(0, 3)}:{c}
+                                </span>
+                              );
+                            })}
+                          </div>
+
+                          {emp.last_device?.summary && (
+                            <div className="text-[9.5px] text-slate-500 truncate">
+                              HP Terakhir: {emp.last_device.summary}
+                            </div>
+                          )}
                         </div>
                       );
                     })}
                   </div>
-                </div>
+                </section>
 
-                <button
-                  type="button"
-                  onClick={() => void saveEmployee()}
-                  className="w-full py-2 rounded-lg bg-blue-600 text-white text-xs font-bold"
-                >
-                  {empForm.id ? "Simpan Edit Karyawan" : "Simpan Karyawan"}
-                </button>
-              </div>
-
-              <div className="space-y-1.5 pt-1">
-                {employees.map((emp) => {
-                  const wk = sanitizeWeeklySchedule(
-                    emp.weekly_schedule,
-                    shiftTimeToCode(emp.shift_start_time)
-                  );
-                  const isLockedCode = LOCKED_STAFF_CODES.includes(
-                    emp.emp_code.toUpperCase() as (typeof LOCKED_STAFF_CODES)[number]
-                  );
-                  return (
-                    <div
-                      key={emp.emp_code}
-                      className={`p-2 rounded-lg border space-y-1 text-xs ${
-                        empForm.emp_code.toUpperCase() ===
-                        emp.emp_code.toUpperCase()
-                          ? "bg-amber-50 border-amber-400"
-                          : "bg-slate-50 border-slate-200/70"
-                      }`}
+                <section className="bg-white rounded-2xl p-3.5 border-t-4 border-t-rose-500 border border-slate-200/80 shadow-sm space-y-2.5">
+                  <div className="flex items-center justify-between">
+                    <h2 className="text-xs font-extrabold text-slate-800">
+                      5. Titik Koordinat Lokasi &amp; Radius Absen
+                    </h2>
+                    <button
+                      type="button"
+                      onClick={fillFromCurrentGps}
+                      className="px-2.5 py-1 rounded-lg bg-slate-100 text-slate-700 text-[10px] font-bold"
                     >
-                      <div className="flex flex-wrap items-center justify-between gap-1.5">
-                        <div className="break-all">
-                          <span className="font-bold">{emp.full_name}</span> (
-                          {emp.emp_code}) • PIN: <b>{emp.pin_code}</b> •{" "}
-                          {emp.role}
-                        </div>
-                        <div className="flex gap-1">
-                          <button
-                            type="button"
-                            onClick={() => beginEditEmployeeCard(emp)}
-                            className="px-2 py-0.5 rounded bg-amber-500 text-white text-[10px] font-bold"
-                          >
-                            Edit
-                          </button>
-                          {emp.role !== "ADMIN" && !isLockedCode && (
-                            <button
-                              type="button"
-                              onClick={() => void deleteEmployee(emp)}
-                              className="px-2 py-0.5 rounded bg-rose-600 text-white text-[10px] font-bold"
-                            >
-                              Hapus
-                            </button>
-                          )}
-                        </div>
-                      </div>
-                      {emp.last_device?.summary && (
-                        <div className="text-[9px] text-slate-500 truncate">
-                          HP Login: {emp.last_device.summary}
-                        </div>
-                      )}
-                      <div className="flex flex-wrap gap-1 text-[9px]">
-                        {DAYS_OF_WEEK.map((d) => {
-                          const c = wk[d] || "P";
-                          const p = SHIFT_PRESETS[c] || SHIFT_PRESETS.P;
-                          return (
-                            <span
-                              key={d}
-                              className={`px-1.5 py-0.5 rounded font-bold ${p.badgeClass}`}
-                            >
-                              {d.slice(0, 3)}: {c}
-                            </span>
-                          );
-                        })}
-                      </div>
+                      Isi dari GPS
+                    </button>
+                  </div>
+                  <div className="grid grid-cols-3 gap-1.5">
+                    <div>
+                      <label className="block text-[9px] font-bold text-slate-500 mb-0.5">
+                        Latitude
+                      </label>
+                      <input
+                        type="text"
+                        value={latInput}
+                        onChange={(e) => setLatInput(e.target.value)}
+                        className="w-full rounded-lg border border-slate-300 px-2 py-1.5 text-xs"
+                      />
                     </div>
-                  );
-                })}
-              </div>
-
-              <div className="pt-2.5 border-t border-slate-100 space-y-1.5">
-                <div className="flex items-center justify-between">
-                  <span className="text-[11px] font-extrabold text-slate-700">
-                    Atur Titik Koordinat &amp; Radius
-                  </span>
+                    <div>
+                      <label className="block text-[9px] font-bold text-slate-500 mb-0.5">
+                        Longitude
+                      </label>
+                      <input
+                        type="text"
+                        value={lngInput}
+                        onChange={(e) => setLngInput(e.target.value)}
+                        className="w-full rounded-lg border border-slate-300 px-2 py-1.5 text-xs"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[9px] font-bold text-slate-500 mb-0.5">
+                        Radius (m)
+                      </label>
+                      <input
+                        type="number"
+                        value={radiusInput}
+                        onChange={(e) => setRadiusInput(e.target.value)}
+                        className="w-full rounded-lg border border-slate-300 px-2 py-1.5 text-xs"
+                      />
+                    </div>
+                  </div>
                   <button
                     type="button"
-                    onClick={fillFromCurrentGps}
-                    className="px-2 py-0.5 rounded bg-slate-200 hover:bg-slate-300 text-slate-800 text-[10px] font-bold"
+                    onClick={() => void saveCustomLocation()}
+                    className="w-full py-2 rounded-lg bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold"
                   >
-                    Isi dari GPS Saat Ini
+                    Simpan Titik Koordinat &amp; Radius
                   </button>
-                </div>
-                <div className="grid grid-cols-3 gap-1.5">
-                  <input
-                    type="text"
-                    inputMode="decimal"
-                    placeholder="Latitude"
-                    value={latInput}
-                    onChange={(e) => setLatInput(e.target.value)}
-                    className="rounded-lg border border-slate-300 bg-white px-2 py-1.5 text-xs font-mono"
-                  />
-                  <input
-                    type="text"
-                    inputMode="decimal"
-                    placeholder="Longitude"
-                    value={lngInput}
-                    onChange={(e) => setLngInput(e.target.value)}
-                    className="rounded-lg border border-slate-300 bg-white px-2 py-1.5 text-xs font-mono"
-                  />
-                  <input
-                    type="number"
-                    placeholder="Radius (m)"
-                    value={radiusInput}
-                    onChange={(e) => setRadiusInput(e.target.value)}
-                    className="rounded-lg border border-slate-300 bg-white px-2 py-1.5 text-xs"
-                  />
-                </div>
-                <button
-                  type="button"
-                  onClick={() => void saveCustomLocation()}
-                  className="w-full py-1.5 rounded-lg bg-emerald-700 text-white text-xs font-bold"
-                >
-                  Simpan Titik Koordinat &amp; Radius
-                </button>
-              </div>
-            </section>
+                </section>
+
+                <section className="bg-white rounded-2xl p-3.5 border-t-4 border-t-slate-800 border border-slate-200/80 shadow-sm space-y-2.5">
+                  <h2 className="text-xs font-extrabold text-slate-800">
+                    6. Barcode / QR Kantor Resmi
+                  </h2>
+                  <div className="flex gap-1.5">
+                    <input
+                      type="text"
+                      value={officeQrCode}
+                      onChange={(e) =>
+                        setOfficeQrCode(e.target.value.toUpperCase())
+                      }
+                      className="flex-1 rounded-lg border border-slate-300 px-2.5 py-1.5 text-xs font-bold uppercase"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => {
+                        void saveOfficeQrToServer(officeQrCode);
+                        notify("ok", `QR Kantor disimpan: ${officeQrCode}`);
+                      }}
+                      className="px-3 py-1.5 rounded-lg bg-slate-900 text-white text-xs font-bold"
+                    >
+                      Simpan QR
+                    </button>
+                  </div>
+                  <div className="flex items-center gap-3 pt-1">
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img
+                      src={qrUrl}
+                      alt="QR Kantor"
+                      className="w-24 h-24 rounded-lg border border-slate-200 p-1 bg-white shrink-0"
+                    />
+                    <div className="space-y-1.5">
+                      <div className="text-[11px] font-bold text-slate-700">
+                        Kode: {officeQrCode}
+                      </div>
+                      <a
+                        href={qrUrl}
+                        download={`QR_${officeQrCode}.png`}
+                        className="inline-block px-3 py-1.5 rounded-lg bg-blue-600 text-white text-[11px] font-bold"
+                      >
+                        Unduh Gambar QR
+                      </a>
+                    </div>
+                  </div>
+                </section>
+              </>
+            )}
           </>
         )}
       </div>
