@@ -162,17 +162,18 @@ const SHIFT_OPTIONS = [
   { label: "( OFF ) Libur", time: "OFF", code: "OFF" as ShiftCode },
 ];
 
-const CACHE_KEY = "absensi_v11_cache";
-const QUEUE_KEY = "absensi_v11_queue";
-const QR_CODE_KEY = "absensi_v11_qr";
-const LOC_KEY = "absensi_v11_custom_loc";
-const WEEKLY_SCHED_KEY = "absensi_v11_weekly_sched";
-const SCHEDULE_POSTER_KEY = "absensi_v11_schedule_poster";
-const DEVICE_LOCK_KEY = "absensi_v11_device_locked_karyawan";
-const STAFF_EMP_KEY = "absensi_v11_staff_emp_id";
-const STAFF_SESSION_KEY = "absensi_v11_staff_logged_in";
-const DEVICE_REG_KEY = "absensi_v11_device_registry";
-const AUTH_SERVER_KEY = "absensi_v11_auth_server";
+const CACHE_KEY = "absensi_v12_cache";
+const QUEUE_KEY = "absensi_v12_queue";
+const QR_CODE_KEY = "absensi_v12_qr";
+const LOC_KEY = "absensi_v12_custom_loc";
+const WEEKLY_SCHED_KEY = "absensi_v12_weekly_sched";
+const SCHEDULE_POSTER_KEY = "absensi_v12_schedule_poster";
+const DEVICE_LOCK_KEY = "absensi_v12_device_locked_karyawan";
+const STAFF_EMP_KEY = "absensi_v12_staff_emp_id";
+const STAFF_EMP_CODE_KEY = "absensi_v12_staff_emp_code";
+const STAFF_SESSION_KEY = "absensi_v12_staff_logged_in";
+const DEVICE_REG_KEY = "absensi_v12_device_registry";
+const AUTH_SERVER_KEY = "absensi_v12_auth_server";
 
 function collectHpDeviceSystemInfo(loggedInAt?: string): DeviceSystemInfo {
   if (typeof window === "undefined" || typeof navigator === "undefined") {
@@ -190,13 +191,13 @@ function collectHpDeviceSystemInfo(loggedInAt?: string): DeviceSystemInfo {
 
   let deviceId = "";
   try {
-    deviceId = localStorage.getItem("absensi_v11_hw_id") || "";
+    deviceId = localStorage.getItem("absensi_v12_hw_id") || "";
     if (!deviceId) {
       deviceId = `HP-${Math.random().toString(36).slice(2, 7).toUpperCase()}-${Date.now()
         .toString(36)
         .slice(-4)
         .toUpperCase()}`;
-      localStorage.setItem("absensi_v11_hw_id", deviceId);
+      localStorage.setItem("absensi_v12_hw_id", deviceId);
     }
   } catch {
     deviceId = "HP-LOCAL";
@@ -413,7 +414,7 @@ const DEFAULT_EMPLOYEES: Employee[] = [
   {
     id: 3,
     emp_code: "AP-SCRTY-MPI.22112026.0001",
-    full_name: "Anggota AP",
+    full_name: "ANGGAR PERMADI",
     role: "STAFF",
     department: "Security Dormitory Batang",
     pin_code: "1001",
@@ -461,7 +462,7 @@ function ensureLockedEmployees(
     const empCodeClean = String(e.emp_code || "").trim().toUpperCase();
     const defCode = shiftTimeToCode(e.shift_start_time);
     const resolvedSchedule = sanitizeWeeklySchedule(
-      weeklyMap[empCodeClean] || e.weekly_schedule,
+      e.weekly_schedule || weeklyMap[empCodeClean],
       defCode
     );
     return {
@@ -470,10 +471,7 @@ function ensureLockedEmployees(
       role: normalizeRole(e.role),
       shift_start_time: normalizeShiftTime(e.shift_start_time),
       weekly_schedule: resolvedSchedule,
-      last_device:
-        devReg[empCodeClean] ||
-        e.last_device ||
-        null,
+      last_device: e.last_device || devReg[empCodeClean] || null,
     };
   });
 
@@ -641,7 +639,7 @@ function unlockAudioContext() {
       void ctx.resume();
     }
   } catch {
-    // Abaikan jika gagal
+    // Abaikan
   }
 }
 
@@ -687,7 +685,7 @@ function speakIndonesian(text: string) {
       runSpeak();
     }
   } catch {
-    // Abaikan jika TTS tidak didukung
+    // Abaikan
   }
 }
 
@@ -748,11 +746,7 @@ function detectShiftCodeFromText(text: string): ShiftCode {
   const upper = text.toUpperCase();
   const lower = text.toLowerCase();
 
-  if (
-    /\bOFF\b/.test(upper) ||
-    lower.includes("libur") ||
-    lower.includes("off")
-  ) {
+  if (/\bOFF\b/.test(upper) || lower.includes("libur") || lower.includes("off")) {
     return "OFF";
   }
   if (
@@ -986,9 +980,7 @@ function renderDepartureBoardPosterDataUrl(
           : "#3730A3";
       ctx.font = "900 12px sans-serif";
       const label =
-        code === "OFF"
-          ? "OFF"
-          : `${code} (${SHIFT_PRESETS[code].start})`;
+        code === "OFF" ? "OFF" : `${code} (${SHIFT_PRESETS[code].start})`;
       ctx.fillText(label, badgeX + 8, badgeY + 18);
     });
   });
@@ -1073,6 +1065,7 @@ function getInitialBoot() {
       isAuthenticatedPrivileged: false,
       qrCode: "ABSENSI-KANTOR-MPI-BTG",
       staffEmpId: 3,
+      staffEmpCode: "AP-SCRTY-MPI.22112026.0001",
       queue: [] as TimeEntry[],
       employees: DEFAULT_EMPLOYEES,
       locations: DEFAULT_LOCATIONS,
@@ -1083,6 +1076,7 @@ function getInitialBoot() {
 
   let qrCode = "ABSENSI-KANTOR-MPI-BTG";
   let staffEmpId = 3;
+  let staffEmpCode = "AP-SCRTY-MPI.22112026.0001";
   let isStaffLoggedIn = false;
   let queue: TimeEntry[] = [];
   const weeklyMap = loadWeeklySchedulesMap();
@@ -1124,7 +1118,10 @@ function getInitialBoot() {
     const savedStaff = localStorage.getItem(STAFF_EMP_KEY);
     if (savedStaff && Number(savedStaff) > 0) staffEmpId = Number(savedStaff);
 
-    if (localStorage.getItem(STAFF_SESSION_KEY) === "1" && savedStaff) {
+    const savedStaffCode = localStorage.getItem(STAFF_EMP_CODE_KEY);
+    if (savedStaffCode) staffEmpCode = savedStaffCode.toUpperCase();
+
+    if (localStorage.getItem(STAFF_SESSION_KEY) === "1" && (savedStaff || savedStaffCode)) {
       isStaffLoggedIn = true;
     }
 
@@ -1175,6 +1172,7 @@ function getInitialBoot() {
     isAuthenticatedPrivileged,
     qrCode,
     staffEmpId,
+    staffEmpCode,
     queue,
     employees,
     locations,
@@ -1213,6 +1211,7 @@ export default function AbsensiMultiServerPage() {
   const [serverEntries, setServerEntries] = useState<TimeEntry[]>(boot.entries);
   const [offlineQueue, setOfflineQueue] = useState<TimeEntry[]>(boot.queue);
   const [staffEmpId, setStaffEmpId] = useState<number>(boot.staffEmpId);
+  const [staffEmpCode, setStaffEmpCode] = useState<string>(boot.staffEmpCode);
   const [dbConnected, setDbConnected] = useState<boolean>(true);
 
   const [serverOffsetMs, setServerOffsetMs] = useState<number>(0);
@@ -1377,7 +1376,11 @@ export default function AbsensiMultiServerPage() {
   const activeUser = useMemo(() => {
     if (isDeviceLockedKaryawan || serverMode === "KARYAWAN") {
       return (
-        staffList.find((e) => Number(e.id) === Number(staffEmpId)) ||
+        staffList.find(
+          (e) =>
+            e.emp_code.toUpperCase() === staffEmpCode.toUpperCase() ||
+            Number(e.id) === Number(staffEmpId)
+        ) ||
         staffList[0] ||
         DEFAULT_EMPLOYEES[2]
       );
@@ -1388,7 +1391,7 @@ export default function AbsensiMultiServerPage() {
       );
     }
     return employees.find((e) => e.role === "ADMIN") || DEFAULT_EMPLOYEES[0];
-  }, [isDeviceLockedKaryawan, serverMode, staffList, staffEmpId, employees]);
+  }, [isDeviceLockedKaryawan, serverMode, staffList, staffEmpCode, staffEmpId, employees]);
 
   const activeUserTodayShift = useMemo(
     () => getEmployeeShiftForIso(activeUser, syncedIsoNow),
@@ -1480,11 +1483,6 @@ export default function AbsensiMultiServerPage() {
 
   const refreshServer = useCallback(
     async (silent = false) => {
-      const latestPoster = loadSchedulePoster();
-      if (latestPoster) {
-        setSchedulePoster(latestPoster);
-      }
-
       if (!navigator.onLine) {
         setNowMs(Date.now() + offsetRef.current);
         if (!silent) notify("warn", "Offline: jam WIB tersinkronisasi lokal.");
@@ -1496,7 +1494,7 @@ export default function AbsensiMultiServerPage() {
         const pending: TimeEntry[] = rawQ ? JSON.parse(rawQ) : [];
         if (pending.length > 0) await syncOfflineQueue(pending, true);
 
-        const res = await fetch("/api/absen", { cache: "no-store" });
+        const res = await fetch(`/api/absen?t=${Date.now()}`, { cache: "no-store" });
         const headerDate = res.headers.get("date");
         let nextOffset = offsetRef.current;
         if (headerDate) {
@@ -1512,6 +1510,12 @@ export default function AbsensiMultiServerPage() {
           const data = await res.json();
           if (data?.ok) {
             setDbConnected(Boolean(data.dbConnected));
+
+            if (data.officeQr) {
+              setOfficeQrCode(String(data.officeQr));
+              localStorage.setItem(QR_CODE_KEY, String(data.officeQr));
+            }
+
             if (data.schedulePoster && data.schedulePoster.imageDataUrl) {
               setSchedulePoster(data.schedulePoster);
               localStorage.setItem(
@@ -1519,6 +1523,7 @@ export default function AbsensiMultiServerPage() {
                 JSON.stringify(data.schedulePoster)
               );
             }
+
             const weeklyMap = loadWeeklySchedulesMap();
             if (data.weeklySchedules && typeof data.weeklySchedules === "object") {
               Object.entries(data.weeklySchedules).forEach(([code, sched]) => {
@@ -1527,8 +1532,8 @@ export default function AbsensiMultiServerPage() {
                   "P"
                 );
               });
-              localStorage.setItem(WEEKLY_SCHED_KEY, JSON.stringify(weeklyMap));
             }
+
             const devReg = loadDeviceRegistry();
             setEmployees((prevEmps) => {
               const baseList =
@@ -1543,21 +1548,22 @@ export default function AbsensiMultiServerPage() {
                       const defCode = shiftTimeToCode(
                         e.shift_start_time || prevMatch?.shift_start_time
                       );
-                      const mergedSchedule = sanitizeWeeklySchedule(
-                        e.weekly_schedule ||
-                          weeklyMap[codeUpper] ||
-                          prevMatch?.weekly_schedule,
-                        defCode
-                      );
-                      weeklyMap[codeUpper] = mergedSchedule;
+                      const serverSchedule = e.weekly_schedule
+                        ? sanitizeWeeklySchedule(e.weekly_schedule, defCode)
+                        : weeklyMap[codeUpper]
+                        ? sanitizeWeeklySchedule(weeklyMap[codeUpper], defCode)
+                        : sanitizeWeeklySchedule(prevMatch?.weekly_schedule, defCode);
+
+                      weeklyMap[codeUpper] = serverSchedule;
                       return {
                         ...e,
+                        emp_code: codeUpper,
                         pin_code: e.pin_code || prevMatch?.pin_code || "1001",
                         shift_start_time:
                           e.shift_start_time ||
                           prevMatch?.shift_start_time ||
-                          shiftCodeToStartTime(mergedSchedule.Senin || "P"),
-                        weekly_schedule: mergedSchedule,
+                          shiftCodeToStartTime(serverSchedule.Senin || "P"),
+                        weekly_schedule: serverSchedule,
                         last_device: e.last_device || prevMatch?.last_device,
                       };
                     })
@@ -1566,8 +1572,7 @@ export default function AbsensiMultiServerPage() {
               localStorage.setItem(WEEKLY_SCHED_KEY, JSON.stringify(weeklyMap));
               const nextEmps = ensureLockedEmployees(baseList, weeklyMap, devReg);
 
-              const customLoc = parseSavedLocation(localStorage.getItem(LOC_KEY));
-              let nextLocs: LocationItem[] =
+              const nextLocs: LocationItem[] =
                 Array.isArray(data.locations) && data.locations.length > 0
                   ? data.locations.map((l: LocationItem) => ({
                       id: Number(l.id) || 1,
@@ -1581,11 +1586,10 @@ export default function AbsensiMultiServerPage() {
                     }))
                   : DEFAULT_LOCATIONS;
 
-              if (customLoc) {
-                nextLocs = [customLoc];
-              }
-
               setLocations(nextLocs);
+              if (nextLocs[0]) {
+                localStorage.setItem(LOC_KEY, JSON.stringify(nextLocs[0]));
+              }
               setLatInput(String(nextLocs[0]?.latitude ?? DEFAULT_LAT));
               setLngInput(String(nextLocs[0]?.longitude ?? DEFAULT_LNG));
               setRadiusInput(
@@ -1628,7 +1632,7 @@ export default function AbsensiMultiServerPage() {
               notify(
                 data.dbConnected ? "ok" : "warn",
                 data.dbConnected
-                  ? "Terhubung ke Database Neon & Jam WIB sinkron."
+                  ? "Terhubung ke Database Neon & Jadwal Realtime Sinkron."
                   : `Peringatan DB: ${data.dbError || "DATABASE_URL belum aktif"}`
               );
             }
@@ -1648,12 +1652,12 @@ export default function AbsensiMultiServerPage() {
 
   useEffect(() => {
     if (!isOnline) return;
-    const intervalMs = isKaryawanMode ? 4000 : 2000;
+    const intervalMs = 2500;
     const poller = window.setInterval(() => {
       void refreshServer(true);
     }, intervalMs);
     return () => clearInterval(poller);
-  }, [isOnline, isKaryawanMode, refreshServer]);
+  }, [isOnline, refreshServer]);
 
   useEffect(() => {
     if (!isOnline || offlineQueue.length === 0) return;
@@ -1792,7 +1796,9 @@ export default function AbsensiMultiServerPage() {
     );
 
     setStaffEmpId(Number(matched.id));
+    setStaffEmpCode(matched.emp_code);
     localStorage.setItem(STAFF_EMP_KEY, String(matched.id));
+    localStorage.setItem(STAFF_EMP_CODE_KEY, matched.emp_code);
     localStorage.setItem(STAFF_SESSION_KEY, "1");
     setIsStaffLoggedIn(true);
     setStaffLoginPin("");
@@ -1814,6 +1820,7 @@ export default function AbsensiMultiServerPage() {
             },
           }),
         });
+        await refreshServer(true);
       } catch {
         // Tetap tercatat di registry lokal
       }
@@ -2186,11 +2193,7 @@ export default function AbsensiMultiServerPage() {
 
     ctx.fillStyle = "#94A3B8";
     ctx.font = "10px monospace";
-    ctx.fillText(
-      `QR: ${officeQrCode} • LatLng Verified`,
-      18,
-      boxY + 91
-    );
+    ctx.fillText(`QR: ${officeQrCode} • LatLng Verified`, 18, boxY + 91);
 
     const dataUrl = c.toDataURL("image/jpeg", 0.78);
     setCapturedSelfie(dataUrl);
@@ -2604,14 +2607,15 @@ export default function AbsensiMultiServerPage() {
               },
             }),
           });
+          await refreshServer(true);
         } catch {
-          // Tetap tersimpan lokal dan tampil di board
+          // Tetap tersimpan lokal
         }
       }
 
       notify(
         "ok",
-        `File PDF ${file.name} berhasil diunggah Admin! Gambar Jadwal Keberangkatan otomatis tampil di board Admin & Karyawan.`
+        `File PDF ${file.name} berhasil diunggah Admin & tersinkron ke database Neon!`
       );
     } catch {
       notify("err", `Gagal memproses file PDF ${file.name}.`);
@@ -3036,7 +3040,7 @@ export default function AbsensiMultiServerPage() {
     const nextEmployeesList = ensureLockedEmployees(
       empForm.id
         ? employees.map((e) =>
-            e.id === empForm.id
+            e.id === empForm.id || e.emp_code.toUpperCase() === cleanCode
               ? { ...e, ...payload, weekly_schedule: cleanedWeekly }
               : e
           )
@@ -3080,7 +3084,10 @@ export default function AbsensiMultiServerPage() {
               shift_start_time: "07.00",
               weekly_schedule: buildDefaultWeeklySchedule("P"),
             });
-            notify("ok", "Data, PIN & jadwal karyawan disimpan di server Admin.");
+            notify(
+              "ok",
+              "Data, PIN & jadwal karyawan tersimpan di Neon & langsung sinkron ke HP Karyawan!"
+            );
             return;
           }
         }
@@ -3099,7 +3106,7 @@ export default function AbsensiMultiServerPage() {
       shift_start_time: "07.00",
       weekly_schedule: buildDefaultWeeklySchedule("P"),
     });
-    notify("ok", "Data, PIN & jadwal karyawan diperbarui di server Admin.");
+    notify("warn", "Tersimpan lokal (cek koneksi internet untuk sinkron ke Neon).");
   };
 
   const deleteEmployee = async (emp: Employee) => {
@@ -3200,14 +3207,35 @@ export default function AbsensiMultiServerPage() {
             payload: locPayload,
           }),
         });
+        await refreshServer(true);
       } catch {
         // Tetap tersimpan lokal
       }
     }
     notify(
       "ok",
-      `Titik koordinat diperbarui: ${parsedLat}, ${parsedLng} (Radius ${parsedRadius}m)`
+      `Titik koordinat diperbarui & sinkron ke semua HP: ${parsedLat}, ${parsedLng} (Radius ${parsedRadius}m)`
     );
+  };
+
+  const saveOfficeQrToServer = async (nextQr: string) => {
+    const clean = nextQr.trim().toUpperCase();
+    setOfficeQrCode(clean);
+    localStorage.setItem(QR_CODE_KEY, clean);
+    if (navigator.onLine && clean) {
+      try {
+        await fetch("/api/absen", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            action: "SAVE_QR",
+            payload: { qrCode: clean },
+          }),
+        });
+      } catch {
+        // Abaikan
+      }
+    }
   };
 
   const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(
@@ -3605,11 +3633,11 @@ export default function AbsensiMultiServerPage() {
               <p className="text-[10px] text-slate-500">
                 {isKaryawanMode
                   ? `Jadwal Mingguan: ${activeUser?.full_name} (${activeUser?.emp_code})`
-                  : "Sinkron ke Board Admin & Board Setiap Anggota"}
+                  : "Sinkron Realtime ke Board Admin & Board Setiap Anggota"}
               </p>
             </div>
             <span className="px-2 py-0.5 rounded bg-indigo-100 text-indigo-800 text-[9px] font-extrabold uppercase shrink-0">
-              {schedulePoster ? "PDF ADMIN AKTIF" : "JADWAL MINGGUAN"}
+              {schedulePoster ? "PDF ADMIN AKTIF" : "REALTIME NEON"}
             </span>
           </div>
 
@@ -4418,10 +4446,7 @@ export default function AbsensiMultiServerPage() {
               <input
                 type="text"
                 value={officeQrCode}
-                onChange={(e) => {
-                  setOfficeQrCode(e.target.value);
-                  localStorage.setItem(QR_CODE_KEY, e.target.value);
-                }}
+                onChange={(e) => void saveOfficeQrToServer(e.target.value)}
                 className="w-full rounded-lg border border-slate-200 px-2.5 py-1.5 text-[11px] font-bold text-center"
               />
 
