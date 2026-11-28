@@ -1029,6 +1029,14 @@ export default function AbsensiMultiServerPage() {
     "Arahkan wajah ke kamera depan lalu klik Ambil Foto Selfie."
   );
 
+  // State modal lihat & download foto sekali klik untuk Admin/Manager
+  const [previewPhoto, setPreviewPhoto] = useState<{
+    src: string;
+    title: string;
+    subtitle: string;
+    fileName: string;
+  } | null>(null);
+
   const [dismissedLateUuid, setDismissedLateUuid] = useState<string | null>(null);
 
   const [inspectionMode, setInspectionMode] = useState<
@@ -1095,6 +1103,26 @@ export default function AbsensiMultiServerPage() {
     setToast({ type, text });
     setTimeout(() => setToast(null), 4500);
   }, []);
+
+  const downloadPhotoDataUrl = useCallback(
+    (dataUrl: string, fileName: string) => {
+      if (!dataUrl) return;
+      try {
+        const a = document.createElement("a");
+        a.href = dataUrl;
+        a.download = fileName.endsWith(".jpg") || fileName.endsWith(".png")
+          ? fileName
+          : `${fileName}.jpg`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        notify("ok", `Foto ${fileName} diunduh.`);
+      } catch {
+        notify("err", "Gagal mengunduh foto.");
+      }
+    },
+    [notify]
+  );
 
   useEffect(() => {
     setCurrentHpDevice(collectHpDeviceSystemInfo());
@@ -3783,6 +3811,18 @@ export default function AbsensiMultiServerPage() {
                           item.device_info ||
                           emp?.last_device?.summary ||
                           "HP";
+                        const empDisplayName =
+                          item.full_name || emp?.full_name || "Karyawan";
+                        const jenisLabel =
+                          item.entry_type === "CLOCK_IN" ? "MASUK" : "KELUAR";
+                        const scanLabel = formatTimeWIB(item.punched_at);
+                        const safeFileSlug = `${empDisplayName}_${jenisLabel}_${getJakartaDateStr(
+                          item.punched_at
+                        )}_${scanLabel.replace(/:/g, "-")}`.replace(
+                          /[^a-zA-Z0-9_-]/g,
+                          "_"
+                        );
+
                         return (
                           <tr
                             key={`${item.client_uuid}-${idx}`}
@@ -3803,30 +3843,44 @@ export default function AbsensiMultiServerPage() {
                               {getJakartaDateStr(item.punched_at)}
                             </td>
                             <td className="p-1.5 font-semibold whitespace-nowrap">
-                              {item.full_name || emp?.full_name || "Karyawan"}
+                              {empDisplayName}
                             </td>
                             <td className="p-1.5 max-w-[120px] truncate text-[9px] text-slate-600">
                               {devLabel}
                             </td>
                             <td className="p-1.5 whitespace-nowrap">
-                              {item.entry_type === "CLOCK_IN"
-                                ? "MASUK"
-                                : "KELUAR"}
+                              {jenisLabel}
                             </td>
                             <td className="p-1.5 whitespace-nowrap">
                               {item.selfie_data ? (
-                                /* eslint-disable-next-line @next/next/no-img-element */
-                                <img
-                                  src={item.selfie_data}
-                                  alt="Wajah TimeMark"
-                                  className="w-8 h-8 rounded object-cover border border-slate-300"
-                                />
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setPreviewPhoto({
+                                      src: item.selfie_data as string,
+                                      title: `${empDisplayName} • ${jenisLabel}`,
+                                      subtitle: `${getJakartaDateStr(
+                                        item.punched_at
+                                      )} • ${scanLabel} WIB • ${devLabel}`,
+                                      fileName: `${safeFileSlug}.jpg`,
+                                    })
+                                  }
+                                  title="Klik untuk lihat & download foto"
+                                  className="block rounded overflow-hidden border border-slate-300 hover:border-blue-600"
+                                >
+                                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                                  <img
+                                    src={item.selfie_data}
+                                    alt="Wajah TimeMark"
+                                    className="w-8 h-8 rounded object-cover block"
+                                  />
+                                </button>
                               ) : (
                                 "-"
                               )}
                             </td>
                             <td className="p-1.5 whitespace-nowrap">
-                              {formatTimeWIB(item.punched_at)}
+                              {scanLabel}
                             </td>
                             <td className="p-1.5 whitespace-nowrap font-bold text-rose-600">
                               {lateDetail.isLate
@@ -4164,6 +4218,65 @@ export default function AbsensiMultiServerPage() {
               </div>
             </section>
           </>
+        )}
+
+        {previewPhoto && !isKaryawanMode && (
+          <div
+            onClick={() => setPreviewPhoto(null)}
+            className="fixed inset-0 z-50 bg-black/75 flex items-center justify-center p-4"
+          >
+            <div
+              onClick={(e) => e.stopPropagation()}
+              className="max-w-sm w-full bg-white rounded-2xl p-3.5 shadow-xl space-y-2.5 border border-slate-200"
+            >
+              <div className="flex items-start justify-between gap-2">
+                <div>
+                  <div className="text-xs font-extrabold text-slate-900">
+                    {previewPhoto.title}
+                  </div>
+                  <div className="text-[10px] text-slate-500">
+                    {previewPhoto.subtitle}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setPreviewPhoto(null)}
+                  className="px-2 py-0.5 rounded bg-slate-200 text-slate-800 text-[10px] font-bold"
+                >
+                  Tutup
+                </button>
+              </div>
+
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                src={previewPhoto.src}
+                alt={previewPhoto.title}
+                className="w-full max-h-80 object-contain rounded-xl border border-slate-200 bg-slate-950"
+              />
+
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={() =>
+                    downloadPhotoDataUrl(
+                      previewPhoto.src,
+                      previewPhoto.fileName
+                    )
+                  }
+                  className="py-2 rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-bold"
+                >
+                  Download Foto
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setPreviewPhoto(null)}
+                  className="py-2 rounded-lg bg-slate-800 text-white text-xs font-bold"
+                >
+                  Selesai
+                </button>
+              </div>
+            </div>
+          </div>
         )}
       </div>
     </div>
