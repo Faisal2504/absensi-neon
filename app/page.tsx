@@ -9,6 +9,17 @@ type DayKey = "Senin" | "Selasa" | "Rabu" | "Kamis" | "Jumat" | "Sabtu" | "Mingg
 
 type WeeklyScheduleMap = Record<DayKey, ShiftCode>;
 
+interface DeviceSystemInfo {
+  device_id: string;
+  os_platform: string;
+  device_model: string;
+  browser: string;
+  screen_size: string;
+  timezone: string;
+  summary: string;
+  logged_in_at?: string;
+}
+
 interface Employee {
   id: number;
   emp_code: string;
@@ -18,6 +29,7 @@ interface Employee {
   pin_code: string;
   shift_start_time?: string;
   weekly_schedule?: WeeklyScheduleMap;
+  last_device?: DeviceSystemInfo | null;
 }
 
 interface LocationItem {
@@ -46,6 +58,7 @@ interface TimeEntry {
   face_detected?: boolean;
   full_name?: string;
   emp_code?: string;
+  device_info?: string;
 }
 
 interface ParsedScheduleItem {
@@ -69,11 +82,23 @@ interface BarcodeDetectorInstance {
   ) => Promise<Array<{ rawValue?: string; raw_value?: string }>>;
 }
 
+interface BeforeInstallPromptEvent extends Event {
+  prompt: () => Promise<void>;
+  userChoice: Promise<{ outcome: "accepted" | "dismissed" }>;
+}
+
 const DEFAULT_LAT = -6.9148609;
 const DEFAULT_LNG = 109.744683;
 const DEFAULT_RADIUS = 2000;
 const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
 const LATE_GRACE_MINUTES = 5;
+
+const LOCKED_STAFF_CODES = [
+  "AP-SCRTY-MPI.22112026.0001",
+  "DDS-SCRTY-MPI.22112026.0002",
+  "JRA-SCRTY-MPI.22112026.0003",
+  "LJ-SCRTY-MPI.22112026.0004",
+] as const;
 
 const DAYS_OF_WEEK: DayKey[] = [
   "Senin",
@@ -133,7 +158,94 @@ const LOC_KEY = "absensi_v11_custom_loc";
 const WEEKLY_SCHED_KEY = "absensi_v11_weekly_sched";
 const DEVICE_LOCK_KEY = "absensi_v11_device_locked_karyawan";
 const STAFF_EMP_KEY = "absensi_v11_staff_emp_id";
+const STAFF_SESSION_KEY = "absensi_v11_staff_logged_in";
+const DEVICE_REG_KEY = "absensi_v11_device_registry";
 const AUTH_SERVER_KEY = "absensi_v11_auth_server";
+
+function collectHpDeviceSystemInfo(loggedInAt?: string): DeviceSystemInfo {
+  if (typeof window === "undefined" || typeof navigator === "undefined") {
+    return {
+      device_id: "SRV-DEFAULT",
+      os_platform: "Unknown",
+      device_model: "Perangkat HP",
+      browser: "Browser",
+      screen_size: "0x0",
+      timezone: "Asia/Jakarta",
+      summary: "Perangkat HP • Asia/Jakarta",
+      logged_in_at: loggedInAt,
+    };
+  }
+
+  let deviceId = "";
+  try {
+    deviceId = localStorage.getItem("absensi_v11_hw_id") || "";
+    if (!deviceId) {
+      deviceId = `HP-${Math.random().toString(36).slice(2, 7).toUpperCase()}-${Date.now()
+        .toString(36)
+        .slice(-4)
+        .toUpperCase()}`;
+      localStorage.setItem("absensi_v11_hw_id", deviceId);
+    }
+  } catch {
+    deviceId = "HP-LOCAL";
+  }
+
+  const ua = navigator.userAgent || "";
+  let osPlatform = navigator.platform || "Mobile";
+  if (/android/i.test(ua)) {
+    const ver = ua.match(/Android\s+([\d.]+)/i)?.[1];
+    osPlatform = ver ? `Android ${ver}` : "Android";
+  } else if (/iphone|ipad|ipod/i.test(ua)) {
+    const ver = ua.match(/OS\s+([\d_]+)/i)?.[1]?.replace(/_/g, ".");
+    osPlatform = ver ? `iOS ${ver}` : "iOS";
+  } else if (/windows/i.test(ua)) {
+    osPlatform = "Windows";
+  } else if (/mac os/i.test(ua)) {
+    osPlatform = "macOS";
+  }
+
+  let deviceModel = "Smartphone";
+  if (/iphone/i.test(ua)) deviceModel = "iPhone";
+  else if (/ipad/i.test(ua)) deviceModel = "iPad";
+  else if (/android/i.test(ua)) {
+    const modelMatch = ua.match(/;\s*([^;)]+)\s+Build\//i);
+    deviceModel = modelMatch?.[1]?.trim() || "Android HP";
+  }
+
+  let browser = "Browser";
+  if (/edg/i.test(ua)) browser = "Edge";
+  else if (/opr|opera/i.test(ua)) browser = "Opera";
+  else if (/chrome|crios/i.test(ua)) browser = "Chrome";
+  else if (/firefox|fxios/i.test(ua)) browser = "Firefox";
+  else if (/safari/i.test(ua)) browser = "Safari";
+
+  const screenSize = `${window.screen?.width || 0}x${window.screen?.height || 0}`;
+  const timezone =
+    Intl.DateTimeFormat().resolvedOptions().timeZone || "Asia/Jakarta";
+
+  return {
+    device_id: deviceId,
+    os_platform: osPlatform,
+    device_model: deviceModel,
+    browser,
+    screen_size: screenSize,
+    timezone,
+    summary: `${deviceModel} (${osPlatform} • ${browser} • ${deviceId})`,
+    logged_in_at: loggedInAt,
+  };
+}
+
+function loadDeviceRegistry(): Record<string, DeviceSystemInfo> {
+  if (typeof window === "undefined") return {};
+  try {
+    const raw = localStorage.getItem(DEVICE_REG_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
 
 function buildDefaultWeeklySchedule(defaultCode: ShiftCode = "P"): WeeklyScheduleMap {
   return {
@@ -257,15 +369,90 @@ const DEFAULT_EMPLOYEES: Employee[] = [
   },
   {
     id: 3,
-    emp_code: "ABZ-0001",
-    full_name: "Amelia",
+    emp_code: "AP-SCRTY-MPI.22112026.0001",
+    full_name: "Anggota AP",
     role: "STAFF",
-    department: "Operasional",
-    pin_code: "1111",
+    department: "Security Dormitory Batang",
+    pin_code: "1001",
+    shift_start_time: "07.00",
+    weekly_schedule: buildDefaultWeeklySchedule("P"),
+  },
+  {
+    id: 4,
+    emp_code: "DDS-SCRTY-MPI.22112026.0002",
+    full_name: "Anggota DDS",
+    role: "STAFF",
+    department: "Security Dormitory Batang",
+    pin_code: "1002",
+    shift_start_time: "15.00",
+    weekly_schedule: buildDefaultWeeklySchedule("S"),
+  },
+  {
+    id: 5,
+    emp_code: "JRA-SCRTY-MPI.22112026.0003",
+    full_name: "Anggota JRA",
+    role: "STAFF",
+    department: "Security Dormitory Batang",
+    pin_code: "1003",
+    shift_start_time: "23.00",
+    weekly_schedule: buildDefaultWeeklySchedule("M"),
+  },
+  {
+    id: 6,
+    emp_code: "LJ-SCRTY-MPI.22112026.0004",
+    full_name: "Anggota LJ",
+    role: "STAFF",
+    department: "Security Dormitory Batang",
+    pin_code: "1004",
     shift_start_time: "07.00",
     weekly_schedule: buildDefaultWeeklySchedule("P"),
   },
 ];
+
+function ensureLockedEmployees(
+  list: Employee[],
+  weeklyMap: Record<string, WeeklyScheduleMap>,
+  devReg: Record<string, DeviceSystemInfo>
+): Employee[] {
+  const normalized: Employee[] = list.map((e) => {
+    const defCode = shiftTimeToCode(e.shift_start_time);
+    return {
+      ...e,
+      emp_code: String(e.emp_code || "").trim().toUpperCase(),
+      role: normalizeRole(e.role),
+      shift_start_time: normalizeShiftTime(e.shift_start_time),
+      weekly_schedule:
+        weeklyMap[String(e.emp_code || "").trim().toUpperCase()] ||
+        e.weekly_schedule ||
+        buildDefaultWeeklySchedule(defCode),
+      last_device:
+        devReg[String(e.emp_code || "").trim().toUpperCase()] ||
+        e.last_device ||
+        null,
+    };
+  });
+
+  LOCKED_STAFF_CODES.forEach((lockedCode, idx) => {
+    const exists = normalized.some(
+      (emp) => emp.emp_code.toUpperCase() === lockedCode
+    );
+    if (!exists) {
+      const seed = DEFAULT_EMPLOYEES[idx + 2];
+      normalized.push({
+        ...seed,
+        id: seed?.id || 100 + idx,
+        emp_code: lockedCode,
+        weekly_schedule:
+          weeklyMap[lockedCode] ||
+          seed?.weekly_schedule ||
+          buildDefaultWeeklySchedule("P"),
+        last_device: devReg[lockedCode] || null,
+      });
+    }
+  });
+
+  return normalized;
+}
 
 const DEFAULT_LOCATIONS: LocationItem[] = [
   {
@@ -546,7 +733,9 @@ function parseScheduleLines(lines: string[]): ParsedScheduleItem[] {
     }
 
     const shiftCode = detectShiftCodeFromText(line);
-    const codeMatch = line.match(/\b([A-Z]{2,6}[-_]\d{1,6})\b/i);
+    const codeMatch = line.match(
+      /\b([A-Z]{2,6}-SCRTY-MPI\.\d{8}\.\d{4}|[A-Z]{2,6}[-_]\d{1,6})\b/i
+    );
 
     const dayTokens = line.match(/\b(P|S|M|OFF)\b/gi);
     const weekly: Partial<WeeklyScheduleMap> = {};
@@ -573,7 +762,7 @@ function parseScheduleLines(lines: string[]): ParsedScheduleItem[] {
     let fullName = "";
 
     if (cols.length >= 2) {
-      if (!empCode && /^[A-Z0-9_-]{2,12}$/i.test(cols[0])) {
+      if (!empCode && /^[A-Z0-9_.-]{2,32}$/i.test(cols[0])) {
         fullName = cols[1];
       } else {
         fullName = cols[0];
@@ -583,7 +772,10 @@ function parseScheduleLines(lines: string[]): ParsedScheduleItem[] {
     }
 
     fullName = fullName
-      .replace(/\b([A-Z]{2,6}[-_]\d{1,6})\b/gi, " ")
+      .replace(
+        /\b([A-Z]{2,6}-SCRTY-MPI\.\d{8}\.\d{4}|[A-Z]{2,6}[-_]\d{1,6})\b/gi,
+        " "
+      )
       .replace(/\b(OFF|P|S|M)\b/g, " ")
       .replace(/shift\s*(pagi|siang|malam|libur|off)/gi, " ")
       .replace(/\b(pagi|siang|malam|libur)\b/gi, " ")
@@ -654,6 +846,7 @@ function getInitialBoot() {
     return {
       serverMode: "ADMIN" as ServerMode,
       isDeviceLockedKaryawan: false,
+      isStaffLoggedIn: false,
       isAuthenticatedPrivileged: true,
       qrCode: "ABSENSI-KANTOR-MPI-BTG",
       staffEmpId: 3,
@@ -666,8 +859,11 @@ function getInitialBoot() {
 
   let qrCode = "ABSENSI-KANTOR-MPI-BTG";
   let staffEmpId = 3;
+  let isStaffLoggedIn = false;
   let queue: TimeEntry[] = [];
-  let employees = DEFAULT_EMPLOYEES;
+  const weeklyMap = loadWeeklySchedulesMap();
+  const devReg = loadDeviceRegistry();
+  let employees = ensureLockedEmployees(DEFAULT_EMPLOYEES, weeklyMap, devReg);
   let locations = DEFAULT_LOCATIONS;
   let entries: TimeEntry[] = [];
   let isDeviceLockedKaryawan = false;
@@ -703,29 +899,21 @@ function getInitialBoot() {
     const savedStaff = localStorage.getItem(STAFF_EMP_KEY);
     if (savedStaff && Number(savedStaff) > 0) staffEmpId = Number(savedStaff);
 
+    if (localStorage.getItem(STAFF_SESSION_KEY) === "1" && savedStaff) {
+      isStaffLoggedIn = true;
+    }
+
     const rawQ = localStorage.getItem(QUEUE_KEY);
     if (rawQ) {
       const parsedQ = JSON.parse(rawQ);
       if (Array.isArray(parsedQ)) queue = parsedQ;
     }
 
-    const weeklyMap = loadWeeklySchedulesMap();
     const rawC = localStorage.getItem(CACHE_KEY);
     if (rawC) {
       const c = JSON.parse(rawC);
       if (Array.isArray(c.employees) && c.employees.length > 0) {
-        employees = c.employees.map((e: Employee) => {
-          const defCode = shiftTimeToCode(e.shift_start_time);
-          return {
-            ...e,
-            role: normalizeRole(e.role),
-            shift_start_time: normalizeShiftTime(e.shift_start_time),
-            weekly_schedule:
-              weeklyMap[e.emp_code] ||
-              e.weekly_schedule ||
-              buildDefaultWeeklySchedule(defCode),
-          };
-        });
+        employees = ensureLockedEmployees(c.employees, weeklyMap, devReg);
       }
       if (Array.isArray(c.locations) && c.locations.length > 0) {
         locations = c.locations.map((l: LocationItem) => ({
@@ -758,6 +946,7 @@ function getInitialBoot() {
   return {
     serverMode,
     isDeviceLockedKaryawan,
+    isStaffLoggedIn,
     isAuthenticatedPrivileged,
     qrCode,
     staffEmpId,
@@ -775,6 +964,19 @@ export default function AbsensiMultiServerPage() {
   const [isDeviceLockedKaryawan, setIsDeviceLockedKaryawan] = useState<boolean>(
     boot.isDeviceLockedKaryawan
   );
+  const [isStaffLoggedIn, setIsStaffLoggedIn] = useState<boolean>(
+    boot.isStaffLoggedIn
+  );
+  const [staffLoginCode, setStaffLoginCode] = useState<string>("");
+  const [staffLoginPin, setStaffLoginPin] = useState<string>("");
+  const [currentHpDevice, setCurrentHpDevice] = useState<DeviceSystemInfo>(() =>
+    collectHpDeviceSystemInfo()
+  );
+
+  const [installPromptEvent, setInstallPromptEvent] =
+    useState<BeforeInstallPromptEvent | null>(null);
+  const [installGuideOpen, setInstallGuideOpen] = useState<boolean>(false);
+
   const [isPrivilegedAuthed, setIsPrivilegedAuthed] = useState<boolean>(
     boot.isAuthenticatedPrivileged
   );
@@ -849,8 +1051,8 @@ export default function AbsensiMultiServerPage() {
     emp_code: "",
     full_name: "",
     role: "STAFF" as RoleType,
-    department: "Operasional",
-    pin_code: "1234",
+    department: "Security Dormitory Batang",
+    pin_code: "1001",
     shift_start_time: "07.00",
     weekly_schedule: buildDefaultWeeklySchedule("P"),
   });
@@ -882,6 +1084,32 @@ export default function AbsensiMultiServerPage() {
     setToast({ type, text });
     setTimeout(() => setToast(null), 4500);
   }, []);
+
+  useEffect(() => {
+    setCurrentHpDevice(collectHpDeviceSystemInfo());
+  }, []);
+
+  useEffect(() => {
+    const onBeforeInstall = (e: Event) => {
+      e.preventDefault();
+      setInstallPromptEvent(e as BeforeInstallPromptEvent);
+    };
+    window.addEventListener("beforeinstallprompt", onBeforeInstall);
+    return () => window.removeEventListener("beforeinstallprompt", onBeforeInstall);
+  }, []);
+
+  const triggerGoogleAppDownloadInstall = async () => {
+    if (installPromptEvent) {
+      await installPromptEvent.prompt();
+      const choice = await installPromptEvent.userChoice;
+      if (choice.outcome === "accepted") {
+        notify("ok", "Aplikasi Login & Absensi sedang diunduh/diinstal ke HP.");
+        setInstallPromptEvent(null);
+      }
+      return;
+    }
+    setInstallGuideOpen((prev) => !prev);
+  };
 
   useEffect(() => {
     offsetRef.current = serverOffsetMs;
@@ -1043,27 +1271,28 @@ export default function AbsensiMultiServerPage() {
           if (data?.ok) {
             setDbConnected(Boolean(data.dbConnected));
             const weeklyMap = loadWeeklySchedulesMap();
+            const devReg = loadDeviceRegistry();
             setEmployees((prevEmps) => {
-              const nextEmps: Employee[] =
+              const baseList =
                 Array.isArray(data.employees) && data.employees.length > 0
                   ? data.employees.map((e: Employee) => {
                       const prevMatch = prevEmps.find(
                         (pe) =>
-                          pe.emp_code === e.emp_code || Number(pe.id) === Number(e.id)
+                          pe.emp_code.toUpperCase() ===
+                            String(e.emp_code || "").toUpperCase() ||
+                          Number(pe.id) === Number(e.id)
                       );
-                      const defCode = shiftTimeToCode(e.shift_start_time);
                       return {
                         ...e,
-                        role: normalizeRole(e.role),
-                        shift_start_time: normalizeShiftTime(e.shift_start_time),
+                        pin_code: prevMatch?.pin_code || e.pin_code || "1001",
                         weekly_schedule:
-                          weeklyMap[e.emp_code] ||
-                          prevMatch?.weekly_schedule ||
-                          e.weekly_schedule ||
-                          buildDefaultWeeklySchedule(defCode),
+                          prevMatch?.weekly_schedule || e.weekly_schedule,
+                        last_device: prevMatch?.last_device || e.last_device,
                       };
                     })
                   : prevEmps;
+
+              const nextEmps = ensureLockedEmployees(baseList, weeklyMap, devReg);
 
               const customLoc = parseSavedLocation(localStorage.getItem(LOC_KEY));
               let nextLocs: LocationItem[] =
@@ -1101,6 +1330,7 @@ export default function AbsensiMultiServerPage() {
                         ...item,
                         entry_type: normalizeEntryType(item.entry_type),
                         selfie_data: item.selfie_data || prevE?.selfie_data || null,
+                        device_info: item.device_info || prevE?.device_info || "",
                         client_uuid:
                           item.client_uuid ||
                           `srv-${item.id || Math.random().toString(36).slice(2)}`,
@@ -1232,6 +1462,92 @@ export default function AbsensiMultiServerPage() {
     };
   }, [refreshServer, requestCurrentGps, notify, stopQrCam, stopSelfieCam]);
 
+  // Login anggota karyawan: wajib ID Karyawan & PIN yang dibuat Admin di server utama
+  const handleStaffMemberLogin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const codeClean = staffLoginCode.trim().toUpperCase();
+    const pinClean = staffLoginPin.trim();
+
+    if (!codeClean || !pinClean) {
+      notify("err", "Masukkan ID Karyawan dan PIN yang dibuat Admin.");
+      return;
+    }
+
+    const matched = employees.find(
+      (emp) =>
+        emp.role === "STAFF" &&
+        emp.emp_code.trim().toUpperCase() === codeClean &&
+        String(emp.pin_code || "").trim() === pinClean
+    );
+
+    if (!matched) {
+      notify(
+        "err",
+        "ID Karyawan atau PIN salah / belum terdaftar di server Admin."
+      );
+      return;
+    }
+
+    const devInfo = collectHpDeviceSystemInfo(new Date(nowMs).toISOString());
+    setCurrentHpDevice(devInfo);
+
+    const devReg = loadDeviceRegistry();
+    devReg[matched.emp_code] = devInfo;
+    localStorage.setItem(DEVICE_REG_KEY, JSON.stringify(devReg));
+
+    setEmployees((prev) =>
+      prev.map((emp) =>
+        Number(emp.id) === Number(matched.id)
+          ? { ...emp, last_device: devInfo }
+          : emp
+      )
+    );
+
+    setStaffEmpId(Number(matched.id));
+    localStorage.setItem(STAFF_EMP_KEY, String(matched.id));
+    localStorage.setItem(STAFF_SESSION_KEY, "1");
+    setIsStaffLoggedIn(true);
+    setStaffLoginPin("");
+
+    if (navigator.onLine) {
+      try {
+        await fetch("/api/absen", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            action: "DEVICE_LOGIN",
+            payload: {
+              employee_id: matched.id,
+              emp_code: matched.emp_code,
+              full_name: matched.full_name,
+              device_info: devInfo.summary,
+              device_detail: devInfo,
+              logged_in_at: devInfo.logged_in_at,
+            },
+          }),
+        });
+      } catch {
+        // Tetap tercatat di registry lokal
+      }
+    }
+
+    notify(
+      "ok",
+      `Login berhasil: ${matched.full_name} (${matched.emp_code}) • Device ${devInfo.device_model} terkirim ke Admin.`
+    );
+  };
+
+  // Keluar dari sesi anggota saat ini (wajib login ulang dengan ID & PIN sendiri)
+  const handleStaffMemberLogout = () => {
+    stopQrCam();
+    stopSelfieCam();
+    localStorage.removeItem(STAFF_SESSION_KEY);
+    setIsStaffLoggedIn(false);
+    setStaffLoginCode("");
+    setStaffLoginPin("");
+    notify("ok", "Sesi akun anggota ditutup. Masukkan ID & PIN untuk login.");
+  };
+
   const targetLocation = useMemo(() => {
     const loc = locations[0] || DEFAULT_LOCATIONS[0];
     return {
@@ -1273,8 +1589,6 @@ export default function AbsensiMultiServerPage() {
     );
   }, [serverEntries, offlineQueue]);
 
-  // Cooldown hanya mencegah duplikasi jenis absen yang SAMA (MASUK -> MASUK atau KELUAR -> KELUAR) dalam 6 jam,
-  // sehingga karyawan dapat langsung membuka kamera depan & absen KELUAR kapan saja setelah absen MASUK.
   const cooldownInfo = useMemo(() => {
     if (!activeUser) {
       return {
@@ -1428,7 +1742,6 @@ export default function AbsensiMultiServerPage() {
           audio: false,
         });
       } catch {
-        // Fallback jika perangkat tidak mendukung constraint ideal
         stream = await navigator.mediaDevices.getUserMedia({
           video: { facingMode: "user" },
           audio: false,
@@ -1558,6 +1871,20 @@ export default function AbsensiMultiServerPage() {
     }
 
     const punchedAtIso = new Date(syncedNow).toISOString();
+    const devInfo = collectHpDeviceSystemInfo(punchedAtIso);
+    setCurrentHpDevice(devInfo);
+
+    const devReg = loadDeviceRegistry();
+    devReg[activeUser.emp_code] = devInfo;
+    localStorage.setItem(DEVICE_REG_KEY, JSON.stringify(devReg));
+    setEmployees((prev) =>
+      prev.map((emp) =>
+        Number(emp.id) === Number(activeUser.id)
+          ? { ...emp, last_device: devInfo }
+          : emp
+      )
+    );
+
     const shiftToday = getEmployeeShiftForIso(activeUser, punchedAtIso);
     const lateInfo =
       entryType === "CLOCK_IN"
@@ -1590,6 +1917,7 @@ export default function AbsensiMultiServerPage() {
       face_detected: Boolean(capturedSelfie && faceStatus !== "no_face"),
       full_name: activeUser.full_name,
       emp_code: activeUser.emp_code,
+      device_info: devInfo.summary,
     };
 
     const nextQueue = [newPunch, ...offlineQueue];
@@ -1613,11 +1941,7 @@ export default function AbsensiMultiServerPage() {
         );
       }
     } else {
-      if (isAdminServer) {
-        speakIndonesian("Terimakasih, semoga selamat sampai rumah");
-      } else {
-        speakIndonesian("Terimakasih, semoga selamat sampai rumah");
-      }
+      speakIndonesian("Terimakasih, semoga selamat sampai rumah");
     }
 
     if (navigator.onLine) {
@@ -1639,7 +1963,9 @@ export default function AbsensiMultiServerPage() {
     stopSelfieCam();
     localStorage.setItem(DEVICE_LOCK_KEY, "1");
     localStorage.removeItem(AUTH_SERVER_KEY);
+    localStorage.removeItem(STAFF_SESSION_KEY);
     setIsDeviceLockedKaryawan(true);
+    setIsStaffLoggedIn(false);
     setIsPrivilegedAuthed(false);
     setServerMode("KARYAWAN");
     if (typeof window !== "undefined") {
@@ -1649,7 +1975,7 @@ export default function AbsensiMultiServerPage() {
     }
     notify(
       "ok",
-      "Perangkat dikunci ke Server Karyawan (Mode Terbatas). Akses Manager & Admin diblokir."
+      "Perangkat dikunci ke Server Karyawan. Silakan login per anggota dengan ID & PIN."
     );
   };
 
@@ -1668,7 +1994,6 @@ export default function AbsensiMultiServerPage() {
 
   const todayStr = getJakartaDateStr(syncedIsoNow);
 
-  // Notifikasi real-time keterlambatan (> 5 menit) hari ini untuk Admin & semua HP Karyawan
   const latestLateAlertToday = useMemo(() => {
     const todayIns = allEntries
       .filter(
@@ -1852,6 +2177,7 @@ export default function AbsensiMultiServerPage() {
         empId: number;
         empName: string;
         empCode: string;
+        deviceSummary: string;
         shiftInfo: { code: ShiftCode; startTime: string; rangeLabel: string };
         inEntry?: TimeEntry;
         outEntry?: TimeEntry;
@@ -1873,14 +2199,22 @@ export default function AbsensiMultiServerPage() {
         timeZone: "Asia/Jakarta",
         weekday: "long",
       });
+      const devStr =
+        item.device_info || emp?.last_device?.summary || "Perangkat HP";
+
       const existing = groups.get(key) || {
         dateStr,
         dayName,
         empId: Number(item.employee_id),
         empName: item.full_name || emp?.full_name || "Karyawan",
         empCode: item.emp_code || emp?.emp_code || "-",
+        deviceSummary: devStr,
         shiftInfo: getEmployeeShiftForIso(emp, item.punched_at),
       };
+
+      if (item.device_info) {
+        existing.deviceSummary = item.device_info;
+      }
 
       if (item.entry_type === "CLOCK_IN") {
         if (!existing.inEntry) existing.inEntry = item;
@@ -1895,7 +2229,9 @@ export default function AbsensiMultiServerPage() {
     );
   };
 
-  const buildTimesheetHeaderMeta = (groupedRows: ReturnType<typeof buildGroupedTimesheetRows>) => {
+  const buildTimesheetHeaderMeta = (
+    groupedRows: ReturnType<typeof buildGroupedTimesheetRows>
+  ) => {
     const uniqueEmpCodes = Array.from(new Set(groupedRows.map((g) => g.empCode)));
     const singleEmp =
       reportEmpFilter !== "ALL"
@@ -1956,6 +2292,7 @@ export default function AbsensiMultiServerPage() {
       "TANGGAL",
       "HARI",
       "ANGGOTA",
+      "DEVICE HP",
       "SHIFT",
       "JAM MASUK",
       "FOTO WAJAH MASUK",
@@ -1977,7 +2314,10 @@ export default function AbsensiMultiServerPage() {
           g.dateStr,
           g.dayName,
           `${g.empName} (${g.empCode})`,
-          g.shiftInfo.code === "OFF" ? "OFF (LIBUR)" : `${g.shiftInfo.code} (${g.shiftInfo.rangeLabel})`,
+          g.deviceSummary,
+          g.shiftInfo.code === "OFF"
+            ? "OFF (LIBUR)"
+            : `${g.shiftInfo.code} (${g.shiftInfo.rangeLabel})`,
           g.inEntry ? formatTimeWIB(g.inEntry.punched_at) : "-",
           g.inEntry?.selfie_data ? "ADA FOTO WAJAH" : "-",
           g.outEntry ? formatTimeWIB(g.outEntry.punched_at) : "-",
@@ -2046,6 +2386,7 @@ export default function AbsensiMultiServerPage() {
           <td>${g.dateStr}</td>
           <td>${g.dayName}</td>
           <td><b>${g.empName}</b><br/><span style="font-size:10px;color:#475569">${g.empCode}</span></td>
+          <td style="font-size:10px">${g.deviceSummary}</td>
           <td>${shiftHtml}</td>
           <td>${g.inEntry ? formatTimeWIB(g.inEntry.punched_at) : "-"}</td>
           <td style="text-align:center">${inImgHtml}</td>
@@ -2186,7 +2527,7 @@ export default function AbsensiMultiServerPage() {
       notify("err", "Isi ID dan Nama Lengkap karyawan.");
       return;
     }
-    const cleanCode = empForm.emp_code.trim();
+    const cleanCode = empForm.emp_code.trim().toUpperCase();
     const mondayCode = empForm.weekly_schedule.Senin || "P";
     const resolvedStartTime =
       empForm.shift_start_time || shiftCodeToStartTime(mondayCode);
@@ -2200,7 +2541,7 @@ export default function AbsensiMultiServerPage() {
       emp_code: cleanCode,
       full_name: empForm.full_name.trim(),
       role: empForm.role,
-      department: empForm.department.trim() || "Operasional",
+      department: empForm.department.trim() || "Security Dormitory Batang",
       pin_code: empForm.pin_code.trim() || "1234",
       shift_start_time: normalizeShiftTime(resolvedStartTime),
     };
@@ -2220,12 +2561,12 @@ export default function AbsensiMultiServerPage() {
               emp_code: "",
               full_name: "",
               role: "STAFF",
-              department: "Operasional",
-              pin_code: "1234",
+              department: "Security Dormitory Batang",
+              pin_code: "1001",
               shift_start_time: "07.00",
               weekly_schedule: buildDefaultWeeklySchedule("P"),
             });
-            notify("ok", "Data & jadwal Senin–Minggu karyawan disimpan.");
+            notify("ok", "Data, PIN & jadwal karyawan disimpan di server Admin.");
             return;
           }
         }
@@ -2234,50 +2575,68 @@ export default function AbsensiMultiServerPage() {
       }
     }
     setEmployees((prev) => {
-      if (empForm.id) {
-        return prev.map((e) =>
-          e.id === empForm.id
-            ? { ...e, ...payload, weekly_schedule: empForm.weekly_schedule }
-            : e
-        );
-      }
-      return [
-        ...prev,
-        {
-          ...payload,
-          id: Date.now(),
-          weekly_schedule: empForm.weekly_schedule,
-        },
-      ];
+      const next = empForm.id
+        ? prev.map((e) =>
+            e.id === empForm.id
+              ? { ...e, ...payload, weekly_schedule: empForm.weekly_schedule }
+              : e
+          )
+        : [
+            ...prev,
+            {
+              ...payload,
+              id: Date.now(),
+              weekly_schedule: empForm.weekly_schedule,
+            },
+          ];
+      return ensureLockedEmployees(
+        next,
+        weeklyMap,
+        loadDeviceRegistry()
+      );
     });
     setEmpForm({
       id: 0,
       emp_code: "",
       full_name: "",
       role: "STAFF",
-      department: "Operasional",
-      pin_code: "1234",
+      department: "Security Dormitory Batang",
+      pin_code: "1001",
       shift_start_time: "07.00",
       weekly_schedule: buildDefaultWeeklySchedule("P"),
     });
-    notify("ok", "Data & jadwal Senin–Minggu karyawan diperbarui.");
+    notify("ok", "Data, PIN & jadwal karyawan diperbarui di server Admin.");
   };
 
-  const deleteEmployee = async (id: number) => {
+  const deleteEmployee = async (emp: Employee) => {
     if (isKaryawanMode) return;
+    if (
+      LOCKED_STAFF_CODES.includes(
+        emp.emp_code.toUpperCase() as (typeof LOCKED_STAFF_CODES)[number]
+      )
+    ) {
+      notify(
+        "warn",
+        `Kode ${emp.emp_code} dikunci sebagai data anggota inti; gunakan Edit untuk mengubah nama/PIN.`
+      );
+      return;
+    }
     if (navigator.onLine) {
       try {
         await fetch("/api/absen", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ action: "DELETE_EMPLOYEE", payload: { id } }),
+          body: JSON.stringify({
+            action: "DELETE_EMPLOYEE",
+            payload: { id: emp.id },
+          }),
         });
         await refreshServer(true);
       } catch {
         // Abaikan error
       }
     }
-    setEmployees((prev) => prev.filter((e) => e.id !== id));
+    setEmployees((prev) => prev.filter((e) => e.id !== emp.id));
     notify("ok", "Anggota karyawan dihapus.");
   };
 
@@ -2447,6 +2806,113 @@ export default function AbsensiMultiServerPage() {
     );
   }
 
+  if (isKaryawanMode && !isStaffLoggedIn) {
+    return (
+      <div className="min-h-screen bg-[#ECEFF4] flex items-center justify-center p-4">
+        <form
+          onSubmit={(e) => void handleStaffMemberLogin(e)}
+          className="max-w-sm w-full bg-white rounded-2xl p-5 shadow space-y-3 border border-slate-200"
+        >
+          <div className="flex items-center justify-between">
+            <span className="text-xs font-extrabold uppercase text-slate-900">
+              Login Anggota Karyawan
+            </span>
+            <span className="px-2 py-0.5 rounded bg-sky-100 text-sky-800 text-[9px] font-extrabold">
+              SERVER KARYAWAN
+            </span>
+          </div>
+
+          <div className="text-[11px] font-mono text-emerald-700 bg-emerald-50 px-2.5 py-1.5 rounded-lg">
+            {indonesiaClockWIB}
+          </div>
+
+          {toast && (
+            <div
+              className={`px-3 py-2 rounded-lg text-white text-xs font-bold ${
+                toast.type === "ok"
+                  ? "bg-emerald-600"
+                  : toast.type === "warn"
+                  ? "bg-amber-600"
+                  : "bg-rose-600"
+              }`}
+            >
+              {toast.text}
+            </div>
+          )}
+
+          <p className="text-xs text-slate-500">
+            Masukkan <b>ID Karyawan</b> dan <b>PIN</b> yang dibuat Admin di
+            server utama agar akun &amp; HP rapi dan tidak bentrok.
+          </p>
+
+          <input
+            type="text"
+            placeholder="ID Karyawan (cth: AP-SCRTY-MPI.22112026.0001)"
+            value={staffLoginCode}
+            onChange={(e) => setStaffLoginCode(e.target.value)}
+            className="w-full rounded-lg border border-slate-300 px-3 py-2 text-xs font-bold uppercase"
+          />
+
+          <input
+            type="password"
+            inputMode="numeric"
+            placeholder="PIN Anggota buatan Admin"
+            value={staffLoginPin}
+            onChange={(e) => setStaffLoginPin(e.target.value)}
+            className="w-full rounded-lg border border-slate-300 px-3 py-2 text-xs text-center tracking-widest"
+          />
+
+          <div className="p-2 rounded-lg bg-slate-50 border border-slate-200 text-[10px] text-slate-600 space-y-0.5">
+            <div className="font-bold text-slate-800">
+              Sistem Perangkat HP Terbaca:
+            </div>
+            <div>{currentHpDevice.summary}</div>
+            <div>
+              Layar: {currentHpDevice.screen_size} • {currentHpDevice.timezone}
+            </div>
+          </div>
+
+          <button
+            type="submit"
+            className="w-full py-2.5 rounded-lg bg-blue-600 text-white text-xs font-extrabold"
+          >
+            Masuk Ke Akun Anggota
+          </button>
+
+          <button
+            type="button"
+            onClick={() => void triggerGoogleAppDownloadInstall()}
+            className="w-full py-2 rounded-lg bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-bold"
+          >
+            {installPromptEvent
+              ? "Download & Instal Aplikasi (Google)"
+              : "Instal Aplikasi di Google / HP"}
+          </button>
+
+          {installGuideOpen && (
+            <div className="p-2.5 rounded-lg bg-emerald-50 border border-emerald-200 text-[10px] text-emerald-950 space-y-1">
+              <div className="font-extrabold">
+                Cara Menginstal Aplikasi di HP via Google:
+              </div>
+              <div>
+                1. Buka halaman ini di browser <b>Google Chrome</b>.
+              </div>
+              <div>
+                2. Ketuk menu <b>⋮ (titik tiga)</b> di pojok kanan atas lalu
+                pilih <b>Instal aplikasi</b> atau{" "}
+                <b>Tambahkan ke layar utama</b>.
+              </div>
+              <div>
+                3. Ikon aplikasi akan muncul di layar HP dan login memakai ID &amp;
+                PIN yang dibuat Admin.
+              </div>
+            </div>
+          )}
+        </form>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen bg-[#ECEFF4] text-slate-900 p-2.5 sm:p-4">
       <div className="max-w-md mx-auto space-y-3.5">
@@ -2520,6 +2986,12 @@ export default function AbsensiMultiServerPage() {
             {indonesiaClockWIB}
           </div>
 
+          {isKaryawanMode && (
+            <div className="text-[10px] text-sky-200 bg-white/5 px-2.5 py-1 rounded-lg truncate">
+              Device HP: {currentHpDevice.summary}
+            </div>
+          )}
+
           <div className="flex flex-wrap items-center gap-1.5">
             <span
               className={`px-2.5 py-1 rounded-md text-white text-[10px] font-extrabold uppercase ${
@@ -2544,6 +3016,16 @@ export default function AbsensiMultiServerPage() {
             >
               {isSyncing ? "Sinkron..." : "Refresh Server"}
             </button>
+
+            {isKaryawanMode && (
+              <button
+                type="button"
+                onClick={handleStaffMemberLogout}
+                className="px-2.5 py-1 rounded-md bg-rose-600 text-white text-[10px] font-bold"
+              >
+                Keluar Akun
+              </button>
+            )}
 
             {!isKaryawanMode && (
               <>
@@ -2582,35 +3064,6 @@ export default function AbsensiMultiServerPage() {
             )}
           </div>
         </header>
-
-        {isKaryawanMode && (
-          <section className="bg-white rounded-2xl p-3 border border-slate-200/80 shadow-sm space-y-1.5">
-            <label className="block text-[11px] font-extrabold text-slate-700">
-              Pilih Nama Karyawan
-            </label>
-            <select
-              value={activeUser?.id || ""}
-              onChange={(e) => {
-                const nextId = Number(e.target.value);
-                setStaffEmpId(nextId);
-                localStorage.setItem(STAFF_EMP_KEY, String(nextId));
-              }}
-              className="w-full rounded-lg border border-slate-300 px-2.5 py-2 text-xs font-bold bg-slate-50"
-            >
-              {staffList.map((emp) => {
-                const todaySh = getEmployeeShiftForIso(emp, syncedIsoNow);
-                return (
-                  <option key={emp.id} value={emp.id}>
-                    {emp.full_name} ({emp.emp_code}) •{" "}
-                    {todaySh.code === "OFF"
-                      ? "OFF (Libur)"
-                      : `Shift ${todaySh.code} (${todaySh.rangeLabel})`}
-                  </option>
-                );
-              })}
-            </select>
-          </section>
-        )}
 
         {!isKaryawanMode && (
           <section className="bg-white rounded-2xl p-3.5 border-t-4 border-t-blue-600 border border-slate-200/80 shadow-sm space-y-2.5">
@@ -3129,6 +3582,7 @@ export default function AbsensiMultiServerPage() {
                       </th>
                       <th className="p-1.5">Tanggal</th>
                       <th className="p-1.5">Nama</th>
+                      <th className="p-1.5">Device HP</th>
                       <th className="p-1.5">Jenis</th>
                       <th className="p-1.5">Foto</th>
                       <th className="p-1.5">Scan</th>
@@ -3140,7 +3594,7 @@ export default function AbsensiMultiServerPage() {
                     {filteredEntries.length === 0 ? (
                       <tr>
                         <td
-                          colSpan={8}
+                          colSpan={9}
                           className="p-4 text-center text-slate-400"
                         >
                           Belum ada data absensi
@@ -3159,6 +3613,10 @@ export default function AbsensiMultiServerPage() {
                           item.entry_type === "CLOCK_IN"
                             ? calcLateDetail(item.punched_at, shift.startTime)
                             : { lateMinutes: 0, isLate: false, statusNote: "" };
+                        const devLabel =
+                          item.device_info ||
+                          emp?.last_device?.summary ||
+                          "HP";
                         return (
                           <tr
                             key={`${item.client_uuid}-${idx}`}
@@ -3180,6 +3638,9 @@ export default function AbsensiMultiServerPage() {
                             </td>
                             <td className="p-1.5 font-semibold whitespace-nowrap">
                               {item.full_name || emp?.full_name || "Karyawan"}
+                            </td>
+                            <td className="p-1.5 max-w-[120px] truncate text-[9px] text-slate-600">
+                              {devLabel}
                             </td>
                             <td className="p-1.5 whitespace-nowrap">
                               {item.entry_type === "CLOCK_IN"
@@ -3295,7 +3756,7 @@ export default function AbsensiMultiServerPage() {
               <div className="space-y-1.5">
                 <input
                   type="text"
-                  placeholder="ID (KRY-005)"
+                  placeholder="ID (cth: AP-SCRTY-MPI.22112026.0001)"
                   value={empForm.emp_code}
                   onChange={(e) =>
                     setEmpForm((p) => ({ ...p, emp_code: e.target.value }))
@@ -3416,15 +3877,19 @@ export default function AbsensiMultiServerPage() {
                     buildDefaultWeeklySchedule(
                       shiftTimeToCode(emp.shift_start_time)
                     );
+                  const isLockedCode = LOCKED_STAFF_CODES.includes(
+                    emp.emp_code.toUpperCase() as (typeof LOCKED_STAFF_CODES)[number]
+                  );
                   return (
                     <div
                       key={emp.id}
                       className="p-2 rounded-lg bg-slate-50 border border-slate-200/70 space-y-1 text-xs"
                     >
                       <div className="flex flex-wrap items-center justify-between gap-1.5">
-                        <div>
+                        <div className="break-all">
                           <span className="font-bold">{emp.full_name}</span> (
-                          {emp.emp_code}) • {emp.role}
+                          {emp.emp_code}) • PIN: <b>{emp.pin_code}</b> •{" "}
+                          {emp.role}
                         </div>
                         <div className="flex gap-1">
                           <button
@@ -3447,10 +3912,10 @@ export default function AbsensiMultiServerPage() {
                           >
                             Edit
                           </button>
-                          {emp.role !== "ADMIN" && (
+                          {emp.role !== "ADMIN" && !isLockedCode && (
                             <button
                               type="button"
-                              onClick={() => void deleteEmployee(emp.id)}
+                              onClick={() => void deleteEmployee(emp)}
                               className="px-2 py-0.5 rounded bg-rose-600 text-white text-[10px] font-bold"
                             >
                               Hapus
@@ -3458,6 +3923,11 @@ export default function AbsensiMultiServerPage() {
                           )}
                         </div>
                       </div>
+                      {emp.last_device?.summary && (
+                        <div className="text-[9px] text-slate-500 truncate">
+                          HP Login: {emp.last_device.summary}
+                        </div>
+                      )}
                       <div className="flex flex-wrap gap-1 text-[9px]">
                         {DAYS_OF_WEEK.map((d) => {
                           const c = wk[d] || "P";
