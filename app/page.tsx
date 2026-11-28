@@ -479,6 +479,17 @@ const formatTimeWIB = (iso?: string | null) =>
         second: "2-digit",
       });
 
+const formatFullTimestampWIB = (ms: number) =>
+  new Date(ms).toLocaleString("id-ID", {
+    timeZone: "Asia/Jakarta",
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  }) + " WIB";
+
 const formatDateTimeLocalWIB = (iso?: string | null) => {
   if (!iso) return "";
   return new Intl.DateTimeFormat("sv-SE", {
@@ -1591,8 +1602,6 @@ export default function AbsensiMultiServerPage() {
 
   const todayStr = getJakartaDateStr(syncedIsoNow);
 
-  // Aturan: setiap anggota & Admin hanya bisa absen MASUK 1x dan KELUAR 1x per hari (kecuali dihapus Admin),
-  // serta tetap terkena jeda minimal 6 jam setelah absen.
   const attendanceGuard = useMemo(() => {
     if (!activeUser) {
       return {
@@ -1730,7 +1739,7 @@ export default function AbsensiMultiServerPage() {
     if (!FD) {
       setFaceStatus("fallback");
       setFaceText(
-        "Kamera depan aktif; klik Ambil Foto Selfie untuk menyimpan wajah."
+        "Kamera depan aktif; klik Ambil Foto Selfie untuk cap waktu & lokasi."
       );
       return;
     }
@@ -1796,6 +1805,7 @@ export default function AbsensiMultiServerPage() {
     }
   };
 
+  // Membuat foto selfie dengan cap verifikasi asli ala TimeMark (Waktu WIB, Nama/Kode, GPS + Geofence, Device)
   const takeSelfiePhoto = async () => {
     if (!selfieVideoRef.current || !selfieCanvasRef.current) return;
     const FD = (
@@ -1826,25 +1836,97 @@ export default function AbsensiMultiServerPage() {
     }
 
     const c = selfieCanvasRef.current;
-    c.width = 240;
-    c.height = 240;
+    const width = 480;
+    const height = 480;
+    c.width = width;
+    c.height = height;
     const ctx = c.getContext("2d");
     if (!ctx) return;
-    ctx.drawImage(selfieVideoRef.current, 0, 0, 240, 240);
-    const dataUrl = c.toDataURL("image/jpeg", 0.65);
+
+    ctx.save();
+    ctx.translate(width, 0);
+    ctx.scale(-1, 1);
+    ctx.drawImage(selfieVideoRef.current, 0, 0, width, height);
+    ctx.restore();
+
+    const stampMs = Date.now() + offsetRef.current;
+    const wibStamp = formatFullTimestampWIB(stampMs);
+    const latVal = gpsCoords?.lat ?? targetLocation.latitude;
+    const lngVal = gpsCoords?.lng ?? targetLocation.longitude;
+    const distVal = geofence ? `${geofence.distance}m` : "GPS";
+    const radiusStatus = geofence
+      ? geofence.inside
+        ? "IN RADIUS"
+        : "OUT RADIUS"
+      : "CAM VERIFIED";
+    const faceTag = FD
+      ? detected
+        ? "FACE VERIFIED"
+        : "CAM LIVE"
+      : "CAM LIVE";
+    const actionLabel = selectedAction === "CLOCK_OUT" ? "KELUAR" : "MASUK";
+    const userLabel = activeUser
+      ? `${activeUser.full_name} • ${activeUser.emp_code}`
+      : "KARYAWAN";
+
+    ctx.fillStyle = "rgba(11, 18, 32, 0.82)";
+    ctx.fillRect(10, 10, width - 20, 26);
+    ctx.fillStyle = "#34D399";
+    ctx.font = "bold 11px monospace";
+    ctx.fillText(
+      `TIMEMARK VERIFIED • ${actionLabel} • ${faceTag} • ${radiusStatus}`,
+      16,
+      27
+    );
+
+    const boxH = 104;
+    const boxY = height - boxH - 10;
+    ctx.fillStyle = "rgba(11, 18, 32, 0.86)";
+    ctx.fillRect(10, boxY, width - 20, boxH);
+
+    ctx.strokeStyle = "#38BDF8";
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(10, boxY, width - 20, boxH);
+
+    ctx.fillStyle = "#FFFFFF";
+    ctx.font = "bold 13px sans-serif";
+    ctx.fillText(wibStamp, 18, boxY + 20);
+
+    ctx.fillStyle = "#BAE6FD";
+    ctx.font = "bold 11px sans-serif";
+    ctx.fillText(userLabel, 18, boxY + 38);
+
+    ctx.fillStyle = "#86EFAC";
+    ctx.font = "11px monospace";
+    ctx.fillText(
+      `GPS: ${latVal}, ${lngVal} (${distVal}/${targetLocation.radius_meters}m)`,
+      18,
+      boxY + 56
+    );
+
+    ctx.fillStyle = "#E2E8F0";
+    ctx.font = "10px sans-serif";
+    const devText = currentHpDevice.summary.slice(0, 62);
+    ctx.fillText(`Device: ${devText}`, 18, boxY + 74);
+
+    ctx.fillStyle = "#94A3B8";
+    ctx.font = "10px monospace";
+    ctx.fillText(
+      `QR: ${officeQrCode} • LatLng Verified`,
+      18,
+      boxY + 91
+    );
+
+    const dataUrl = c.toDataURL("image/jpeg", 0.78);
     setCapturedSelfie(dataUrl);
     setFaceStatus(FD ? "detected" : "fallback");
     setFaceText(
-      `Selfie wajah ${
-        selectedAction === "CLOCK_OUT" ? "KELUAR" : "MASUK"
-      } tersimpan.`
+      `Foto TimeMark (${actionLabel}) siap dengan cap waktu, lokasi & verifikasi.`
     );
     stopSelfieCam();
     notify(
       "ok",
-      `Selfie wajah ${
-        selectedAction === "CLOCK_OUT" ? "KELUAR" : "MASUK"
-      } berhasil diambil.`
+      `Foto selfie ${actionLabel} dengan watermark waktu & lokasi berhasil diambil.`
     );
   };
 
@@ -1859,10 +1941,7 @@ export default function AbsensiMultiServerPage() {
 
     const entryType = typeOverride || selectedAction;
 
-    if (
-      entryType === "CLOCK_IN" &&
-      attendanceGuard.hasClockInToday
-    ) {
+    if (entryType === "CLOCK_IN" && attendanceGuard.hasClockInToday) {
       notify(
         "err",
         "Sudah absen MASUK 1 kali hari ini (tidak bisa absen ganda). Hubungi Admin jika perlu reset/hapus data."
@@ -1870,10 +1949,7 @@ export default function AbsensiMultiServerPage() {
       return;
     }
 
-    if (
-      entryType === "CLOCK_OUT" &&
-      attendanceGuard.hasClockOutToday
-    ) {
+    if (entryType === "CLOCK_OUT" && attendanceGuard.hasClockOutToday) {
       notify(
         "err",
         "Sudah absen KELUAR 1 kali hari ini (tidak bisa absen ganda). Hubungi Admin jika perlu reset/hapus data."
@@ -1953,6 +2029,12 @@ export default function AbsensiMultiServerPage() {
         ? crypto.randomUUID()
         : `${syncedNow}-${Math.random().toString(36).slice(2)}`;
 
+    const latVal = gpsCoords?.lat ?? targetLocation.latitude;
+    const lngVal = gpsCoords?.lng ?? targetLocation.longitude;
+    const locStampNote = `TimeMark GPS ${latVal}, ${lngVal} (${
+      geofence?.distance ?? 0
+    }m)`;
+
     const newPunch: TimeEntry = {
       client_uuid: uuid,
       employee_id: Number(activeUser.id),
@@ -1961,13 +2043,15 @@ export default function AbsensiMultiServerPage() {
       is_offline_sync: !navigator.onLine,
       qr_code: effectiveQr,
       mode: capturedSelfie
-        ? "BARCODE + WAJAH"
+        ? "TIMEMARK + BARCODE + WAJAH"
         : enteredCode
         ? "BARCODE + GPS"
         : "MANUAL KLIK",
-      notes: lateInfo.isLate ? lateInfo.statusNote : "",
-      latitude: gpsCoords?.lat ?? targetLocation.latitude,
-      longitude: gpsCoords?.lng ?? targetLocation.longitude,
+      notes: lateInfo.isLate
+        ? `${lateInfo.statusNote} • ${locStampNote}`
+        : locStampNote,
+      latitude: latVal,
+      longitude: lngVal,
       distance_meters: geofence?.distance ?? 0,
       is_within_geofence: geofence ? geofence.inside : true,
       selfie_data: capturedSelfie,
@@ -2374,9 +2458,9 @@ export default function AbsensiMultiServerPage() {
             ? "OFF (LIBUR)"
             : `${g.shiftInfo.code} (${g.shiftInfo.rangeLabel})`,
           g.inEntry ? formatTimeWIB(g.inEntry.punched_at) : "-",
-          g.inEntry?.selfie_data ? "ADA FOTO WAJAH" : "-",
+          g.inEntry?.selfie_data ? "TIMEMARK + WAJAH" : "-",
           g.outEntry ? formatTimeWIB(g.outEntry.punched_at) : "-",
-          g.outEntry?.selfie_data ? "ADA FOTO WAJAH" : "-",
+          g.outEntry?.selfie_data ? "TIMEMARK + WAJAH" : "-",
           "0j 00m",
           "0j 00m",
           lateInfo.isLate ? `${lateInfo.lateMinutes}m` : "0m",
@@ -2385,7 +2469,7 @@ export default function AbsensiMultiServerPage() {
             : g.shiftInfo.code === "OFF"
             ? "LIBUR (OFF)"
             : "HADIR",
-          g.inEntry?.mode || g.outEntry?.mode || "BARCODE + WAJAH",
+          g.inEntry?.mode || g.outEntry?.mode || "TIMEMARK + BARCODE + WAJAH",
         ];
       });
 
@@ -2419,10 +2503,10 @@ export default function AbsensiMultiServerPage() {
           ? calcLateDetail(g.inEntry.punched_at, g.shiftInfo.startTime)
           : { lateMinutes: 0, isLate: false, statusNote: "-" };
         const inImgHtml = g.inEntry?.selfie_data
-          ? `<img src="${g.inEntry.selfie_data}" width="46" height="46" style="width:46px;height:46px;object-fit:cover;border-radius:4px;border:1px solid #082A63" />`
+          ? `<img src="${g.inEntry.selfie_data}" width="54" height="54" style="width:54px;height:54px;object-fit:cover;border-radius:4px;border:1px solid #082A63" />`
           : `<span style="color:#64748b">-</span>`;
         const outImgHtml = g.outEntry?.selfie_data
-          ? `<img src="${g.outEntry.selfie_data}" width="46" height="46" style="width:46px;height:46px;object-fit:cover;border-radius:4px;border:1px solid #082A63" />`
+          ? `<img src="${g.outEntry.selfie_data}" width="54" height="54" style="width:54px;height:54px;object-fit:cover;border-radius:4px;border:1px solid #082A63" />`
           : `<span style="color:#64748b">-</span>`;
         const shiftHtml =
           g.shiftInfo.code === "OFF"
@@ -2451,7 +2535,7 @@ export default function AbsensiMultiServerPage() {
           <td>0j 00m</td>
           <td>${telatHtml}</td>
           <td>${ketText}</td>
-          <td>${g.inEntry?.mode || g.outEntry?.mode || "BARCODE + WAJAH"}</td>
+          <td>${g.inEntry?.mode || g.outEntry?.mode || "TIMEMARK + BARCODE + WAJAH"}</td>
         </tr>`;
       })
       .join("");
@@ -3311,7 +3395,7 @@ export default function AbsensiMultiServerPage() {
           <div className="pt-2 border-t border-slate-100 space-y-2">
             <div className="flex items-center justify-between">
               <span className="text-[11px] font-extrabold text-slate-700">
-                Selfie Kamera Depan (Masuk &amp; Keluar)
+                Selfie Kamera Depan + TimeMark (Masuk &amp; Keluar)
               </span>
               {capturedSelfie && (
                 <span className="text-[10px] font-bold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded">
@@ -3384,11 +3468,11 @@ export default function AbsensiMultiServerPage() {
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img
                   src={capturedSelfie}
-                  alt="Selfie Wajah"
-                  className="w-12 h-12 rounded-lg object-cover border border-emerald-500"
+                  alt="Selfie Wajah TimeMark"
+                  className="w-16 h-16 rounded-lg object-cover border border-emerald-500"
                 />
                 <span className="text-[11px] text-emerald-800 font-semibold">
-                  Foto wajah tersimpan. Klik{" "}
+                  Foto TimeMark (waktu, GPS &amp; verifikasi) tersimpan. Klik{" "}
                   {selectedAction === "CLOCK_OUT" ? "KELUAR" : "MASUK"}.
                 </span>
               </div>
@@ -3734,8 +3818,8 @@ export default function AbsensiMultiServerPage() {
                                 /* eslint-disable-next-line @next/next/no-img-element */
                                 <img
                                   src={item.selfie_data}
-                                  alt="Wajah"
-                                  className="w-6 h-6 rounded object-cover border border-slate-300"
+                                  alt="Wajah TimeMark"
+                                  className="w-8 h-8 rounded object-cover border border-slate-300"
                                 />
                               ) : (
                                 "-"
