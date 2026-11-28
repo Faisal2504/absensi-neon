@@ -228,6 +228,7 @@ const QR_CODE_KEY = "absensi_v12_qr";
 const LOC_KEY = "absensi_v12_custom_loc";
 const WEEKLY_SCHED_KEY = "absensi_v12_weekly_sched";
 const SCHEDULE_POSTER_KEY = "absensi_v12_schedule_poster";
+const SCHEDULE_CLEARED_KEY = "absensi_v12_poster_cleared";
 const DEVICE_LOCK_KEY = "absensi_v12_device_locked_karyawan";
 const STAFF_EMP_KEY = "absensi_v12_staff_emp_id";
 const STAFF_EMP_CODE_KEY = "absensi_v12_staff_emp_code";
@@ -235,6 +236,7 @@ const STAFF_SESSION_KEY = "absensi_v12_staff_logged_in";
 const DEVICE_REG_KEY = "absensi_v12_device_registry";
 const AUTH_SERVER_KEY = "absensi_v12_auth_server";
 const GEMINI_HEALTH_KEY = "absensi_v12_gemini_health";
+const LIVE_SYNC_EVENT = "absensi_v12_live_sync_event";
 
 function isValidShiftCode(val: string): val is ShiftCode {
   return val === "P" || val === "S" || val === "M" || val === "P/M" || val === "OFF";
@@ -367,8 +369,44 @@ function loadDeviceRegistry(): Record<string, DeviceSystemInfo> {
   }
 }
 
+function isSchedulePosterCleared(): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    return localStorage.getItem(SCHEDULE_CLEARED_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function setSchedulePosterClearedFlag(cleared: boolean) {
+  if (typeof window === "undefined") return;
+  try {
+    if (cleared) {
+      localStorage.setItem(SCHEDULE_CLEARED_KEY, "1");
+      localStorage.removeItem(SCHEDULE_POSTER_KEY);
+    } else {
+      localStorage.removeItem(SCHEDULE_CLEARED_KEY);
+    }
+  } catch {
+    // Abaikan error storage
+  }
+}
+
+function broadcastLiveSync(detail: {
+  posterCleared?: boolean;
+  weeklySchedules?: Record<string, WeeklyScheduleMap>;
+}) {
+  if (typeof window === "undefined") return;
+  try {
+    window.dispatchEvent(new CustomEvent(LIVE_SYNC_EVENT, { detail }));
+  } catch {
+    // Abaikan
+  }
+}
+
 function loadSchedulePoster(): UploadedSchedulePoster | null {
   if (typeof window === "undefined") return null;
+  if (isSchedulePosterCleared()) return null;
   try {
     const raw = localStorage.getItem(SCHEDULE_POSTER_KEY);
     if (!raw) return null;
@@ -1133,6 +1171,7 @@ function reconcileScheduleAndAttendanceWithGeminiGuard(params: {
   employees: Employee[];
   entries: TimeEntry[];
   poster: UploadedSchedulePoster | null;
+  posterCleared: boolean;
   checkedAtLabel: string;
 }): {
   employees: Employee[];
@@ -1180,6 +1219,8 @@ function reconcileScheduleAndAttendanceWithGeminiGuard(params: {
     );
   }
 
+  const activePoster = params.posterCleared ? null : params.poster;
+
   const normalizedEmployees = ensureLockedEmployees(
     params.employees,
     weeklyMap,
@@ -1192,7 +1233,7 @@ function reconcileScheduleAndAttendanceWithGeminiGuard(params: {
       defCode
     );
 
-    const posterMatch = params.poster?.summaryRows?.find(
+    const posterMatch = activePoster?.summaryRows?.find(
       (r) =>
         r.emp_code.toUpperCase() === codeUpper ||
         r.full_name.toLowerCase() === emp.full_name.toLowerCase()
@@ -1201,7 +1242,10 @@ function reconcileScheduleAndAttendanceWithGeminiGuard(params: {
     if (posterMatch) {
       matchedCount++;
       if (posterMatch.weekly && Object.keys(posterMatch.weekly).length > 0) {
-        wk = sanitizeWeeklySchedule({ ...wk, ...posterMatch.weekly }, posterMatch.shift_code);
+        wk = sanitizeWeeklySchedule(
+          { ...wk, ...posterMatch.weekly },
+          posterMatch.shift_code
+        );
       } else {
         const nextFromPoster: WeeklyScheduleMap = { ...wk };
         DAYS_OF_WEEK.forEach((d) => {
@@ -1240,7 +1284,9 @@ function reconcileScheduleAndAttendanceWithGeminiGuard(params: {
     );
   }
   findings.push(
-    `Jadwal keberangkatan otomatis tersinkron ke ${staffOnly.length} akun karyawan & papan Admin.`
+    params.posterCleared
+      ? `File/gambar jadwal PDF telah dibersihkan; jadwal manual ${staffOnly.length} karyawan tetap sinkron.`
+      : `Jadwal keberangkatan otomatis tersinkron ke ${staffOnly.length} akun karyawan & papan Admin.`
   );
 
   const healthScore = Math.max(85, Math.min(100, 100 - cleanedAnomalies * 2));
@@ -1278,6 +1324,7 @@ function getInitialBoot() {
       locations: DEFAULT_LOCATIONS,
       entries: [] as TimeEntry[],
       schedulePoster: null as UploadedSchedulePoster | null,
+      posterCleared: false,
       geminiHealth: null as GeminiServerHealthReport | null,
     };
   }
@@ -1295,7 +1342,8 @@ function getInitialBoot() {
   let isDeviceLockedKaryawan = false;
   let serverMode: ServerMode = "ADMIN";
   let isAuthenticatedPrivileged = false;
-  const schedulePoster = loadSchedulePoster();
+  const posterCleared = isSchedulePosterCleared();
+  const schedulePoster = posterCleared ? null : loadSchedulePoster();
   const geminiHealth = loadGeminiHealthReport();
 
   try {
@@ -1330,7 +1378,10 @@ function getInitialBoot() {
     const savedStaffCode = localStorage.getItem(STAFF_EMP_CODE_KEY);
     if (savedStaffCode) staffEmpCode = savedStaffCode.toUpperCase();
 
-    if (localStorage.getItem(STAFF_SESSION_KEY) === "1" && (savedStaff || savedStaffCode)) {
+    if (
+      localStorage.getItem(STAFF_SESSION_KEY) === "1" &&
+      (savedStaff || savedStaffCode)
+    ) {
       isStaffLoggedIn = true;
     }
 
@@ -1387,6 +1438,7 @@ function getInitialBoot() {
     locations,
     entries,
     schedulePoster,
+    posterCleared,
     geminiHealth,
   };
 }
@@ -1479,6 +1531,9 @@ export default function AbsensiMultiServerPage() {
     authSeal: string;
   } | null>(null);
 
+  const [posterCleared, setPosterCleared] = useState<boolean>(
+    boot.posterCleared
+  );
   const [scheduleFileName, setScheduleFileName] = useState(
     boot.schedulePoster?.fileName || "Tidak ada file yang dipilih"
   );
@@ -1538,6 +1593,26 @@ export default function AbsensiMultiServerPage() {
   const empFormSectionRef = useRef<HTMLDivElement | null>(null);
   const offsetRef = useRef<number>(0);
   const syncInFlightRef = useRef<boolean>(false);
+  const posterClearedRef = useRef<boolean>(boot.posterCleared);
+  const employeesRef = useRef<Employee[]>(boot.employees);
+  const entriesRef = useRef<TimeEntry[]>(boot.entries);
+  const posterRef = useRef<UploadedSchedulePoster | null>(boot.schedulePoster);
+
+  useEffect(() => {
+    posterClearedRef.current = posterCleared;
+  }, [posterCleared]);
+
+  useEffect(() => {
+    employeesRef.current = employees;
+  }, [employees]);
+
+  useEffect(() => {
+    entriesRef.current = serverEntries;
+  }, [serverEntries]);
+
+  useEffect(() => {
+    posterRef.current = schedulePoster;
+  }, [schedulePoster]);
 
   const notify = useCallback((type: "ok" | "warn" | "err", text: string) => {
     setToast({ type, text });
@@ -1673,22 +1748,31 @@ export default function AbsensiMultiServerPage() {
       targetEmployees?: Employee[];
       targetEntries?: TimeEntry[];
       targetPoster?: UploadedSchedulePoster | null;
+      forceCleared?: boolean;
       syncToBackend?: boolean;
     }) => {
-      setIsGeminiRunning(true);
       try {
+        setIsGeminiRunning(true);
         const checkedAtLabel = formatFullTimestampWIB(
           Date.now() + offsetRef.current
         );
-        const baseEmps = opts?.targetEmployees ?? employees;
-        const baseEntries = opts?.targetEntries ?? serverEntries;
-        const activePoster =
-          opts?.targetPoster !== undefined ? opts.targetPoster : schedulePoster;
+        const baseEmps = opts?.targetEmployees ?? employeesRef.current;
+        const baseEntries = opts?.targetEntries ?? entriesRef.current;
+        const isCleared =
+          opts?.forceCleared !== undefined
+            ? opts.forceCleared
+            : posterClearedRef.current;
+        const activePoster = isCleared
+          ? null
+          : opts?.targetPoster !== undefined
+          ? opts.targetPoster
+          : posterRef.current;
 
         const guarded = reconcileScheduleAndAttendanceWithGeminiGuard({
           employees: baseEmps,
           entries: baseEntries,
           poster: activePoster,
+          posterCleared: isCleared,
           checkedAtLabel,
         });
 
@@ -1705,6 +1789,7 @@ export default function AbsensiMultiServerPage() {
                   employees: guarded.employees,
                   weeklySchedules: guarded.weeklyMap,
                   poster: activePoster,
+                  posterCleared: isCleared,
                   healthReport: guarded.report,
                 },
               }),
@@ -1721,7 +1806,7 @@ export default function AbsensiMultiServerPage() {
               }
             }
           } catch {
-            // Tetap pakai hasil pemeriksaan & sinkronisasi guard lokal tanpa error
+            // Aman: tidak melempar error ke server/APK absen
           }
         }
 
@@ -1752,14 +1837,16 @@ export default function AbsensiMultiServerPage() {
         if (!opts?.silent) {
           notify(
             "ok",
-            `AI Gemini Kontrol (${finalReport.healthScore}/100 • ${finalReport.statusLabel}): data absen & jadwal tersinkron otomatis ke Admin & Karyawan.`
+            `AI Gemini Kontrol (${finalReport.healthScore}/100 • ${finalReport.statusLabel}): data absen & jadwal sinkron otomatis ke Admin & Karyawan.`
           );
         }
+      } catch {
+        // Isolasi error AI agar tidak mengganggu server/APK absen
       } finally {
         setIsGeminiRunning(false);
       }
     },
-    [employees, serverEntries, schedulePoster, notify]
+    [notify]
   );
 
   const applyServerState = useCallback(
@@ -1772,20 +1859,31 @@ export default function AbsensiMultiServerPage() {
         localStorage.setItem(QR_CODE_KEY, String(data.officeQr));
       }
 
-      if (
+      const clearedFlag =
+        Boolean(data.clearSchedulePoster) ||
+        Boolean(data.posterCleared) ||
+        posterClearedRef.current;
+
+      if (clearedFlag) {
+        setPosterCleared(true);
+        posterClearedRef.current = true;
+        setSchedulePoster(null);
+        setSchedulePreview([]);
+        setScheduleFileName("Tidak ada file yang dipilih");
+        setScheduleImageZoomOpen(false);
+        setSchedulePosterClearedFlag(true);
+      } else if (
         data.schedulePoster &&
         typeof data.schedulePoster === "object" &&
         (data.schedulePoster as UploadedSchedulePoster).imageDataUrl
       ) {
         const poster = data.schedulePoster as UploadedSchedulePoster;
+        setPosterCleared(false);
+        posterClearedRef.current = false;
         setSchedulePoster(poster);
         setScheduleFileName(poster.fileName || "Jadwal PDF");
+        setSchedulePosterClearedFlag(false);
         localStorage.setItem(SCHEDULE_POSTER_KEY, JSON.stringify(poster));
-      } else if (data.clearSchedulePoster) {
-        setSchedulePoster(null);
-        setSchedulePreview([]);
-        setScheduleFileName("Tidak ada file yang dipilih");
-        localStorage.removeItem(SCHEDULE_POSTER_KEY);
       }
 
       const weeklyMap = loadWeeklySchedulesMap();
@@ -2079,9 +2177,42 @@ export default function AbsensiMultiServerPage() {
         flushNow();
       }
     };
+    const onLiveSyncEvent = (ev: Event) => {
+      const custom = ev as CustomEvent<{
+        posterCleared?: boolean;
+        weeklySchedules?: Record<string, WeeklyScheduleMap>;
+      }>;
+      if (custom.detail?.posterCleared) {
+        setPosterCleared(true);
+        posterClearedRef.current = true;
+        setSchedulePoster(null);
+        setSchedulePreview([]);
+        setScheduleFileName("Tidak ada file yang dipilih");
+        setScheduleImageZoomOpen(false);
+      }
+      if (custom.detail?.weeklySchedules) {
+        const wm = custom.detail.weeklySchedules;
+        setEmployees((prev) =>
+          ensureLockedEmployees(prev, wm, loadDeviceRegistry())
+        );
+      }
+    };
     const onStorageSync = (ev: StorageEvent) => {
+      if (ev.key === SCHEDULE_CLEARED_KEY) {
+        if (ev.newValue === "1") {
+          setPosterCleared(true);
+          posterClearedRef.current = true;
+          setSchedulePoster(null);
+          setSchedulePreview([]);
+          setScheduleFileName("Tidak ada file yang dipilih");
+          setScheduleImageZoomOpen(false);
+        } else {
+          setPosterCleared(false);
+          posterClearedRef.current = false;
+        }
+      }
       if (ev.key === SCHEDULE_POSTER_KEY) {
-        if (ev.newValue) {
+        if (ev.newValue && !posterClearedRef.current) {
           try {
             const parsed = JSON.parse(ev.newValue) as UploadedSchedulePoster;
             setSchedulePoster(parsed);
@@ -2089,7 +2220,7 @@ export default function AbsensiMultiServerPage() {
           } catch {
             // Abaikan
           }
-        } else {
+        } else if (!ev.newValue) {
           setSchedulePoster(null);
           setSchedulePreview([]);
           setScheduleFileName("Tidak ada file yang dipilih");
@@ -2116,6 +2247,7 @@ export default function AbsensiMultiServerPage() {
     window.addEventListener("focus", flushNow);
     window.addEventListener("pageshow", flushNow);
     window.addEventListener("storage", onStorageSync);
+    window.addEventListener(LIVE_SYNC_EVENT, onLiveSyncEvent);
     document.addEventListener("visibilitychange", onVisibilityOrFocus);
 
     const t = window.setTimeout(() => {
@@ -2131,6 +2263,7 @@ export default function AbsensiMultiServerPage() {
       window.removeEventListener("focus", flushNow);
       window.removeEventListener("pageshow", flushNow);
       window.removeEventListener("storage", onStorageSync);
+      window.removeEventListener(LIVE_SYNC_EVENT, onLiveSyncEvent);
       document.removeEventListener("visibilitychange", onVisibilityOrFocus);
       stopQrCam();
       stopSelfieCam();
@@ -2793,8 +2926,8 @@ export default function AbsensiMultiServerPage() {
       entryType === "CLOCK_IN"
         ? lateInfo.isLate
           ? `Absen MASUK tercatat (TERLAMBAT ${lateInfo.lateMinutes} menit)!`
-          : "Terimakasih Sudah Hadir, Selamat Bertempur!"
-        : "Terimakasih, semoga selamat sampai rumah!"
+          : "Terimakasih Sudah Hadir, Selamat Berkerja!"
+        : "Terimakasih sudah absen pulang, jangan lupa minum kopi setelah sampai rumah!"
     );
   };
 
@@ -3057,43 +3190,46 @@ export default function AbsensiMultiServerPage() {
       );
       return;
     }
+
+    setPosterCleared(true);
+    posterClearedRef.current = true;
     setSchedulePoster(null);
     setSchedulePreview([]);
     setScheduleFileName("Tidak ada file yang dipilih");
     setScheduleImageZoomOpen(false);
-    localStorage.removeItem(SCHEDULE_POSTER_KEY);
+    setSchedulePosterClearedFlag(true);
+    broadcastLiveSync({ posterCleared: true });
+
     if (scheduleInputRef.current) {
       scheduleInputRef.current.value = "";
     }
 
     if (navigator.onLine) {
       try {
-        const res = await fetch("/api/absen", {
+        await fetch("/api/absen", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             action: "DELETE_SCHEDULE_POSTER",
+            payload: { posterCleared: true },
           }),
           cache: "no-store",
         });
-        if (res.ok) {
-          const data = await res.json();
-          applyServerState({ ...data, clearSchedulePoster: true });
-        }
       } catch {
-        // Tetap terhapus lokal
+        // Tetap terhapus lokal & sinkron lintas tab
       }
     }
 
     void runGeminiServerGuardAndSync({
       silent: true,
       targetPoster: null,
+      forceCleared: true,
       syncToBackend: false,
     });
 
     notify(
       "ok",
-      "File input PDF & gambar jadwal keberangkatan di dasbor berhasil dihapus."
+      "File PDF & gambar jadwal keberangkatan berhasil dihapus dan disembunyikan dari dashboard."
     );
   };
 
@@ -3160,6 +3296,9 @@ export default function AbsensiMultiServerPage() {
         };
       });
 
+      setPosterCleared(false);
+      posterClearedRef.current = false;
+      setSchedulePosterClearedFlag(false);
       localStorage.setItem(WEEKLY_SCHED_KEY, JSON.stringify(weeklyMap));
       setEmployees(updatedEmployees);
 
@@ -3182,6 +3321,7 @@ export default function AbsensiMultiServerPage() {
 
       setSchedulePoster(posterObj);
       localStorage.setItem(SCHEDULE_POSTER_KEY, JSON.stringify(posterObj));
+      broadcastLiveSync({ posterCleared: false, weeklySchedules: weeklyMap });
 
       if (navigator.onLine) {
         try {
@@ -3211,6 +3351,7 @@ export default function AbsensiMultiServerPage() {
         silent: true,
         targetEmployees: updatedEmployees,
         targetPoster: posterObj,
+        forceCleared: false,
         syncToBackend: true,
       });
 
@@ -3399,7 +3540,7 @@ export default function AbsensiMultiServerPage() {
       });
 
       const csv = [
-        ["MURINDA", "Timesheet Absensi Security Dormitory Batang"],
+        ["Timesheet Absensi Security Dormitory Batang"],
         ["Month", meta.monthLabel],
         ["Anggota", meta.memberName],
         ["Kode", meta.memberCode],
@@ -3643,9 +3784,12 @@ export default function AbsensiMultiServerPage() {
       empForm.weekly_schedule,
       shiftTimeToCode(empForm.shift_start_time)
     );
-    const mondayCode = cleanedWeekly.Senin || "P";
+    const todayCode =
+      cleanedWeekly[getJakartaDayKey(syncedIsoNow)] ||
+      cleanedWeekly.Senin ||
+      "P";
     const resolvedStartTime =
-      empForm.shift_start_time || shiftCodeToStartTime(mondayCode);
+      empForm.shift_start_time || shiftCodeToStartTime(todayCode);
 
     const weeklyMap = loadWeeklySchedulesMap();
     weeklyMap[cleanCode] = cleanedWeekly;
@@ -3690,6 +3834,21 @@ export default function AbsensiMultiServerPage() {
 
     setEmployees(nextEmployeesList);
     persistWeeklySchedulesFromEmployees(nextEmployeesList);
+    broadcastLiveSync({ weeklySchedules: weeklyMap });
+
+    try {
+      const rawCache = localStorage.getItem(CACHE_KEY);
+      const parsedCache = rawCache ? JSON.parse(rawCache) : {};
+      localStorage.setItem(
+        CACHE_KEY,
+        JSON.stringify({
+          ...parsedCache,
+          employees: nextEmployeesList,
+        })
+      );
+    } catch {
+      // Abaikan
+    }
 
     if (navigator.onLine) {
       try {
@@ -3700,6 +3859,7 @@ export default function AbsensiMultiServerPage() {
             action: "SAVE_EMPLOYEE",
             payload,
             weeklySchedules: weeklyMap,
+            employees: nextEmployeesList,
           }),
           cache: "no-store",
         });
@@ -3724,7 +3884,7 @@ export default function AbsensiMultiServerPage() {
             });
             notify(
               "ok",
-              `Tersimpan ke Neon: ${payload.full_name} (PIN: ${payload.pin_code}) langsung sinkron ke HP Karyawan!`
+              `Tersimpan & sinkron realtime: jadwal ${payload.full_name} langsung tampil di Admin & Karyawan!`
             );
             return;
           }
@@ -3744,7 +3904,10 @@ export default function AbsensiMultiServerPage() {
       shift_start_time: "07.00",
       weekly_schedule: buildDefaultWeeklySchedule("P"),
     });
-    notify("warn", "Tersimpan lokal (cek koneksi internet untuk sinkron ke Neon).");
+    notify(
+      "ok",
+      `Jadwal ${payload.full_name} diperbarui & sinkron realtime ke board Admin & Karyawan.`
+    );
   };
 
   const deleteEmployee = async (emp: Employee) => {
@@ -4296,7 +4459,9 @@ export default function AbsensiMultiServerPage() {
               </p>
             </div>
             <span className="px-2 py-0.5 rounded bg-indigo-100 text-indigo-800 text-[9px] font-extrabold uppercase shrink-0">
-              {schedulePoster ? "PDF ADMIN AKTIF" : "REALTIME NEON"}
+              {schedulePoster && !posterCleared
+                ? "PDF ADMIN AKTIF"
+                : "REALTIME NEON"}
             </span>
           </div>
 
@@ -4414,7 +4579,7 @@ export default function AbsensiMultiServerPage() {
             </div>
           )}
 
-          {schedulePoster?.imageDataUrl && (
+          {!posterCleared && schedulePoster?.imageDataUrl && (
             <div className="p-2.5 rounded-xl bg-blue-50/70 border border-blue-200 space-y-1.5">
               <div className="flex items-center justify-between gap-2">
                 <div className="text-[10px] font-extrabold text-[#082A63] truncate">
@@ -5109,7 +5274,8 @@ export default function AbsensiMultiServerPage() {
                   <span className="text-[11px] text-slate-600 truncate flex-1 min-w-0">
                     {scheduleFileName}
                   </span>
-                  {(schedulePoster || schedulePreview.length > 0) && (
+                  {(!posterCleared &&
+                    (schedulePoster || schedulePreview.length > 0)) && (
                     <button
                       type="button"
                       onClick={() => void handleDeleteSchedulePdf()}
@@ -5120,7 +5286,7 @@ export default function AbsensiMultiServerPage() {
                   )}
                 </div>
 
-                {schedulePreview.length > 0 && (
+                {!posterCleared && schedulePreview.length > 0 && (
                   <div className="space-y-1 pt-1 max-h-40 overflow-y-auto">
                     {schedulePreview.map((r, i) => (
                       <div
@@ -5509,6 +5675,7 @@ export default function AbsensiMultiServerPage() {
                                   ...empForm,
                                   weekly_schedule: nextWk,
                                   shift_start_time:
+                                    day === getJakartaDayKey(syncedIsoNow) ||
                                     day === "Senin"
                                       ? shiftCodeToStartTime(nextCode)
                                       : empForm.shift_start_time,
