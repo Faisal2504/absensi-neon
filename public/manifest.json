@@ -3,21 +3,22 @@
   "short_name": "Fast Absensi Pro",
   "description": "Aplikasi absensi online dan offline dengan QR Code, GPS & selfie",
   "start_url": "/",
+  "scope": "/",
   "display": "standalone",
   "background_color": "#0B1220",
   "theme_color": "#0B1220",
   "icons": [
     {
-      "src": "/fast-absensi-pro-mfr.png?v=3",
+      "src": "/Logo%20Absensi%20Cepat%20Emas%20Pink.png?v=6",
       "sizes": "192x192",
       "type": "image/png",
       "purpose": "any"
     },
     {
-      "src": "/fast-absensi-pro-mfr.png?v=3",
+      "src": "/Logo%20Absensi%20Cepat%20Emas%20Pink.png?v=6",
       "sizes": "512x512",
       "type": "image/png",
-      "purpose": "any maskable"
+      "purpose": "maskable"
     }
   ]
 }
