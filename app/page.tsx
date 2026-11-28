@@ -4,7 +4,7 @@ import React, { useState, useEffect, useRef, useMemo, useCallback } from "react"
 
 type RoleType = "ADMIN" | "MANAGER" | "STAFF";
 type ServerMode = "ADMIN" | "MANAGER" | "KARYAWAN";
-type ShiftCode = "P" | "S" | "M" | "OFF";
+type ShiftCode = "P" | "S" | "M" | "P/M" | "OFF";
 type DayKey = "Senin" | "Selasa" | "Rabu" | "Kamis" | "Jumat" | "Sabtu" | "Minggu";
 
 type WeeklyScheduleMap = Record<DayKey, ShiftCode>;
@@ -124,7 +124,18 @@ const DAYS_OF_WEEK: DayKey[] = [
 
 const SHIFT_PRESETS: Record<
   ShiftCode,
-  { code: ShiftCode; name: string; start: string; end: string; rangeLabel: string }
+  {
+    code: ShiftCode;
+    name: string;
+    start: string;
+    end: string;
+    rangeLabel: string;
+    badgeClass: string;
+    selectClass: string;
+    posterBg: string;
+    posterText: string;
+    shortLabel: string;
+  }
 > = {
   P: {
     code: "P",
@@ -132,6 +143,11 @@ const SHIFT_PRESETS: Record<
     start: "07.00",
     end: "15.00",
     rangeLabel: "07.00 - 15.00",
+    badgeClass: "bg-emerald-100 text-emerald-800 border border-emerald-300",
+    selectClass: "bg-emerald-50 text-emerald-800 border-emerald-400",
+    posterBg: "#DCFCE7",
+    posterText: "#15803D",
+    shortLabel: "P (07.00)",
   },
   S: {
     code: "S",
@@ -139,6 +155,11 @@ const SHIFT_PRESETS: Record<
     start: "15.00",
     end: "23.00",
     rangeLabel: "15.00 - 23.00",
+    badgeClass: "bg-amber-100 text-amber-800 border border-amber-300",
+    selectClass: "bg-amber-50 text-amber-800 border-amber-400",
+    posterBg: "#FEF3C7",
+    posterText: "#B45309",
+    shortLabel: "S (15.00)",
   },
   M: {
     code: "M",
@@ -146,6 +167,23 @@ const SHIFT_PRESETS: Record<
     start: "23.00",
     end: "07.00",
     rangeLabel: "23.00 - 07.00",
+    badgeClass: "bg-blue-100 text-blue-800 border border-blue-300",
+    selectClass: "bg-blue-50 text-blue-800 border-blue-400",
+    posterBg: "#DBEAFE",
+    posterText: "#1D4ED8",
+    shortLabel: "M (23.00)",
+  },
+  "P/M": {
+    code: "P/M",
+    name: "Pagi & Malam",
+    start: "07.00",
+    end: "07.00",
+    rangeLabel: "Pagi 07.00-15.00 & Malam 23.00-07.00",
+    badgeClass: "bg-purple-100 text-purple-800 border border-purple-300",
+    selectClass: "bg-purple-50 text-purple-800 border-purple-400",
+    posterBg: "#F3E8FF",
+    posterText: "#7E22CE",
+    shortLabel: "P/M",
   },
   OFF: {
     code: "OFF",
@@ -153,6 +191,11 @@ const SHIFT_PRESETS: Record<
     start: "OFF",
     end: "OFF",
     rangeLabel: "LIBUR (OFF)",
+    badgeClass: "bg-rose-100 text-rose-700 border border-rose-300 font-extrabold",
+    selectClass: "bg-rose-50 text-rose-700 border-rose-400 font-extrabold",
+    posterBg: "#FEE2E2",
+    posterText: "#DC2626",
+    shortLabel: "OFF",
   },
 };
 
@@ -160,6 +203,11 @@ const SHIFT_OPTIONS = [
   { label: "( P ) Pagi • 07.00 - 15.00", time: "07.00", code: "P" as ShiftCode },
   { label: "( S ) Siang • 15.00 - 23.00", time: "15.00", code: "S" as ShiftCode },
   { label: "( M ) Malam • 23.00 - 07.00", time: "23.00", code: "M" as ShiftCode },
+  {
+    label: "( P/M ) Pagi 07.00-15.00 & Malam 23.00-07.00",
+    time: "07.00",
+    code: "P/M" as ShiftCode,
+  },
   { label: "( OFF ) Libur", time: "OFF", code: "OFF" as ShiftCode },
 ];
 
@@ -175,6 +223,10 @@ const STAFF_EMP_CODE_KEY = "absensi_v12_staff_emp_code";
 const STAFF_SESSION_KEY = "absensi_v12_staff_logged_in";
 const DEVICE_REG_KEY = "absensi_v12_device_registry";
 const AUTH_SERVER_KEY = "absensi_v12_auth_server";
+
+function isValidShiftCode(val: string): val is ShiftCode {
+  return val === "P" || val === "S" || val === "M" || val === "P/M" || val === "OFF";
+}
 
 function buildPhotoAuthSeal(params: {
   uuid: string;
@@ -339,8 +391,8 @@ function sanitizeWeeklySchedule(
   const obj = raw as Record<string, unknown>;
   DAYS_OF_WEEK.forEach((day) => {
     const val = String(obj[day] || "").trim().toUpperCase();
-    if (val === "P" || val === "S" || val === "M" || val === "OFF") {
-      base[day] = val as ShiftCode;
+    if (isValidShiftCode(val)) {
+      base[day] = val;
     }
   });
   return base;
@@ -349,8 +401,19 @@ function sanitizeWeeklySchedule(
 function shiftTimeToCode(raw?: string | null): ShiftCode {
   const s = String(raw || "").trim().toUpperCase();
   if (s === "OFF" || s.includes("LIBUR")) return "OFF";
-  if (s === "S" || s.includes("15.00") || s.includes("15:00") || s.includes("SIANG")) return "S";
-  if (s === "M" || s.includes("23.00") || s.includes("23:00") || s.includes("MALAM")) return "M";
+  if (
+    s === "P/M" ||
+    s.includes("P/M") ||
+    (s.includes("PAGI") && s.includes("MALAM"))
+  ) {
+    return "P/M";
+  }
+  if (s === "S" || s.includes("15.00") || s.includes("15:00") || s.includes("SIANG")) {
+    return "S";
+  }
+  if (s === "M" || s.includes("23.00") || s.includes("23:00") || s.includes("MALAM")) {
+    return "M";
+  }
   return "P";
 }
 
@@ -377,6 +440,9 @@ function normalizeShiftTime(raw?: string | null): string {
     lower.includes("fleks")
   ) {
     return "OFF";
+  }
+  if (upper === "P/M" || (lower.includes("pagi") && lower.includes("malam"))) {
+    return "07.00";
   }
   if (s.includes("15:00") || s.includes("15.00") || lower.includes("siang") || upper === "S") {
     return "15.00";
@@ -793,6 +859,12 @@ function detectShiftCodeFromText(text: string): ShiftCode {
     return "OFF";
   }
   if (
+    /\bP\/M\b/.test(upper) ||
+    (lower.includes("pagi") && lower.includes("malam"))
+  ) {
+    return "P/M";
+  }
+  if (
     /\bM\b/.test(upper) ||
     lower.includes("malam") ||
     text.includes("23.00") ||
@@ -831,13 +903,12 @@ function parseScheduleLines(lines: string[]): ParsedScheduleItem[] {
       /\b([A-Z]{2,6}-SCRTY-MPI\.\d{8}\.\d{4}|[A-Z]{2,6}[-_]\d{1,6})\b/i
     );
 
-    const dayTokens = line.match(/\b(P|S|M|OFF)\b/gi);
+    const dayTokens = line.match(/\b(P\/M|OFF|P|S|M)\b/gi);
     const weekly: Partial<WeeklyScheduleMap> = {};
     if (dayTokens && dayTokens.length >= 7) {
       DAYS_OF_WEEK.forEach((d, idx) => {
         const tok = (dayTokens[idx] || "P").toUpperCase();
-        weekly[d] =
-          tok === "OFF" ? "OFF" : tok === "S" ? "S" : tok === "M" ? "M" : "P";
+        weekly[d] = isValidShiftCode(tok) ? tok : "P";
       });
     }
 
@@ -870,7 +941,7 @@ function parseScheduleLines(lines: string[]): ParsedScheduleItem[] {
         /\b([A-Z]{2,6}-SCRTY-MPI\.\d{8}\.\d{4}|[A-Z]{2,6}[-_]\d{1,6})\b/gi,
         " "
       )
-      .replace(/\b(OFF|P|S|M)\b/g, " ")
+      .replace(/\b(P\/M|OFF|P|S|M)\b/g, " ")
       .replace(/shift\s*(pagi|siang|malam|libur|off)/gi, " ")
       .replace(/\b(pagi|siang|malam|libur)\b/gi, " ")
       .replace(/\b([012]?\d[:.]\d{2})\b/g, " ")
@@ -901,7 +972,7 @@ function renderDepartureBoardPosterDataUrl(
   parsedItems: ParsedScheduleItem[]
 ): string {
   if (typeof document === "undefined") return "";
-  const width = 920;
+  const width = 960;
   const rowH = 44;
   const headerH = 142;
   const footerH = 46;
@@ -942,9 +1013,9 @@ function renderDepartureBoardPosterDataUrl(
   ctx.fillStyle = "#F1F5F9";
   ctx.fillRect(0, 86, width, 24);
   ctx.fillStyle = "#0F172A";
-  ctx.font = "bold 11px sans-serif";
+  ctx.font = "bold 10.5px sans-serif";
   ctx.fillText(
-    "KETERANGAN SHIFT:   [ P ] Pagi: 07.00 - 15.00 WIB   |   [ S ] Siang: 15.00 - 23.00 WIB   |   [ M ] Malam: 23.00 - 07.00 WIB   |   [ OFF ] Libur",
+    "SHIFT: [ P ] Pagi 07.00-15.00 • [ S ] Siang 15.00-23.00 • [ M ] Malam 23.00-07.00 • [ P/M ] Pagi & Malam • [ OFF ] Libur",
     22,
     102
   );
@@ -994,37 +1065,21 @@ function renderDepartureBoardPosterDataUrl(
 
     DAYS_OF_WEEK.forEach((day, dIdx) => {
       const code: ShiftCode = wk[day] || "P";
+      const preset = SHIFT_PRESETS[code] || SHIFT_PRESETS.P;
       const cellX = colNameW + dIdx * dayColW;
       ctx.strokeRect(cellX, y, dayColW, rowH);
 
-      const badgeX = cellX + 12;
+      const badgeX = cellX + 10;
       const badgeY = y + 8;
-      const badgeW = dayColW - 24;
+      const badgeW = dayColW - 20;
       const badgeH = rowH - 16;
 
-      if (code === "OFF") {
-        ctx.fillStyle = "#FEE2E2";
-      } else if (code === "P") {
-        ctx.fillStyle = "#DBEAFE";
-      } else if (code === "S") {
-        ctx.fillStyle = "#FEF3C7";
-      } else {
-        ctx.fillStyle = "#E0E7FF";
-      }
+      ctx.fillStyle = preset.posterBg;
       ctx.fillRect(badgeX, badgeY, badgeW, badgeH);
 
-      ctx.fillStyle =
-        code === "OFF"
-          ? "#B91C1C"
-          : code === "P"
-          ? "#1D4ED8"
-          : code === "S"
-          ? "#B45309"
-          : "#3730A3";
-      ctx.font = "900 12px sans-serif";
-      const label =
-        code === "OFF" ? "OFF" : `${code} (${SHIFT_PRESETS[code].start})`;
-      ctx.fillText(label, badgeX + 8, badgeY + 18);
+      ctx.fillStyle = preset.posterText;
+      ctx.font = "900 11.5px sans-serif";
+      ctx.fillText(preset.shortLabel, badgeX + 8, badgeY + 18);
     });
   });
 
@@ -1809,11 +1864,17 @@ export default function AbsensiMultiServerPage() {
       }
     };
     const onStorageSync = (ev: StorageEvent) => {
-      if (ev.key === SCHEDULE_POSTER_KEY && ev.newValue) {
-        try {
-          setSchedulePoster(JSON.parse(ev.newValue));
-        } catch {
-          // Abaikan
+      if (ev.key === SCHEDULE_POSTER_KEY) {
+        if (ev.newValue) {
+          try {
+            setSchedulePoster(JSON.parse(ev.newValue));
+          } catch {
+            // Abaikan
+          }
+        } else {
+          setSchedulePoster(null);
+          setSchedulePreview([]);
+          setScheduleFileName("Tidak ada file yang dipilih");
         }
       }
       if (ev.key === WEEKLY_SCHED_KEY) {
@@ -2752,6 +2813,45 @@ export default function AbsensiMultiServerPage() {
     } else {
       setSelectedReportUuids(filteredEntries.map((e) => e.client_uuid));
     }
+  };
+
+  const handleDeleteSchedulePdf = async () => {
+    if (!isAdminServer) {
+      notify(
+        "err",
+        "Akses ditolak: hanya Admin yang dapat menghapus file input jadwal PDF."
+      );
+      return;
+    }
+    setSchedulePoster(null);
+    setSchedulePreview([]);
+    setScheduleFileName("Tidak ada file yang dipilih");
+    setScheduleImageZoomOpen(false);
+    localStorage.removeItem(SCHEDULE_POSTER_KEY);
+    if (scheduleInputRef.current) {
+      scheduleInputRef.current.value = "";
+    }
+
+    if (navigator.onLine) {
+      try {
+        const res = await fetch("/api/absen", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            action: "DELETE_SCHEDULE_POSTER",
+          }),
+          cache: "no-store",
+        });
+        if (res.ok) {
+          const data = await res.json();
+          applyServerState(data);
+        }
+      } catch {
+        // Tetap terhapus lokal
+      }
+    }
+
+    notify("ok", "File input data PDF jadwal mingguan berhasil dihapus.");
   };
 
   const handleScheduleFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -3925,7 +4025,7 @@ export default function AbsensiMultiServerPage() {
           <div className="flex items-center justify-between gap-2">
             <div>
               <h2 className="text-xs font-extrabold text-slate-800">
-                Jadwal Mingguan &amp; Keberangkatan Karyawan
+                Jadwal Shift Keberangkatan (Senin – Minggu)
               </h2>
               <p className="text-[10px] text-slate-500">
                 {isKaryawanMode
@@ -3938,18 +4038,42 @@ export default function AbsensiMultiServerPage() {
             </span>
           </div>
 
+          <div className="p-2 rounded-lg bg-slate-50 border border-slate-200 text-[9.5px] leading-relaxed text-slate-700">
+            <span className="px-1.5 py-0.5 rounded font-extrabold mr-1 bg-emerald-100 text-emerald-800">
+              P
+            </span>
+            Pagi 07.00–15.00 •{" "}
+            <span className="px-1.5 py-0.5 rounded font-extrabold mx-1 bg-amber-100 text-amber-800">
+              S
+            </span>
+            Siang 15.00–23.00 •{" "}
+            <span className="px-1.5 py-0.5 rounded font-extrabold mx-1 bg-blue-100 text-blue-800">
+              M
+            </span>
+            Malam 23.00–07.00 •{" "}
+            <span className="px-1.5 py-0.5 rounded font-extrabold mx-1 bg-purple-100 text-purple-800">
+              P/M
+            </span>
+            Pagi 07.00–15.00 &amp; Malam 23.00–07.00 •{" "}
+            <span className="px-1.5 py-0.5 rounded font-extrabold ml-1 bg-rose-100 text-rose-700">
+              OFF
+            </span>{" "}
+            Libur
+          </div>
+
           <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200 space-y-1.5">
             <div className="flex items-center justify-between text-[10px]">
               <span className="font-extrabold text-slate-800">
                 {activeUser?.full_name} ({activeUser?.emp_code})
               </span>
               <span className="text-slate-500 font-semibold">
-                P: 07.00 • S: 15.00 • M: 23.00 • OFF: Libur
+                Senin – Minggu
               </span>
             </div>
             <div className="grid grid-cols-7 gap-1 text-center">
               {DAYS_OF_WEEK.map((day) => {
                 const code = activeUserWeeklySchedule[day] || "P";
+                const preset = SHIFT_PRESETS[code] || SHIFT_PRESETS.P;
                 const isTodayCol = getJakartaDayKey(syncedIsoNow) === day;
                 return (
                   <div
@@ -3964,20 +4088,18 @@ export default function AbsensiMultiServerPage() {
                       {day.slice(0, 3)}
                     </div>
                     <div
-                      className={`mt-0.5 rounded py-0.5 text-[10px] font-black ${
-                        code === "OFF"
-                          ? "bg-rose-100 text-rose-700"
-                          : code === "P"
-                          ? "bg-blue-100 text-blue-800"
-                          : code === "S"
-                          ? "bg-amber-100 text-amber-800"
-                          : "bg-indigo-100 text-indigo-800"
-                      }`}
+                      className={`mt-0.5 rounded py-0.5 text-[10px] font-black ${preset.badgeClass}`}
                     >
                       {code}
                     </div>
-                    <div className="text-[8px] font-mono text-slate-500 mt-0.5">
-                      {code === "OFF" ? "LIBUR" : SHIFT_PRESETS[code].start}
+                    <div
+                      className={`text-[8px] font-mono mt-0.5 ${
+                        code === "OFF"
+                          ? "text-rose-600 font-extrabold"
+                          : "text-slate-500"
+                      }`}
+                    >
+                      {code === "OFF" ? "OFF" : preset.start}
                     </div>
                   </div>
                 );
@@ -4011,18 +4133,11 @@ export default function AbsensiMultiServerPage() {
                         </td>
                         {DAYS_OF_WEEK.map((d) => {
                           const c = wk[d] || "P";
+                          const p = SHIFT_PRESETS[c] || SHIFT_PRESETS.P;
                           return (
                             <td key={d} className="p-1 text-center">
                               <span
-                                className={`inline-block px-1.5 py-0.5 rounded font-extrabold text-[9px] ${
-                                  c === "OFF"
-                                    ? "bg-rose-100 text-rose-700"
-                                    : c === "P"
-                                    ? "bg-blue-100 text-blue-800"
-                                    : c === "S"
-                                    ? "bg-amber-100 text-amber-800"
-                                    : "bg-indigo-100 text-indigo-800"
-                                }`}
+                                className={`inline-block px-1.5 py-0.5 rounded font-extrabold text-[9px] ${p.badgeClass}`}
                               >
                                 {c}
                               </span>
@@ -4431,8 +4546,12 @@ export default function AbsensiMultiServerPage() {
             {activeUserTodayShift.code === "OFF" ? (
               <span className="font-extrabold text-rose-600">OFF (Libur)</span>
             ) : (
-              <span className="font-bold text-slate-800">
-                Shift {activeUserTodayShift.code} ({activeUserTodayShift.rangeLabel})
+              <span
+                className={`inline-block px-1.5 py-0.5 rounded text-[10px] font-extrabold ${
+                  SHIFT_PRESETS[activeUserTodayShift.code]?.badgeClass || ""
+                }`}
+              >
+                {activeUserTodayShift.code} ({activeUserTodayShift.rangeLabel})
               </span>
             )}{" "}
             • Toleransi telat 5 menit
@@ -4676,7 +4795,7 @@ export default function AbsensiMultiServerPage() {
                     otomatis muncul di board dasbor Admin maupun setiap dasbor
                     Karyawan.
                   </p>
-                  <div className="flex items-center gap-2 rounded-lg border border-slate-200 p-1.5 bg-slate-50">
+                  <div className="flex items-center gap-1.5 rounded-lg border border-slate-200 p-1.5 bg-slate-50">
                     <button
                       type="button"
                       onClick={() => scheduleInputRef.current?.click()}
@@ -4684,9 +4803,18 @@ export default function AbsensiMultiServerPage() {
                     >
                       Pilih File PDF
                     </button>
-                    <span className="text-[11px] text-slate-500 truncate">
+                    <span className="flex-1 text-[11px] text-slate-500 truncate">
                       {scheduleFileName}
                     </span>
+                    {(schedulePoster || schedulePreview.length > 0) && (
+                      <button
+                        type="button"
+                        onClick={() => void handleDeleteSchedulePdf()}
+                        className="px-2 py-1 rounded bg-rose-600 hover:bg-rose-700 text-white text-[10px] font-bold shrink-0"
+                      >
+                        Hapus File PDF
+                      </button>
+                    )}
                     <input
                       ref={scheduleInputRef}
                       type="file"
@@ -4704,25 +4832,24 @@ export default function AbsensiMultiServerPage() {
               )}
               {schedulePreview.length > 0 && (
                 <div className="space-y-1 pt-1">
-                  {schedulePreview.map((r, idx) => (
-                    <div
-                      key={`${r.emp_code}-${idx}`}
-                      className="text-[10px] bg-emerald-50 text-emerald-900 px-2.5 py-1 rounded flex justify-between font-semibold"
-                    >
-                      <span>
-                        {r.full_name} ({r.emp_code})
-                      </span>
-                      <span
-                        className={
-                          r.shift_code === "OFF"
-                            ? "text-rose-600 font-extrabold"
-                            : ""
-                        }
+                  {schedulePreview.map((r, idx) => {
+                    const p = SHIFT_PRESETS[r.shift_code] || SHIFT_PRESETS.P;
+                    return (
+                      <div
+                        key={`${r.emp_code}-${idx}`}
+                        className="text-[10px] bg-emerald-50 text-emerald-900 px-2.5 py-1 rounded flex justify-between items-center font-semibold"
                       >
-                        {r.shift_label}
-                      </span>
-                    </div>
-                  ))}
+                        <span>
+                          {r.full_name} ({r.emp_code})
+                        </span>
+                        <span
+                          className={`px-1.5 py-0.5 rounded text-[9px] font-extrabold ${p.badgeClass}`}
+                        >
+                          {r.shift_label}
+                        </span>
+                      </div>
+                    );
+                  })}
                 </div>
               )}
             </section>
@@ -4917,7 +5044,7 @@ export default function AbsensiMultiServerPage() {
                       </th>
                       <th className="p-1.5">Tanggal</th>
                       <th className="p-1.5">Nama</th>
-                      <th className="p-1.5">Device HP</th>
+                      <th className="p-1.5">Shift</th>
                       <th className="p-1.5">Jenis</th>
                       <th className="p-1.5">Scan</th>
                       <th className="p-1.5">Telat</th>
@@ -4947,14 +5074,12 @@ export default function AbsensiMultiServerPage() {
                           emp,
                           item.punched_at
                         );
+                        const shiftPreset =
+                          SHIFT_PRESETS[shift.code] || SHIFT_PRESETS.P;
                         const lateDetail =
                           item.entry_type === "CLOCK_IN"
                             ? calcLateDetail(item.punched_at, shift.startTime)
                             : { lateMinutes: 0, isLate: false, statusNote: "" };
-                        const devLabel =
-                          item.device_info ||
-                          emp?.last_device?.summary ||
-                          "HP";
                         return (
                           <tr
                             key={`${item.client_uuid}-${idx}`}
@@ -4977,8 +5102,12 @@ export default function AbsensiMultiServerPage() {
                             <td className="p-1.5 font-semibold whitespace-nowrap">
                               {item.full_name || emp?.full_name || "Karyawan"}
                             </td>
-                            <td className="p-1.5 max-w-[120px] truncate text-[9px] text-slate-600">
-                              {devLabel}
+                            <td className="p-1.5 whitespace-nowrap">
+                              <span
+                                className={`inline-block px-1.5 py-0.5 rounded font-extrabold text-[9px] ${shiftPreset.badgeClass}`}
+                              >
+                                {shift.code}
+                              </span>
                             </td>
                             <td className="p-1.5 whitespace-nowrap">
                               {item.entry_type === "CLOCK_IN"
@@ -5168,7 +5297,7 @@ export default function AbsensiMultiServerPage() {
                     className="rounded-lg border border-slate-300 px-2 py-1.5 text-xs bg-white"
                   >
                     {SHIFT_OPTIONS.map((opt) => (
-                      <option key={opt.time} value={opt.time}>
+                      <option key={opt.label} value={opt.time}>
                         {opt.label}
                       </option>
                     ))}
@@ -5176,13 +5305,20 @@ export default function AbsensiMultiServerPage() {
                 </div>
 
                 <div className="p-2 rounded-xl bg-slate-50 border border-slate-200 space-y-1.5">
-                  <div className="text-[10px] font-extrabold text-slate-700">
-                    Jadwal Keberangkatan Senin – Minggu (P: 07.00-15.00 • S: 15.00-23.00 • M: 23.00-07.00 •{" "}
-                    <span className="text-rose-600">OFF: Libur</span>)
+                  <div className="text-[9.5px] font-extrabold text-slate-700 leading-relaxed">
+                    Jadwal Senin–Minggu:{" "}
+                    <span className="text-emerald-700">P (07.00–15.00)</span> •{" "}
+                    <span className="text-amber-700">S (15.00–23.00)</span> •{" "}
+                    <span className="text-blue-700">M (23.00–07.00)</span> •{" "}
+                    <span className="text-purple-700">
+                      P/M (07–15 &amp; 23–07)
+                    </span>{" "}
+                    • <span className="text-rose-600">OFF (Libur)</span>
                   </div>
                   <div className="grid grid-cols-7 gap-1 text-center">
                     {DAYS_OF_WEEK.map((day) => {
                       const code = empForm.weekly_schedule[day] || "P";
+                      const preset = SHIFT_PRESETS[code] || SHIFT_PRESETS.P;
                       return (
                         <div key={day} className="space-y-0.5">
                           <div className="text-[9px] font-bold text-slate-600">
@@ -5200,18 +5336,13 @@ export default function AbsensiMultiServerPage() {
                                 },
                               }));
                             }}
-                            className={`w-full rounded border px-0.5 py-1 text-[10px] font-extrabold text-center bg-white ${
-                              code === "OFF"
-                                ? "text-rose-600 border-rose-400 bg-rose-50"
-                                : "text-slate-800 border-slate-300"
-                            }`}
+                            className={`w-full rounded border px-0.5 py-1 text-[9.5px] font-extrabold text-center ${preset.selectClass}`}
                           >
                             <option value="P">P</option>
                             <option value="S">S</option>
                             <option value="M">M</option>
-                            <option value="OFF" className="text-rose-600 font-bold">
-                              OFF
-                            </option>
+                            <option value="P/M">P/M</option>
+                            <option value="OFF">OFF</option>
                           </select>
                         </div>
                       );
@@ -5280,14 +5411,11 @@ export default function AbsensiMultiServerPage() {
                       <div className="flex flex-wrap gap-1 text-[9px]">
                         {DAYS_OF_WEEK.map((d) => {
                           const c = wk[d] || "P";
+                          const p = SHIFT_PRESETS[c] || SHIFT_PRESETS.P;
                           return (
                             <span
                               key={d}
-                              className={`px-1.5 py-0.5 rounded font-bold ${
-                                c === "OFF"
-                                  ? "bg-rose-100 text-rose-600 font-extrabold"
-                                  : "bg-slate-200/80 text-slate-700"
-                              }`}
+                              className={`px-1.5 py-0.5 rounded font-bold ${p.badgeClass}`}
                             >
                               {d.slice(0, 3)}: {c}
                             </span>
