@@ -1,609 +1,610 @@
 import { NextRequest, NextResponse } from "next/server";
+import { neon } from "@neondatabase/serverless";
 
-export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+export const revalidate = 0;
 
-export interface EmployeeRecord {
-  id: number;
-  emp_code: string;
-  full_name: string;
-  role: "ADMIN" | "MANAGER" | "STAFF";
-  department: string;
-  pin_code: string;
-  shift_start_time: string;
-}
+type ShiftCode = "P" | "S" | "M" | "OFF";
+type DayKey = "Senin" | "Selasa" | "Rabu" | "Kamis" | "Jumat" | "Sabtu" | "Minggu";
+type WeeklyScheduleMap = Record<DayKey, ShiftCode>;
 
-export interface LocationRecord {
-  id: number;
-  name: string;
-  latitude: number;
-  longitude: number;
-  radius_meters: number;
-}
-
-export interface PunchRecord {
-  id?: number;
-  client_uuid: string;
-  employee_id: number;
-  emp_code?: string | null;
-  full_name?: string | null;
-  entry_type: "CLOCK_IN" | "CLOCK_OUT";
-  punched_at: string;
-  is_offline_sync?: boolean;
-  qr_code?: string | null;
-  mode?: string;
-  notes?: string;
-  latitude?: number | null;
-  longitude?: number | null;
-  distance_meters?: number | null;
-  is_within_geofence?: boolean;
-  selfie_data?: string | null;
-  face_detected?: boolean;
-}
-
-const DEFAULT_LAT = -6.9148609;
-const DEFAULT_LNG = 109.744683;
-const DEFAULT_RADIUS = 2000;
-
-const INITIAL_EMPLOYEES: EmployeeRecord[] = [
-  {
-    id: 1,
-    emp_code: "ADM-001",
-    full_name: "Admin Operasional",
-    role: "ADMIN",
-    department: "Administrator",
-    pin_code: "0000",
-    shift_start_time: "07.00",
-  },
-  {
-    id: 2,
-    emp_code: "MGR-001",
-    full_name: "Manager Operasional",
-    role: "MANAGER",
-    department: "Manajemen",
-    pin_code: "2026",
-    shift_start_time: "07.00",
-  },
-  {
-    id: 3,
-    emp_code: "ABZ-0001",
-    full_name: "Amelia",
-    role: "STAFF",
-    department: "Operasional",
-    pin_code: "1111",
-    shift_start_time: "07.00",
-  },
+const DAYS_OF_WEEK: DayKey[] = [
+  "Senin",
+  "Selasa",
+  "Rabu",
+  "Kamis",
+  "Jumat",
+  "Sabtu",
+  "Minggu",
 ];
 
-const INITIAL_LOCATIONS: LocationRecord[] = [
-  {
-    id: 1,
-    name: "Kantor Utama",
-    latitude: DEFAULT_LAT,
-    longitude: DEFAULT_LNG,
-    radius_meters: DEFAULT_RADIUS,
-  },
-];
+function defaultWeekly(code: ShiftCode = "P"): WeeklyScheduleMap {
+  return {
+    Senin: code,
+    Selasa: code,
+    Rabu: code,
+    Kamis: code,
+    Jumat: code,
+    Sabtu: code,
+    Minggu: "OFF",
+  };
+}
 
-function findDatabaseUrl(): { envKey: string; url: string } | null {
-  const keys = [
-    "DATABASE_URL",
-    "DATABASE_URL_UNPOOLED",
-    "POSTGRES_URL",
-    "POSTGRES_PRISMA_URL",
-    "POSTGRES_URL_NON_POOLING",
-    "NEON_DATABASE_URL",
-  ];
-  for (const k of keys) {
-    const val = (process.env[k] || "").trim();
-    if (val) {
-      return {
-        envKey: k,
-        url: val.replace(/^postgres:\/\//i, "postgresql://"),
-      };
+function sanitizeWeekly(raw: unknown, fallback: ShiftCode = "P"): WeeklyScheduleMap {
+  const base = defaultWeekly(fallback);
+  if (!raw || typeof raw !== "object") return base;
+  const obj = raw as Record<string, unknown>;
+  for (const d of DAYS_OF_WEEK) {
+    const val = String(obj[d] || "").trim().toUpperCase();
+    if (val === "P" || val === "S" || val === "M" || val === "OFF") {
+      base[d] = val as ShiftCode;
     }
   }
-  return null;
+  return base;
 }
 
-function getNeonConfig(): {
-  envKey: string;
-  endpoint: string;
-  conn: string;
-} | null {
-  const found = findDatabaseUrl();
-  if (!found) return null;
-  try {
-    const u = new URL(found.url);
-    return {
-      envKey: found.envKey,
-      endpoint: `https://${u.hostname}/sql`,
-      conn: found.url,
-    };
-  } catch {
-    return null;
-  }
+function getSql() {
+  const url =
+    process.env.DATABASE_URL ||
+    process.env.POSTGRES_URL ||
+    process.env.NEON_DATABASE_URL ||
+    "";
+  if (!url) return null;
+  return neon(url);
 }
 
-async function runNeonSql(
-  query: string,
-  params: unknown[] = []
-): Promise<{ ok: boolean; rows: Record<string, unknown>[]; error?: string }> {
-  const cfg = getNeonConfig();
-  if (!cfg) {
-    return {
-      ok: false,
-      rows: [],
-      error: "DATABASE_URL tidak ditemukan di Environment Variables Vercel",
-    };
-  }
+let schemaReady = false;
 
-  try {
-    const res = await fetch(cfg.endpoint, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Neon-Connection-String": cfg.conn,
-      },
-      body: JSON.stringify({ query, params }),
-      cache: "no-store",
-    });
+async function ensureSchema(sql: ReturnType<typeof neon>) {
+  if (schemaReady) return;
 
-    const text = await res.text();
-    if (!res.ok) {
-      return {
-        ok: false,
-        rows: [],
-        error: `Neon HTTP ${res.status} (${cfg.envKey}): ${text.slice(0, 200)}`,
-      };
-    }
-
-    const data = JSON.parse(text);
-    const rows = Array.isArray(data?.rows) ? data.rows : [];
-    return { ok: true, rows };
-  } catch (err) {
-    return {
-      ok: false,
-      rows: [],
-      error: err instanceof Error ? err.message : "Gagal terhubung ke Neon",
-    };
-  }
-}
-
-async function ensureNeonTables(): Promise<{ ok: boolean; error?: string }> {
-  const t1 = await runNeonSql(`
+  await sql`
     CREATE TABLE IF NOT EXISTS employees (
       id SERIAL PRIMARY KEY,
-      emp_code VARCHAR(32) UNIQUE NOT NULL,
-      full_name VARCHAR(120) NOT NULL,
-      role VARCHAR(20) NOT NULL DEFAULT 'STAFF',
-      department VARCHAR(80) NOT NULL DEFAULT 'Operasional',
-      pin_code VARCHAR(20) NOT NULL DEFAULT '1111',
-      shift_start_time VARCHAR(16) NOT NULL DEFAULT '07.00'
-    );
-  `);
-  if (!t1.ok) return { ok: false, error: t1.error };
+      emp_code TEXT UNIQUE NOT NULL,
+      full_name TEXT NOT NULL,
+      role TEXT NOT NULL DEFAULT 'STAFF',
+      department TEXT NOT NULL DEFAULT 'Security Dormitory Batang',
+      pin_code TEXT NOT NULL DEFAULT '1001',
+      shift_start_time TEXT NOT NULL DEFAULT '07.00',
+      weekly_schedule JSONB,
+      last_device JSONB,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `;
 
-  const t2 = await runNeonSql(`
+  await sql`ALTER TABLE employees ADD COLUMN IF NOT EXISTS pin_code TEXT NOT NULL DEFAULT '1001'`;
+  await sql`ALTER TABLE employees ADD COLUMN IF NOT EXISTS shift_start_time TEXT NOT NULL DEFAULT '07.00'`;
+  await sql`ALTER TABLE employees ADD COLUMN IF NOT EXISTS weekly_schedule JSONB`;
+  await sql`ALTER TABLE employees ADD COLUMN IF NOT EXISTS last_device JSONB`;
+
+  await sql`
     CREATE TABLE IF NOT EXISTS locations (
       id SERIAL PRIMARY KEY,
-      name VARCHAR(120) NOT NULL DEFAULT 'Kantor Utama',
-      latitude DOUBLE PRECISION NOT NULL,
-      longitude DOUBLE PRECISION NOT NULL,
+      name TEXT NOT NULL DEFAULT 'Kantor Utama',
+      latitude DOUBLE PRECISION NOT NULL DEFAULT -6.9148609,
+      longitude DOUBLE PRECISION NOT NULL DEFAULT 109.744683,
       radius_meters INTEGER NOT NULL DEFAULT 2000
-    );
-  `);
-  if (!t2.ok) return { ok: false, error: t2.error };
+    )
+  `;
 
-  const t3 = await runNeonSql(`
+  await sql`
     CREATE TABLE IF NOT EXISTS time_entries (
       id SERIAL PRIMARY KEY,
-      client_uuid VARCHAR(100) UNIQUE NOT NULL,
+      client_uuid TEXT UNIQUE NOT NULL,
       employee_id INTEGER NOT NULL,
-      emp_code VARCHAR(32),
-      full_name VARCHAR(120),
-      entry_type VARCHAR(20) NOT NULL DEFAULT 'CLOCK_IN',
-      punched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      is_offline_sync BOOLEAN NOT NULL DEFAULT FALSE,
-      qr_code VARCHAR(100),
-      mode VARCHAR(40) DEFAULT 'BARCODE + WAJAH',
-      notes TEXT DEFAULT '',
+      entry_type TEXT NOT NULL,
+      punched_at TIMESTAMPTZ NOT NULL,
+      is_offline_sync BOOLEAN DEFAULT FALSE,
+      qr_code TEXT,
+      mode TEXT,
+      notes TEXT,
       latitude DOUBLE PRECISION,
       longitude DOUBLE PRECISION,
-      distance_meters INTEGER DEFAULT 0,
+      distance_meters INTEGER,
       is_within_geofence BOOLEAN DEFAULT TRUE,
       selfie_data TEXT,
-      face_detected BOOLEAN DEFAULT FALSE
-    );
-  `);
-  if (!t3.ok) return { ok: false, error: t3.error };
+      face_detected BOOLEAN DEFAULT FALSE,
+      device_info TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `;
 
-  const empCount = await runNeonSql(`SELECT COUNT(*)::int AS cnt FROM employees;`);
-  if (empCount.ok && Number(empCount.rows[0]?.cnt ?? 0) === 0) {
-    for (const emp of INITIAL_EMPLOYEES) {
-      await runNeonSql(
-        `
-        INSERT INTO employees (emp_code, full_name, role, department, pin_code, shift_start_time)
-        VALUES ($1, $2, $3, $4, $5, $6)
-        ON CONFLICT (emp_code) DO NOTHING;
-        `,
-        [
-          emp.emp_code,
-          emp.full_name,
-          emp.role,
-          emp.department,
-          emp.pin_code,
-          emp.shift_start_time,
-        ]
-      );
+  await sql`ALTER TABLE time_entries ADD COLUMN IF NOT EXISTS selfie_data TEXT`;
+  await sql`ALTER TABLE time_entries ADD COLUMN IF NOT EXISTS face_detected BOOLEAN DEFAULT FALSE`;
+  await sql`ALTER TABLE time_entries ADD COLUMN IF NOT EXISTS device_info TEXT`;
+  await sql`ALTER TABLE time_entries ADD COLUMN IF NOT EXISTS qr_code TEXT`;
+  await sql`ALTER TABLE time_entries ADD COLUMN IF NOT EXISTS mode TEXT`;
+  await sql`ALTER TABLE time_entries ADD COLUMN IF NOT EXISTS notes TEXT`;
+  await sql`ALTER TABLE time_entries ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION`;
+  await sql`ALTER TABLE time_entries ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION`;
+  await sql`ALTER TABLE time_entries ADD COLUMN IF NOT EXISTS distance_meters INTEGER`;
+  await sql`ALTER TABLE time_entries ADD COLUMN IF NOT EXISTS is_within_geofence BOOLEAN DEFAULT TRUE`;
+
+  await sql`
+    CREATE TABLE IF NOT EXISTS app_settings (
+      key TEXT PRIMARY KEY,
+      value JSONB NOT NULL,
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `;
+
+  const existingEmps = await sql`SELECT COUNT(*)::int AS cnt FROM employees`;
+  if ((existingEmps[0]?.cnt ?? 0) === 0) {
+    const seeds = [
+      {
+        emp_code: "ADM-001",
+        full_name: "Admin Operasional",
+        role: "ADMIN",
+        department: "Administrator",
+        pin_code: "0000",
+        shift_start_time: "07.00",
+        weekly_schedule: defaultWeekly("P"),
+      },
+      {
+        emp_code: "MGR-001",
+        full_name: "Manager Operasional",
+        role: "MANAGER",
+        department: "Manajemen",
+        pin_code: "2026",
+        shift_start_time: "07.00",
+        weekly_schedule: defaultWeekly("P"),
+      },
+      {
+        emp_code: "AP-SCRTY-MPI.22112026.0001",
+        full_name: "ANGGAR PERMADI",
+        role: "STAFF",
+        department: "Security Dormitory Batang",
+        pin_code: "1001",
+        shift_start_time: "07.00",
+        weekly_schedule: defaultWeekly("P"),
+      },
+      {
+        emp_code: "DDS-SCRTY-MPI.22112026.0002",
+        full_name: "Anggota DDS",
+        role: "STAFF",
+        department: "Security Dormitory Batang",
+        pin_code: "1002",
+        shift_start_time: "15.00",
+        weekly_schedule: defaultWeekly("S"),
+      },
+      {
+        emp_code: "JRA-SCRTY-MPI.22112026.0003",
+        full_name: "Anggota JRA",
+        role: "STAFF",
+        department: "Security Dormitory Batang",
+        pin_code: "1003",
+        shift_start_time: "23.00",
+        weekly_schedule: defaultWeekly("M"),
+      },
+      {
+        emp_code: "LJ-SCRTY-MPI.22112026.0004",
+        full_name: "Anggota LJ",
+        role: "STAFF",
+        department: "Security Dormitory Batang",
+        pin_code: "1004",
+        shift_start_time: "07.00",
+        weekly_schedule: defaultWeekly("P"),
+      },
+    ];
+
+    for (const s of seeds) {
+      await sql`
+        INSERT INTO employees (emp_code, full_name, role, department, pin_code, shift_start_time, weekly_schedule)
+        VALUES (${s.emp_code}, ${s.full_name}, ${s.role}, ${s.department}, ${s.pin_code}, ${s.shift_start_time}, ${JSON.stringify(s.weekly_schedule)}::jsonb)
+        ON CONFLICT (emp_code) DO NOTHING
+      `;
     }
   }
 
-  const locCount = await runNeonSql(`SELECT COUNT(*)::int AS cnt FROM locations;`);
-  if (locCount.ok && Number(locCount.rows[0]?.cnt ?? 0) === 0) {
-    await runNeonSql(
-      `INSERT INTO locations (name, latitude, longitude, radius_meters) VALUES ($1, $2, $3, $4);`,
-      ["Kantor Utama", DEFAULT_LAT, DEFAULT_LNG, DEFAULT_RADIUS]
-    );
+  const existingLocs = await sql`SELECT COUNT(*)::int AS cnt FROM locations`;
+  if ((existingLocs[0]?.cnt ?? 0) === 0) {
+    await sql`
+      INSERT INTO locations (id, name, latitude, longitude, radius_meters)
+      VALUES (1, 'Kantor Utama', -6.9148609, 109.744683, 2000)
+      ON CONFLICT (id) DO NOTHING
+    `;
   }
 
-  return { ok: true };
+  schemaReady = true;
 }
 
-export async function GET(req: NextRequest) {
-  const isDiag = req.nextUrl.searchParams.get("diag") === "1";
-  const cfg = getNeonConfig();
-  const schema = await ensureNeonTables();
+async function fetchFullState(sql: ReturnType<typeof neon>) {
+  const empRows = await sql`
+    SELECT id, emp_code, full_name, role, department, pin_code, shift_start_time, weekly_schedule, last_device
+    FROM employees
+    ORDER BY id ASC
+  `;
 
-  if (!schema.ok) {
-    return NextResponse.json({
-      ok: true,
-      dbConnected: false,
-      dbError: schema.error,
-      envKeyUsed: cfg?.envKey || null,
-      serverTime: new Date().toISOString(),
-      employees: INITIAL_EMPLOYEES,
-      locations: INITIAL_LOCATIONS,
-      entries: [],
-    });
+  const weeklySchedules: Record<string, WeeklyScheduleMap> = {};
+  const employees = empRows.map((row) => {
+    const code = String(row.emp_code || "").trim().toUpperCase();
+    const fallback: ShiftCode =
+      String(row.shift_start_time || "").includes("15")
+        ? "S"
+        : String(row.shift_start_time || "").includes("23")
+        ? "M"
+        : String(row.shift_start_time || "").toUpperCase() === "OFF"
+        ? "OFF"
+        : "P";
+    const parsedWeekly = sanitizeWeekly(row.weekly_schedule, fallback);
+    weeklySchedules[code] = parsedWeekly;
+    return {
+      id: Number(row.id),
+      emp_code: code,
+      full_name: String(row.full_name || ""),
+      role: String(row.role || "STAFF"),
+      department: String(row.department || "Security Dormitory Batang"),
+      pin_code: String(row.pin_code || "1001"),
+      shift_start_time: String(row.shift_start_time || "07.00"),
+      weekly_schedule: parsedWeekly,
+      last_device: row.last_device || null,
+    };
+  });
+
+  const locRows = await sql`
+    SELECT id, name, latitude, longitude, radius_meters
+    FROM locations
+    ORDER BY id ASC
+  `;
+
+  const entryRows = await sql`
+    SELECT
+      t.id,
+      t.client_uuid,
+      t.employee_id,
+      t.entry_type,
+      t.punched_at,
+      t.is_offline_sync,
+      t.qr_code,
+      t.mode,
+      t.notes,
+      t.latitude,
+      t.longitude,
+      t.distance_meters,
+      t.is_within_geofence,
+      t.selfie_data,
+      t.face_detected,
+      t.device_info,
+      e.full_name,
+      e.emp_code
+    FROM time_entries t
+    LEFT JOIN employees e ON e.id = t.employee_id
+    ORDER BY t.punched_at DESC
+    LIMIT 500
+  `;
+
+  const settingRows = await sql`
+    SELECT key, value FROM app_settings WHERE key IN ('schedule_poster', 'office_qr')
+  `;
+  let schedulePoster = null;
+  let officeQr: string | null = null;
+  for (const s of settingRows) {
+    if (s.key === "schedule_poster") schedulePoster = s.value;
+    if (s.key === "office_qr" && typeof s.value === "string") officeQr = s.value;
   }
 
-  const [empRes, locRes, entryRes] = await Promise.all([
-    runNeonSql(`SELECT * FROM employees ORDER BY id ASC;`),
-    runNeonSql(`SELECT * FROM locations ORDER BY id ASC LIMIT 1;`),
-    runNeonSql(`SELECT * FROM time_entries ORDER BY punched_at DESC LIMIT 300;`),
-  ]);
-
-  const employees: EmployeeRecord[] =
-    empRes.ok && empRes.rows.length > 0
-      ? empRes.rows.map((r, idx) => ({
-          id: Number(r.id) || idx + 1,
-          emp_code: String(r.emp_code || `EMP-${idx + 1}`),
-          full_name: String(r.full_name || "Karyawan"),
-          role:
-            String(r.role || "STAFF").toUpperCase() === "ADMIN"
-              ? "ADMIN"
-              : String(r.role || "STAFF").toUpperCase() === "MANAGER"
-              ? "MANAGER"
-              : "STAFF",
-          department: String(r.department || "Operasional"),
-          pin_code: String(r.pin_code || "1111"),
-          shift_start_time: String(r.shift_start_time || "07.00"),
-        }))
-      : INITIAL_EMPLOYEES;
-
-  const locations: LocationRecord[] =
-    locRes.ok && locRes.rows.length > 0
-      ? [
-          {
-            id: Number(locRes.rows[0].id) || 1,
-            name: String(locRes.rows[0].name || "Kantor Utama"),
-            latitude: Number(locRes.rows[0].latitude) || DEFAULT_LAT,
-            longitude: Number(locRes.rows[0].longitude) || DEFAULT_LNG,
-            radius_meters: Math.max(
-              10,
-              Number(locRes.rows[0].radius_meters) || DEFAULT_RADIUS
-            ),
-          },
-        ]
-      : INITIAL_LOCATIONS;
-
-  const entries: PunchRecord[] = entryRes.ok
-    ? entryRes.rows.map((item, idx) => ({
-        id: Number(item.id) || idx + 1,
-        client_uuid: String(item.client_uuid || `db-${idx + 1}`),
-        employee_id: Number(item.employee_id) || 3,
-        emp_code: item.emp_code ? String(item.emp_code) : null,
-        full_name: item.full_name ? String(item.full_name) : null,
-        entry_type:
-          String(item.entry_type || "CLOCK_IN").toUpperCase() === "CLOCK_OUT"
-            ? "CLOCK_OUT"
-            : "CLOCK_IN",
-        punched_at: item.punched_at
-          ? new Date(String(item.punched_at)).toISOString()
-          : new Date().toISOString(),
-        is_offline_sync: Boolean(item.is_offline_sync),
-        qr_code: item.qr_code ? String(item.qr_code) : null,
-        mode: String(item.mode || "BARCODE + WAJAH"),
-        notes: String(item.notes || ""),
-        latitude:
-          item.latitude !== null && item.latitude !== undefined
-            ? Number(item.latitude)
-            : null,
-        longitude:
-          item.longitude !== null && item.longitude !== undefined
-            ? Number(item.longitude)
-            : null,
-        distance_meters:
-          item.distance_meters !== null && item.distance_meters !== undefined
-            ? Number(item.distance_meters)
-            : 0,
-        is_within_geofence:
-          item.is_within_geofence !== undefined
-            ? Boolean(item.is_within_geofence)
-            : true,
-        selfie_data: item.selfie_data ? String(item.selfie_data) : null,
-        face_detected: Boolean(item.face_detected),
-      }))
-    : [];
-
-  return NextResponse.json({
-    ok: true,
-    dbConnected: true,
-    envKeyUsed: cfg?.envKey || null,
-    serverTime: new Date().toISOString(),
+  return {
     employees,
-    locations,
-    entries,
-    ...(isDiag
-      ? {
-          diag: {
-            endpoint: cfg?.endpoint || null,
-            entriesInDb: entries.length,
-            employeesInDb: employees.length,
-          },
-        }
-      : {}),
+    weeklySchedules,
+    locations: locRows,
+    entries: entryRows,
+    schedulePoster,
+    officeQr,
+  };
+}
+
+function noStoreJson(body: unknown, status = 200) {
+  return NextResponse.json(body, {
+    status,
+    headers: {
+      "Cache-Control": "no-store, no-cache, must-revalidate, proxy-revalidate",
+      Pragma: "no-cache",
+      Expires: "0",
+    },
   });
 }
 
-export async function POST(req: NextRequest) {
+export async function GET() {
+  const sql = getSql();
+  if (!sql) {
+    return noStoreJson({
+      ok: true,
+      dbConnected: false,
+      dbError: "DATABASE_URL belum dikonfigurasi di Vercel",
+    });
+  }
+
   try {
-    const schema = await ensureNeonTables();
-    if (!schema.ok) {
-      return NextResponse.json(
-        {
-          ok: false,
-          dbConnected: false,
-          error: schema.error || "Database Neon belum terhubung",
-        },
-        { status: 500 }
-      );
-    }
+    await ensureSchema(sql);
+    const state = await fetchFullState(sql);
+    return noStoreJson({
+      ok: true,
+      dbConnected: true,
+      serverTime: new Date().toISOString(),
+      ...state,
+    });
+  } catch (err) {
+    return noStoreJson(
+      {
+        ok: false,
+        dbConnected: false,
+        dbError: err instanceof Error ? err.message : "Gagal terhubung ke Neon",
+      },
+      500
+    );
+  }
+}
 
+export async function POST(req: NextRequest) {
+  const sql = getSql();
+  if (!sql) {
+    return noStoreJson(
+      { ok: false, dbConnected: false, error: "DATABASE_URL belum diatur" },
+      500
+    );
+  }
+
+  try {
+    await ensureSchema(sql);
     const body = await req.json();
-    const action = String(body?.action || "SUBMIT_PUNCH").toUpperCase();
+    const action = String(body?.action || "").toUpperCase();
 
-    if (action === "SUBMIT_PUNCH" || action === "SYNC_PUNCHES") {
-      const punches: PunchRecord[] = Array.isArray(body?.punches)
-        ? body.punches
-        : body?.punch
-        ? [body.punch]
-        : [];
+    if (action === "SUBMIT_PUNCH") {
+      const punches = Array.isArray(body?.punches) ? body.punches : [];
+      const syncedUuids: string[] = [];
 
-      let syncedCount = 0;
       for (const p of punches) {
-        if (!p?.client_uuid) continue;
-        const entryType =
-          String(p.entry_type || "CLOCK_IN").toUpperCase() === "CLOCK_OUT"
-            ? "CLOCK_OUT"
-            : "CLOCK_IN";
-        const parsedDate = p.punched_at ? new Date(p.punched_at) : new Date();
-        const punchedAt = isNaN(parsedDate.getTime())
-          ? new Date().toISOString()
-          : parsedDate.toISOString();
+        const uuid = String(p.client_uuid || "").trim();
+        if (!uuid) continue;
 
-        const ins = await runNeonSql(
-          `
+        await sql`
           INSERT INTO time_entries (
-            client_uuid, employee_id, emp_code, full_name, entry_type,
-            punched_at, is_offline_sync, qr_code, mode, notes,
-            latitude, longitude, distance_meters, is_within_geofence,
-            selfie_data, face_detected
+            client_uuid,
+            employee_id,
+            entry_type,
+            punched_at,
+            is_offline_sync,
+            qr_code,
+            mode,
+            notes,
+            latitude,
+            longitude,
+            distance_meters,
+            is_within_geofence,
+            selfie_data,
+            face_detected,
+            device_info
           )
           VALUES (
-            $1, $2, $3, $4, $5,
-            $6::timestamptz, $7, $8, $9, $10,
-            $11, $12, $13, $14,
-            $15, $16
+            ${uuid},
+            ${Number(p.employee_id)},
+            ${String(p.entry_type || "CLOCK_IN")},
+            ${String(p.punched_at || new Date().toISOString())},
+            ${Boolean(p.is_offline_sync)},
+            ${p.qr_code ? String(p.qr_code) : null},
+            ${p.mode ? String(p.mode) : null},
+            ${p.notes ? String(p.notes) : null},
+            ${p.latitude !== undefined && p.latitude !== null ? Number(p.latitude) : null},
+            ${p.longitude !== undefined && p.longitude !== null ? Number(p.longitude) : null},
+            ${p.distance_meters !== undefined && p.distance_meters !== null ? Number(p.distance_meters) : null},
+            ${p.is_within_geofence !== undefined ? Boolean(p.is_within_geofence) : true},
+            ${p.selfie_data ? String(p.selfie_data) : null},
+            ${Boolean(p.face_detected)},
+            ${p.device_info ? String(p.device_info) : null}
           )
-          ON CONFLICT (client_uuid) DO UPDATE SET
-            entry_type = EXCLUDED.entry_type,
-            punched_at = EXCLUDED.punched_at,
-            is_offline_sync = EXCLUDED.is_offline_sync,
-            qr_code = EXCLUDED.qr_code,
-            mode = EXCLUDED.mode,
-            latitude = EXCLUDED.latitude,
-            longitude = EXCLUDED.longitude,
-            distance_meters = EXCLUDED.distance_meters,
-            is_within_geofence = EXCLUDED.is_within_geofence,
-            selfie_data = COALESCE(EXCLUDED.selfie_data, time_entries.selfie_data),
-            face_detected = EXCLUDED.face_detected;
-          `,
-          [
-            String(p.client_uuid),
-            Math.max(1, Number(p.employee_id) || 3),
-            p.emp_code ? String(p.emp_code) : null,
-            p.full_name ? String(p.full_name) : null,
-            entryType,
-            punchedAt,
-            Boolean(p.is_offline_sync),
-            p.qr_code ? String(p.qr_code) : null,
-            String(p.mode || "BARCODE + WAJAH"),
-            String(p.notes || ""),
-            p.latitude !== undefined &&
-            p.latitude !== null &&
-            !Number.isNaN(Number(p.latitude))
-              ? Number(p.latitude)
-              : null,
-            p.longitude !== undefined &&
-            p.longitude !== null &&
-            !Number.isNaN(Number(p.longitude))
-              ? Number(p.longitude)
-              : null,
-            p.distance_meters !== undefined &&
-            p.distance_meters !== null &&
-            !Number.isNaN(Number(p.distance_meters))
-              ? Math.round(Number(p.distance_meters))
-              : 0,
-            p.is_within_geofence !== undefined
-              ? Boolean(p.is_within_geofence)
-              : true,
-            p.selfie_data ? String(p.selfie_data) : null,
-            Boolean(p.face_detected),
-          ]
-        );
-
-        if (!ins.ok) {
-          return NextResponse.json(
-            { ok: false, error: ins.error || "Gagal INSERT ke Neon" },
-            { status: 500 }
-          );
-        }
-        syncedCount++;
+          ON CONFLICT (client_uuid) DO NOTHING
+        `;
+        syncedUuids.push(uuid);
       }
 
-      const entryRes = await runNeonSql(
-        `SELECT * FROM time_entries ORDER BY punched_at DESC LIMIT 300;`
-      );
-      return NextResponse.json({
+      const state = await fetchFullState(sql);
+      return noStoreJson({
         ok: true,
         dbConnected: true,
-        syncedCount,
-        entries: entryRes.rows,
+        syncedCount: syncedUuids.length,
+        syncedUuids,
+        ...state,
       });
-    }
-
-    if (action === "UPDATE_ENTRY") {
-      const p = body?.payload || {};
-      const nextIso = p.punched_at
-        ? new Date(p.punched_at).toISOString()
-        : new Date().toISOString();
-      const nextType =
-        String(p.entry_type || "CLOCK_IN").toUpperCase() === "CLOCK_OUT"
-          ? "CLOCK_OUT"
-          : "CLOCK_IN";
-      const nextNotes = String(p.notes || "");
-
-      if (p.client_uuid) {
-        await runNeonSql(
-          `UPDATE time_entries SET entry_type = $1, punched_at = $2::timestamptz, notes = $3 WHERE client_uuid = $4;`,
-          [nextType, nextIso, nextNotes, String(p.client_uuid)]
-        );
-      } else if (p.id) {
-        await runNeonSql(
-          `UPDATE time_entries SET entry_type = $1, punched_at = $2::timestamptz, notes = $3 WHERE id = $4;`,
-          [nextType, nextIso, nextNotes, Number(p.id)]
-        );
-      }
-      return NextResponse.json({ ok: true });
-    }
-
-    if (action === "DELETE_ENTRY") {
-      const p = body?.payload || {};
-      if (p.client_uuid) {
-        await runNeonSql(`DELETE FROM time_entries WHERE client_uuid = $1;`, [
-          String(p.client_uuid),
-        ]);
-      } else if (p.id) {
-        await runNeonSql(`DELETE FROM time_entries WHERE id = $1;`, [
-          Number(p.id),
-        ]);
-      }
-      return NextResponse.json({ ok: true });
     }
 
     if (action === "SAVE_EMPLOYEE") {
       const p = body?.payload || {};
-      const empCode = String(p.emp_code || "").trim();
+      const empCode = String(p.emp_code || "").trim().toUpperCase();
       const fullName = String(p.full_name || "").trim();
-      const role =
-        String(p.role || "STAFF").toUpperCase() === "ADMIN"
-          ? "ADMIN"
-          : String(p.role || "STAFF").toUpperCase() === "MANAGER"
-          ? "MANAGER"
-          : "STAFF";
-      const department = String(p.department || "Operasional").trim();
-      const pinCode = String(p.pin_code || "1111").trim();
-      const shiftTime = String(p.shift_start_time || "07.00").trim();
+      const role = String(p.role || "STAFF").toUpperCase();
+      const department = String(p.department || "Security Dormitory Batang").trim();
+      const pinCode = String(p.pin_code || "1001").trim();
+      const shiftStartTime = String(p.shift_start_time || "07.00").trim();
+      const weeklySchedule = sanitizeWeekly(p.weekly_schedule, "P");
 
-      if (p.id) {
-        await runNeonSql(
-          `UPDATE employees SET emp_code = $1, full_name = $2, role = $3, department = $4, pin_code = $5, shift_start_time = $6 WHERE id = $7;`,
-          [empCode, fullName, role, department, pinCode, shiftTime, Number(p.id)]
-        );
+      if (!empCode || !fullName) {
+        return noStoreJson({ ok: false, error: "ID dan Nama wajib diisi" }, 400);
+      }
+
+      if (p.id && Number(p.id) > 0 && Number(p.id) < 2000000000) {
+        await sql`
+          UPDATE employees
+          SET
+            emp_code = ${empCode},
+            full_name = ${fullName},
+            role = ${role},
+            department = ${department},
+            pin_code = ${pinCode},
+            shift_start_time = ${shiftStartTime},
+            weekly_schedule = ${JSON.stringify(weeklySchedule)}::jsonb
+          WHERE id = ${Number(p.id)} OR emp_code = ${empCode}
+        `;
       } else {
-        await runNeonSql(
-          `
-          INSERT INTO employees (emp_code, full_name, role, department, pin_code, shift_start_time)
-          VALUES ($1, $2, $3, $4, $5, $6)
+        await sql`
+          INSERT INTO employees (emp_code, full_name, role, department, pin_code, shift_start_time, weekly_schedule)
+          VALUES (${empCode}, ${fullName}, ${role}, ${department}, ${pinCode}, ${shiftStartTime}, ${JSON.stringify(weeklySchedule)}::jsonb)
           ON CONFLICT (emp_code) DO UPDATE SET
             full_name = EXCLUDED.full_name,
             role = EXCLUDED.role,
             department = EXCLUDED.department,
             pin_code = EXCLUDED.pin_code,
-            shift_start_time = EXCLUDED.shift_start_time;
-          `,
-          [empCode, fullName, role, department, pinCode, shiftTime]
-        );
+            shift_start_time = EXCLUDED.shift_start_time,
+            weekly_schedule = EXCLUDED.weekly_schedule
+        `;
       }
-      return NextResponse.json({ ok: true });
+
+      if (body?.weeklySchedules && typeof body.weeklySchedules === "object") {
+        for (const [codeKey, schedVal] of Object.entries(body.weeklySchedules)) {
+          const cleanK = String(codeKey).trim().toUpperCase();
+          const cleanS = sanitizeWeekly(schedVal, "P");
+          await sql`
+            UPDATE employees
+            SET weekly_schedule = ${JSON.stringify(cleanS)}::jsonb
+            WHERE UPPER(emp_code) = ${cleanK}
+          `;
+        }
+      }
+
+      const state = await fetchFullState(sql);
+      return noStoreJson({ ok: true, dbConnected: true, ...state });
     }
 
     if (action === "DELETE_EMPLOYEE") {
-      const id = Number(body?.payload?.id);
-      if (id) {
-        await runNeonSql(`DELETE FROM employees WHERE id = $1;`, [id]);
+      const id = Number(body?.payload?.id || 0);
+      if (id > 0) {
+        await sql`DELETE FROM employees WHERE id = ${id}`;
       }
-      return NextResponse.json({ ok: true });
+      const state = await fetchFullState(sql);
+      return noStoreJson({ ok: true, dbConnected: true, ...state });
+    }
+
+    if (action === "SAVE_SCHEDULE_POSTER") {
+      const poster = body?.payload?.poster || null;
+      const weeklySchedules = body?.payload?.weeklySchedules || {};
+      const incomingEmployees = Array.isArray(body?.payload?.employees)
+        ? body.payload.employees
+        : [];
+
+      if (poster) {
+        await sql`
+          INSERT INTO app_settings (key, value, updated_at)
+          VALUES ('schedule_poster', ${JSON.stringify(poster)}::jsonb, NOW())
+          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+        `;
+      }
+
+      for (const emp of incomingEmployees) {
+        const code = String(emp.emp_code || "").trim().toUpperCase();
+        if (!code) continue;
+        const wk = sanitizeWeekly(
+          weeklySchedules[code] || emp.weekly_schedule,
+          "P"
+        );
+        await sql`
+          UPDATE employees
+          SET
+            full_name = ${String(emp.full_name || "")},
+            shift_start_time = ${String(emp.shift_start_time || "07.00")},
+            weekly_schedule = ${JSON.stringify(wk)}::jsonb
+          WHERE UPPER(emp_code) = ${code}
+        `;
+      }
+
+      const state = await fetchFullState(sql);
+      return noStoreJson({ ok: true, dbConnected: true, ...state });
+    }
+
+    if (action === "DEVICE_LOGIN") {
+      const p = body?.payload || {};
+      const empCode = String(p.emp_code || "").trim().toUpperCase();
+      const detail = p.device_detail || { summary: p.device_info || "Perangkat HP" };
+      if (empCode) {
+        await sql`
+          UPDATE employees
+          SET last_device = ${JSON.stringify(detail)}::jsonb
+          WHERE UPPER(emp_code) = ${empCode}
+        `;
+      }
+      const state = await fetchFullState(sql);
+      return noStoreJson({ ok: true, dbConnected: true, ...state });
+    }
+
+    if (action === "UPDATE_ENTRY") {
+      const p = body?.payload || {};
+      const clientUuid = String(p.client_uuid || "").trim();
+      const entryType = String(p.entry_type || "CLOCK_IN");
+      const punchedAt = String(p.punched_at || new Date().toISOString());
+      const notes = String(p.notes || "");
+
+      if (clientUuid) {
+        await sql`
+          UPDATE time_entries
+          SET entry_type = ${entryType}, punched_at = ${punchedAt}, notes = ${notes}
+          WHERE client_uuid = ${clientUuid}
+        `;
+      } else if (p.id) {
+        await sql`
+          UPDATE time_entries
+          SET entry_type = ${entryType}, punched_at = ${punchedAt}, notes = ${notes}
+          WHERE id = ${Number(p.id)}
+        `;
+      }
+
+      const state = await fetchFullState(sql);
+      return noStoreJson({ ok: true, dbConnected: true, ...state });
+    }
+
+    if (action === "DELETE_ENTRY") {
+      const p = body?.payload || {};
+      if (p.client_uuid) {
+        await sql`DELETE FROM time_entries WHERE client_uuid = ${String(p.client_uuid)}`;
+      }
+      if (p.id) {
+        await sql`DELETE FROM time_entries WHERE id = ${Number(p.id)}`;
+      }
+      const state = await fetchFullState(sql);
+      return noStoreJson({ ok: true, dbConnected: true, ...state });
     }
 
     if (action === "SAVE_LOCATION") {
       const p = body?.payload || {};
+      const id = Number(p.id) || 1;
+      const name = String(p.name || "Kantor Utama");
       const lat = Number(p.latitude);
       const lng = Number(p.longitude);
-      const rad = Math.max(10, Number(p.radius_meters) || DEFAULT_RADIUS);
-      const name = String(p.name || "Kantor Utama");
+      const radius = Math.max(10, Number(p.radius_meters) || 2000);
 
-      const existing = await runNeonSql(
-        `SELECT id FROM locations ORDER BY id ASC LIMIT 1;`
-      );
-      if (existing.rows.length > 0) {
-        await runNeonSql(
-          `UPDATE locations SET name = $1, latitude = $2, longitude = $3, radius_meters = $4 WHERE id = $5;`,
-          [name, lat, lng, rad, Number(existing.rows[0].id)]
-        );
-      } else {
-        await runNeonSql(
-          `INSERT INTO locations (name, latitude, longitude, radius_meters) VALUES ($1, $2, $3, $4);`,
-          [name, lat, lng, rad]
-        );
-      }
-      return NextResponse.json({ ok: true });
+      await sql`
+        INSERT INTO locations (id, name, latitude, longitude, radius_meters)
+        VALUES (${id}, ${name}, ${lat}, ${lng}, ${radius})
+        ON CONFLICT (id) DO UPDATE SET
+          name = EXCLUDED.name,
+          latitude = EXCLUDED.latitude,
+          longitude = EXCLUDED.longitude,
+          radius_meters = EXCLUDED.radius_meters
+      `;
+
+      const state = await fetchFullState(sql);
+      return noStoreJson({ ok: true, dbConnected: true, ...state });
     }
 
-    return NextResponse.json(
-      { ok: false, error: "Aksi tidak dikenali" },
-      { status: 400 }
-    );
+    if (action === "SAVE_QR") {
+      const qr = String(body?.payload?.qrCode || "").trim().toUpperCase();
+      if (qr) {
+        await sql`
+          INSERT INTO app_settings (key, value, updated_at)
+          VALUES ('office_qr', ${JSON.stringify(qr)}::jsonb, NOW())
+          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+        `;
+      }
+      const state = await fetchFullState(sql);
+      return noStoreJson({ ok: true, dbConnected: true, ...state });
+    }
+
+    return noStoreJson({ ok: false, error: `Aksi tidak dikenal: ${action}` }, 400);
   } catch (err) {
-    console.error("POST /api/absen error:", err);
-    return NextResponse.json(
+    return noStoreJson(
       {
         ok: false,
-        error: err instanceof Error ? err.message : "Gagal memproses data absen",
+        error: err instanceof Error ? err.message : "Terjadi kesalahan server",
       },
-      { status: 500 }
+      500
     );
   }
 }
