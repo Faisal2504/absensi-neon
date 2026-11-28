@@ -286,6 +286,22 @@ function buildDefaultWeeklySchedule(defaultCode: ShiftCode = "P"): WeeklySchedul
   };
 }
 
+function sanitizeWeeklySchedule(
+  raw: unknown,
+  fallbackCode: ShiftCode = "P"
+): WeeklyScheduleMap {
+  const base = buildDefaultWeeklySchedule(fallbackCode);
+  if (!raw || typeof raw !== "object") return base;
+  const obj = raw as Record<string, unknown>;
+  DAYS_OF_WEEK.forEach((day) => {
+    const val = String(obj[day] || "").trim().toUpperCase();
+    if (val === "P" || val === "S" || val === "M" || val === "OFF") {
+      base[day] = val as ShiftCode;
+    }
+  });
+  return base;
+}
+
 function shiftTimeToCode(raw?: string | null): ShiftCode {
   const s = String(raw || "").trim().toUpperCase();
   if (s === "OFF" || s.includes("LIBUR")) return "OFF";
@@ -442,18 +458,20 @@ function ensureLockedEmployees(
   devReg: Record<string, DeviceSystemInfo>
 ): Employee[] {
   const normalized: Employee[] = list.map((e) => {
+    const empCodeClean = String(e.emp_code || "").trim().toUpperCase();
     const defCode = shiftTimeToCode(e.shift_start_time);
+    const resolvedSchedule = sanitizeWeeklySchedule(
+      weeklyMap[empCodeClean] || e.weekly_schedule,
+      defCode
+    );
     return {
       ...e,
-      emp_code: String(e.emp_code || "").trim().toUpperCase(),
+      emp_code: empCodeClean,
       role: normalizeRole(e.role),
       shift_start_time: normalizeShiftTime(e.shift_start_time),
-      weekly_schedule:
-        weeklyMap[String(e.emp_code || "").trim().toUpperCase()] ||
-        e.weekly_schedule ||
-        buildDefaultWeeklySchedule(defCode),
+      weekly_schedule: resolvedSchedule,
       last_device:
-        devReg[String(e.emp_code || "").trim().toUpperCase()] ||
+        devReg[empCodeClean] ||
         e.last_device ||
         null,
     };
@@ -465,14 +483,15 @@ function ensureLockedEmployees(
     );
     if (!exists) {
       const seed = DEFAULT_EMPLOYEES[idx + 2];
+      const defCode = shiftTimeToCode(seed?.shift_start_time);
       normalized.push({
         ...seed,
         id: seed?.id || 100 + idx,
         emp_code: lockedCode,
-        weekly_schedule:
-          weeklyMap[lockedCode] ||
-          seed?.weekly_schedule ||
-          buildDefaultWeeklySchedule("P"),
+        weekly_schedule: sanitizeWeeklySchedule(
+          weeklyMap[lockedCode] || seed?.weekly_schedule,
+          defCode
+        ),
         last_device: devReg[lockedCode] || null,
       });
     }
@@ -838,7 +857,6 @@ function parseScheduleLines(lines: string[]): ParsedScheduleItem[] {
   return parsed;
 }
 
-// Render gambar poster/board jadwal keberangkatan mingguan dari PDF yang diunggah Admin
 function renderDepartureBoardPosterDataUrl(
   fileName: string,
   uploadedAtLabel: string,
@@ -1027,6 +1045,22 @@ function loadWeeklySchedulesMap(): Record<string, WeeklyScheduleMap> {
     return parsed && typeof parsed === "object" ? parsed : {};
   } catch {
     return {};
+  }
+}
+
+function persistWeeklySchedulesFromEmployees(list: Employee[]) {
+  if (typeof window === "undefined") return;
+  try {
+    const currentMap = loadWeeklySchedulesMap();
+    list.forEach((emp) => {
+      const code = String(emp.emp_code || "").trim().toUpperCase();
+      if (!code) return;
+      const defCode = shiftTimeToCode(emp.shift_start_time);
+      currentMap[code] = sanitizeWeeklySchedule(emp.weekly_schedule, defCode);
+    });
+    localStorage.setItem(WEEKLY_SCHED_KEY, JSON.stringify(currentMap));
+  } catch {
+    // Abaikan
   }
 }
 
@@ -1362,9 +1396,9 @@ export default function AbsensiMultiServerPage() {
   );
 
   const activeUserWeeklySchedule = useMemo<WeeklyScheduleMap>(() => {
-    return (
-      activeUser?.weekly_schedule ||
-      buildDefaultWeeklySchedule(shiftTimeToCode(activeUser?.shift_start_time))
+    return sanitizeWeeklySchedule(
+      activeUser?.weekly_schedule,
+      shiftTimeToCode(activeUser?.shift_start_time)
     );
   }, [activeUser]);
 
@@ -1486,27 +1520,50 @@ export default function AbsensiMultiServerPage() {
               );
             }
             const weeklyMap = loadWeeklySchedulesMap();
+            if (data.weeklySchedules && typeof data.weeklySchedules === "object") {
+              Object.entries(data.weeklySchedules).forEach(([code, sched]) => {
+                weeklyMap[String(code).trim().toUpperCase()] = sanitizeWeeklySchedule(
+                  sched,
+                  "P"
+                );
+              });
+              localStorage.setItem(WEEKLY_SCHED_KEY, JSON.stringify(weeklyMap));
+            }
             const devReg = loadDeviceRegistry();
             setEmployees((prevEmps) => {
               const baseList =
                 Array.isArray(data.employees) && data.employees.length > 0
                   ? data.employees.map((e: Employee) => {
+                      const codeUpper = String(e.emp_code || "").trim().toUpperCase();
                       const prevMatch = prevEmps.find(
                         (pe) =>
-                          pe.emp_code.toUpperCase() ===
-                            String(e.emp_code || "").toUpperCase() ||
+                          pe.emp_code.toUpperCase() === codeUpper ||
                           Number(pe.id) === Number(e.id)
                       );
+                      const defCode = shiftTimeToCode(
+                        e.shift_start_time || prevMatch?.shift_start_time
+                      );
+                      const mergedSchedule = sanitizeWeeklySchedule(
+                        e.weekly_schedule ||
+                          weeklyMap[codeUpper] ||
+                          prevMatch?.weekly_schedule,
+                        defCode
+                      );
+                      weeklyMap[codeUpper] = mergedSchedule;
                       return {
                         ...e,
-                        pin_code: prevMatch?.pin_code || e.pin_code || "1001",
-                        weekly_schedule:
-                          prevMatch?.weekly_schedule || e.weekly_schedule,
-                        last_device: prevMatch?.last_device || e.last_device,
+                        pin_code: e.pin_code || prevMatch?.pin_code || "1001",
+                        shift_start_time:
+                          e.shift_start_time ||
+                          prevMatch?.shift_start_time ||
+                          shiftCodeToStartTime(mergedSchedule.Senin || "P"),
+                        weekly_schedule: mergedSchedule,
+                        last_device: e.last_device || prevMatch?.last_device,
                       };
                     })
                   : prevEmps;
 
+              localStorage.setItem(WEEKLY_SCHED_KEY, JSON.stringify(weeklyMap));
               const nextEmps = ensureLockedEmployees(baseList, weeklyMap, devReg);
 
               const customLoc = parseSavedLocation(localStorage.getItem(LOC_KEY));
@@ -1694,7 +1751,6 @@ export default function AbsensiMultiServerPage() {
     };
   }, [refreshServer, requestCurrentGps, notify, stopQrCam, stopSelfieCam]);
 
-  // Login anggota karyawan: wajib ID Karyawan & PIN yang dibuat Admin di server utama
   const handleStaffMemberLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     const codeClean = staffLoginCode.trim().toUpperCase();
@@ -1769,7 +1825,6 @@ export default function AbsensiMultiServerPage() {
     );
   };
 
-  // Keluar dari sesi anggota saat ini (wajib login ulang dengan ID & PIN sendiri)
   const handleStaffMemberLogout = () => {
     stopQrCam();
     stopSelfieCam();
@@ -2026,7 +2081,6 @@ export default function AbsensiMultiServerPage() {
     }
   };
 
-  // Membuat foto selfie dengan cap verifikasi asli ala TimeMark (Waktu WIB, Nama/Kode, GPS + Geofence, Device)
   const takeSelfiePhoto = async () => {
     if (!selfieVideoRef.current || !selfieCanvasRef.current) return;
     const FD = (
@@ -2453,7 +2507,6 @@ export default function AbsensiMultiServerPage() {
     }
   };
 
-  // Hanya Admin yang bisa mengunggah file jadwal PDF dan menghasilkan gambar board jadwal keberangkatan untuk Admin & Karyawan
   const handleScheduleFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (!isAdminServer) {
       notify(
@@ -2492,17 +2545,20 @@ export default function AbsensiMultiServerPage() {
             r.full_name.toLowerCase() === emp.full_name.toLowerCase()
         );
         if (!match) return emp;
-        const nextWeekly: WeeklyScheduleMap = {
-          ...(emp.weekly_schedule ||
-            buildDefaultWeeklySchedule(match.shift_code)),
-          ...(match.weekly || {}),
-        };
+        const nextWeekly: WeeklyScheduleMap = sanitizeWeeklySchedule(
+          {
+            ...(emp.weekly_schedule ||
+              buildDefaultWeeklySchedule(match.shift_code)),
+            ...(match.weekly || {}),
+          },
+          match.shift_code
+        );
         if (!match.weekly) {
           DAYS_OF_WEEK.forEach((d) => {
             if (d !== "Minggu") nextWeekly[d] = match.shift_code;
           });
         }
-        weeklyMap[emp.emp_code] = nextWeekly;
+        weeklyMap[emp.emp_code.toUpperCase()] = nextWeekly;
         return {
           ...emp,
           full_name: match.full_name || emp.full_name,
@@ -2544,6 +2600,7 @@ export default function AbsensiMultiServerPage() {
               payload: {
                 poster: posterObj,
                 weeklySchedules: weeklyMap,
+                employees: updatedEmployees,
               },
             }),
           });
@@ -2953,12 +3010,16 @@ export default function AbsensiMultiServerPage() {
       return;
     }
     const cleanCode = empForm.emp_code.trim().toUpperCase();
-    const mondayCode = empForm.weekly_schedule.Senin || "P";
+    const cleanedWeekly = sanitizeWeeklySchedule(
+      empForm.weekly_schedule,
+      shiftTimeToCode(empForm.shift_start_time)
+    );
+    const mondayCode = cleanedWeekly.Senin || "P";
     const resolvedStartTime =
       empForm.shift_start_time || shiftCodeToStartTime(mondayCode);
 
     const weeklyMap = loadWeeklySchedulesMap();
-    weeklyMap[cleanCode] = empForm.weekly_schedule;
+    weeklyMap[cleanCode] = cleanedWeekly;
     localStorage.setItem(WEEKLY_SCHED_KEY, JSON.stringify(weeklyMap));
 
     const payload = {
@@ -2969,13 +3030,41 @@ export default function AbsensiMultiServerPage() {
       department: empForm.department.trim() || "Security Dormitory Batang",
       pin_code: empForm.pin_code.trim() || "1234",
       shift_start_time: normalizeShiftTime(resolvedStartTime),
+      weekly_schedule: cleanedWeekly,
     };
+
+    const nextEmployeesList = ensureLockedEmployees(
+      empForm.id
+        ? employees.map((e) =>
+            e.id === empForm.id
+              ? { ...e, ...payload, weekly_schedule: cleanedWeekly }
+              : e
+          )
+        : [
+            ...employees,
+            {
+              ...payload,
+              id: Date.now(),
+              weekly_schedule: cleanedWeekly,
+            },
+          ],
+      weeklyMap,
+      loadDeviceRegistry()
+    );
+
+    setEmployees(nextEmployeesList);
+    persistWeeklySchedulesFromEmployees(nextEmployeesList);
+
     if (navigator.onLine) {
       try {
         const res = await fetch("/api/absen", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ action: "SAVE_EMPLOYEE", payload }),
+          body: JSON.stringify({
+            action: "SAVE_EMPLOYEE",
+            payload,
+            weeklySchedules: weeklyMap,
+          }),
         });
         if (res.ok) {
           const data = await res.json();
@@ -2999,27 +3088,7 @@ export default function AbsensiMultiServerPage() {
         // Fallback lokal
       }
     }
-    setEmployees((prev) => {
-      const next = empForm.id
-        ? prev.map((e) =>
-            e.id === empForm.id
-              ? { ...e, ...payload, weekly_schedule: empForm.weekly_schedule }
-              : e
-          )
-        : [
-            ...prev,
-            {
-              ...payload,
-              id: Date.now(),
-              weekly_schedule: empForm.weekly_schedule,
-            },
-          ];
-      return ensureLockedEmployees(
-        next,
-        weeklyMap,
-        loadDeviceRegistry()
-      );
-    });
+
     setEmpForm({
       id: 0,
       emp_code: "",
@@ -3152,9 +3221,6 @@ export default function AbsensiMultiServerPage() {
       .slice(0, 5);
   }, [allEntries, activeUser]);
 
-  // =========================================================================
-  // GERBANG LOGIN 1: SERVER ADMIN / MANAGER (Wajib PIN sebelum masuk dasbor)
-  // =========================================================================
   if (!isKaryawanMode && !isPrivilegedAuthed) {
     return (
       <div className="min-h-screen bg-[#ECEFF4] flex items-center justify-center p-4">
@@ -3247,9 +3313,6 @@ export default function AbsensiMultiServerPage() {
     );
   }
 
-  // =========================================================================
-  // GERBANG LOGIN 2: ANGGOTA KARYAWAN (Terkunci di HP Karyawan + Instal PWA)
-  // =========================================================================
   if (isKaryawanMode && !isStaffLoggedIn) {
     return (
       <div className="min-h-screen bg-[#ECEFF4] flex items-center justify-center p-4">
@@ -3533,7 +3596,6 @@ export default function AbsensiMultiServerPage() {
           </div>
         </header>
 
-        {/* BOARD JADWAL MINGGUAN PER KARYAWAN & GAMBAR JADWAL KEBERANGKATAN (TAMPIL DI DASHBOARD ADMIN & ANGGOTA) */}
         <section className="bg-white rounded-2xl p-3.5 border-t-4 border-t-indigo-600 border border-slate-200/80 shadow-sm space-y-2.5">
           <div className="flex items-center justify-between gap-2">
             <div>
@@ -3551,7 +3613,6 @@ export default function AbsensiMultiServerPage() {
             </span>
           </div>
 
-          {/* Kartu Jadwal Mingguan Anggota Aktif (Selalu tampil di Dashboard Anggota maupun Admin) */}
           <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200 space-y-1.5">
             <div className="flex items-center justify-between text-[10px]">
               <span className="font-extrabold text-slate-800">
@@ -3599,7 +3660,6 @@ export default function AbsensiMultiServerPage() {
             </div>
           </div>
 
-          {/* Ringkasan Jadwal Mingguan Semua Anggota di Dashboard Admin */}
           {!isKaryawanMode && (
             <div className="overflow-x-auto rounded-lg border border-slate-200">
               <table className="w-full text-left border-collapse text-[10px]">
@@ -3615,11 +3675,10 @@ export default function AbsensiMultiServerPage() {
                 </thead>
                 <tbody>
                   {staffList.map((emp) => {
-                    const wk =
-                      emp.weekly_schedule ||
-                      buildDefaultWeeklySchedule(
-                        shiftTimeToCode(emp.shift_start_time)
-                      );
+                    const wk = sanitizeWeeklySchedule(
+                      emp.weekly_schedule,
+                      shiftTimeToCode(emp.shift_start_time)
+                    );
                     return (
                       <tr key={emp.id} className="border-t border-slate-100">
                         <td className="p-1.5 font-bold whitespace-nowrap">
@@ -3653,7 +3712,6 @@ export default function AbsensiMultiServerPage() {
             </div>
           )}
 
-          {/* Gambar Jadwal Keberangkatan Karyawan dari File PDF yang Dimasukkan Admin */}
           {schedulePoster?.imageDataUrl && (
             <div className="p-2.5 rounded-xl bg-blue-50/70 border border-blue-200 space-y-1.5">
               <div className="flex items-center justify-between gap-2">
@@ -4459,7 +4517,9 @@ export default function AbsensiMultiServerPage() {
                       setEmpForm((p) => ({
                         ...p,
                         shift_start_time: val,
-                        weekly_schedule: buildDefaultWeeklySchedule(code),
+                        weekly_schedule: p.id
+                          ? { ...p.weekly_schedule, Senin: code }
+                          : buildDefaultWeeklySchedule(code),
                       }));
                     }}
                     className="rounded-lg border border-slate-300 px-2 py-1.5 text-xs bg-white"
@@ -4527,11 +4587,10 @@ export default function AbsensiMultiServerPage() {
 
               <div className="space-y-1.5 pt-1">
                 {employees.map((emp) => {
-                  const wk =
-                    emp.weekly_schedule ||
-                    buildDefaultWeeklySchedule(
-                      shiftTimeToCode(emp.shift_start_time)
-                    );
+                  const wk = sanitizeWeeklySchedule(
+                    emp.weekly_schedule,
+                    shiftTimeToCode(emp.shift_start_time)
+                  );
                   const isLockedCode = LOCKED_STAFF_CODES.includes(
                     emp.emp_code.toUpperCase() as (typeof LOCKED_STAFF_CODES)[number]
                   );
@@ -4560,7 +4619,10 @@ export default function AbsensiMultiServerPage() {
                                 shift_start_time: normalizeShiftTime(
                                   emp.shift_start_time
                                 ),
-                                weekly_schedule: wk,
+                                weekly_schedule: sanitizeWeeklySchedule(
+                                  wk,
+                                  shiftTimeToCode(emp.shift_start_time)
+                                ),
                               })
                             }
                             className="px-2 py-0.5 rounded bg-amber-500 text-white text-[10px] font-bold"
