@@ -56,6 +56,7 @@ interface TimeEntry {
   is_within_geofence?: boolean;
   selfie_data?: string | null;
   face_detected?: boolean;
+  auth_seal?: string;
   full_name?: string;
   emp_code?: string;
   device_info?: string;
@@ -174,6 +175,48 @@ const STAFF_EMP_CODE_KEY = "absensi_v12_staff_emp_code";
 const STAFF_SESSION_KEY = "absensi_v12_staff_logged_in";
 const DEVICE_REG_KEY = "absensi_v12_device_registry";
 const AUTH_SERVER_KEY = "absensi_v12_auth_server";
+
+function buildPhotoAuthSeal(params: {
+  uuid: string;
+  empCode: string;
+  entryType: "CLOCK_IN" | "CLOCK_OUT";
+  punchedAt: string;
+  lat: number | null | undefined;
+  lng: number | null | undefined;
+  deviceSummary: string;
+}): string {
+  const raw = `${params.uuid}|${params.empCode}|${params.entryType}|${params.punchedAt}|${params.lat ?? 0},${params.lng ?? 0}|${params.deviceSummary}`;
+  let h1 = 0x811c9dc5;
+  let h2 = 0x01000193;
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw.charCodeAt(i);
+    h1 ^= ch;
+    h1 = Math.imul(h1, 0x01000193);
+    h2 ^= ch + i;
+    h2 = Math.imul(h2, 0x85ebca6b);
+  }
+  const partA = (h1 >>> 0).toString(16).padStart(8, "0").toUpperCase();
+  const partB = (h2 >>> 0).toString(16).padStart(8, "0").toUpperCase();
+  return `AUTH-${partA}${partB}`;
+}
+
+function formatDayWIB(iso?: string | null) {
+  if (!iso) return "-";
+  return new Date(iso).toLocaleDateString("id-ID", {
+    timeZone: "Asia/Jakarta",
+    weekday: "long",
+  });
+}
+
+function formatDateYearWIB(iso?: string | null) {
+  if (!iso) return "-";
+  return new Date(iso).toLocaleDateString("id-ID", {
+    timeZone: "Asia/Jakarta",
+    day: "2-digit",
+    month: "long",
+    year: "numeric",
+  });
+}
 
 function collectHpDeviceSystemInfo(loggedInAt?: string): DeviceSystemInfo {
   if (typeof window === "undefined" || typeof navigator === "undefined") {
@@ -1251,6 +1294,21 @@ export default function AbsensiMultiServerPage() {
   >("NONE");
   const [inspectionNote, setInspectionNote] = useState("");
 
+  const [photoEmpFilter, setPhotoEmpFilter] = useState<string>("ALL");
+  const [photoDateFilter, setPhotoDateFilter] = useState<string>("");
+  const [inspectedPhotoModal, setInspectedPhotoModal] = useState<{
+    entry: TimeEntry;
+    empName: string;
+    empCode: string;
+    inTimeWib: string;
+    outTimeWib: string;
+    dayName: string;
+    dateYearLabel: string;
+    coordsLabel: string;
+    authStatus: string;
+    authSeal: string;
+  } | null>(null);
+
   const [scheduleFileName, setScheduleFileName] = useState(
     boot.schedulePoster?.fileName || "Tidak ada file yang dipilih"
   );
@@ -1550,14 +1608,29 @@ export default function AbsensiMultiServerPage() {
                   const prevE = prevEntries.find(
                     (pe) => pe.client_uuid === item.client_uuid
                   );
+                  const entryType = normalizeEntryType(item.entry_type);
+                  const uuid =
+                    item.client_uuid ||
+                    `srv-${item.id || Math.random().toString(36).slice(2)}`;
+                  const devInfo = item.device_info || prevE?.device_info || "";
                   return {
                     ...item,
-                    entry_type: normalizeEntryType(item.entry_type),
+                    entry_type: entryType,
                     selfie_data: item.selfie_data || prevE?.selfie_data || null,
-                    device_info: item.device_info || prevE?.device_info || "",
-                    client_uuid:
-                      item.client_uuid ||
-                      `srv-${item.id || Math.random().toString(36).slice(2)}`,
+                    device_info: devInfo,
+                    auth_seal:
+                      item.auth_seal ||
+                      prevE?.auth_seal ||
+                      buildPhotoAuthSeal({
+                        uuid,
+                        empCode: item.emp_code || prevE?.emp_code || "EMP",
+                        entryType,
+                        punchedAt: item.punched_at,
+                        lat: item.latitude ?? prevE?.latitude,
+                        lng: item.longitude ?? prevE?.longitude,
+                        deviceSummary: devInfo,
+                      }),
+                    client_uuid: uuid,
                   };
                 })
               : rawEntries;
@@ -2355,6 +2428,15 @@ export default function AbsensiMultiServerPage() {
     const locStampNote = `TimeMark GPS ${latVal}, ${lngVal} (${
       geofence?.distance ?? 0
     }m)`;
+    const authSeal = buildPhotoAuthSeal({
+      uuid,
+      empCode: activeUser.emp_code,
+      entryType,
+      punchedAt: punchedAtIso,
+      lat: latVal,
+      lng: lngVal,
+      deviceSummary: devInfo.summary,
+    });
 
     const newPunch: TimeEntry = {
       client_uuid: uuid,
@@ -2377,6 +2459,7 @@ export default function AbsensiMultiServerPage() {
       is_within_geofence: geofence ? geofence.inside : true,
       selfie_data: capturedSelfie,
       face_detected: Boolean(capturedSelfie && faceStatus !== "no_face"),
+      auth_seal: authSeal,
       full_name: activeUser.full_name,
       emp_code: activeUser.emp_code,
       device_info: devInfo.summary,
@@ -2542,6 +2625,117 @@ export default function AbsensiMultiServerPage() {
       return true;
     });
   }, [allEntries, reportFilter, reportEmpFilter, todayStr, nowMs]);
+
+  const employeePhotoCards = useMemo(() => {
+    const baseStaff = employees.filter((e) => e.role === "STAFF");
+    const targetStaff =
+      photoEmpFilter === "ALL"
+        ? baseStaff
+        : baseStaff.filter(
+            (e) =>
+              String(e.id) === photoEmpFilter ||
+              e.emp_code.toUpperCase() === photoEmpFilter.toUpperCase()
+          );
+
+    const dateTarget = photoDateFilter || todayStr;
+
+    return targetStaff.map((emp) => {
+      const matches = allEntries
+        .filter((e) => {
+          const sameEmp =
+            Number(e.employee_id) === Number(emp.id) ||
+            (e.emp_code &&
+              e.emp_code.toUpperCase() === emp.emp_code.toUpperCase());
+          if (!sameEmp) return false;
+          if (!dateTarget) return true;
+          return getJakartaDateStr(e.punched_at) === dateTarget;
+        })
+        .sort(
+          (a, b) =>
+            new Date(a.punched_at).getTime() - new Date(b.punched_at).getTime()
+        );
+
+      const inEntry = matches.find((m) => m.entry_type === "CLOCK_IN");
+      const outEntry = [...matches]
+        .reverse()
+        .find((m) => m.entry_type === "CLOCK_OUT");
+      const latestWithPhoto =
+        [...matches].reverse().find((m) => Boolean(m.selfie_data)) ||
+        outEntry ||
+        inEntry;
+
+      const refIso =
+        latestWithPhoto?.punched_at || `${dateTarget}T07:00:00+07:00`;
+      const latVal = latestWithPhoto?.latitude ?? targetLocation.latitude;
+      const lngVal = latestWithPhoto?.longitude ?? targetLocation.longitude;
+      const withinGeo =
+        latestWithPhoto?.is_within_geofence !== undefined
+          ? Boolean(latestWithPhoto.is_within_geofence)
+          : true;
+      const hasPhoto = Boolean(
+        inEntry?.selfie_data || outEntry?.selfie_data
+      );
+      const devSum =
+        latestWithPhoto?.device_info ||
+        emp.last_device?.summary ||
+        "Perangkat Terdaftar";
+
+      const seal =
+        latestWithPhoto?.auth_seal ||
+        buildPhotoAuthSeal({
+          uuid: latestWithPhoto?.client_uuid || `${emp.emp_code}-${dateTarget}`,
+          empCode: emp.emp_code,
+          entryType: latestWithPhoto?.entry_type || "CLOCK_IN",
+          punchedAt: refIso,
+          lat: latVal,
+          lng: lngVal,
+          deviceSummary: devSum,
+        });
+
+      const isAuthentic = hasPhoto && withinGeo && Boolean(refIso);
+
+      return {
+        emp,
+        dateStr: dateTarget,
+        dayName: formatDayWIB(refIso),
+        dateYearLabel: formatDateYearWIB(refIso),
+        inEntry,
+        outEntry,
+        inTimeWib: inEntry ? formatTimeWIB(inEntry.punched_at) : "-",
+        outTimeWib: outEntry ? formatTimeWIB(outEntry.punched_at) : "-",
+        coordsLabel: `${latVal}, ${lngVal}`,
+        authStatus: isAuthentic
+          ? "TERVERIFIKASI AUTENTIK"
+          : hasPhoto
+          ? "PERLU CEK RADIUS GPS"
+          : "BELUM ADA FOTO",
+        isAuthentic,
+        authSeal: seal,
+        deviceSummary: devSum,
+      };
+    });
+  }, [employees, allEntries, photoEmpFilter, photoDateFilter, todayStr, targetLocation]);
+
+  const handleDownloadPhotoAsset = (params: {
+    dataUrl: string;
+    empCode: string;
+    typeLabel: "MASUK" | "KELUAR";
+    dateStr: string;
+    timeWib: string;
+    coordsLabel: string;
+    authSeal: string;
+  }) => {
+    const safeCode = params.empCode.replace(/[^A-Za-z0-9._-]/g, "_");
+    const safeTime = params.timeWib.replace(/[^0-9]/g, "");
+    const a = document.createElement("a");
+    a.href = params.dataUrl;
+    a.download = `VERIF_${safeCode}_${params.typeLabel}_${params.dateStr}_${safeTime}.jpg`;
+    a.click();
+    notify(
+      "ok",
+      `Foto ${params.typeLabel} ${params.empCode} (${params.coordsLabel} • ${params.authSeal}) diunduh.`
+    );
+  };
 
   const toggleReportUuid = (uuid: string) => {
     setSelectedReportUuids((prev) =>
@@ -2786,8 +2980,6 @@ export default function AbsensiMultiServerPage() {
     if (isKaryawanMode) return;
     const entriesToUse = getEntriesForExport();
     const grouped = buildGroupedTimesheetRows(entriesToUse);
-    const faceInCount = grouped.filter((g) => Boolean(g.inEntry?.selfie_data)).length;
-    const faceOutCount = grouped.filter((g) => Boolean(g.outEntry?.selfie_data)).length;
     const totalLateMins = grouped.reduce((acc, g) => {
       if (!g.inEntry) return acc;
       return (
@@ -2797,7 +2989,7 @@ export default function AbsensiMultiServerPage() {
 
     setInspectionMode(format);
     setInspectionNote(
-      `Inspeksi ${format}: ${grouped.length} rekap harian (${entriesToUse.length} scan) • Foto Wajah Masuk: ${faceInCount}, Foto Wajah Keluar: ${faceOutCount} • Total telat (>5 mnt): ${totalLateMins} menit • Logo MURINDA & Timesheet Absensi Security Dormitory Batang siap.`
+      `Inspeksi ${format}: ${grouped.length} rekap harian (${entriesToUse.length} scan) • Total telat (>5 mnt): ${totalLateMins} menit • Format laporan simpel (tanpa kolom foto) & Logo MURINDA siap.`
     );
     notify(
       "ok",
@@ -2818,9 +3010,7 @@ export default function AbsensiMultiServerPage() {
       "DEVICE HP",
       "SHIFT",
       "JAM MASUK",
-      "FOTO WAJAH MASUK",
       "TERAKHIR KELUAR",
-      "FOTO WAJAH KELUAR",
       "JAM PENGGAJIAN",
       "JAM REG",
       "TELAT",
@@ -2842,9 +3032,7 @@ export default function AbsensiMultiServerPage() {
             ? "OFF (LIBUR)"
             : `${g.shiftInfo.code} (${g.shiftInfo.rangeLabel})`,
           g.inEntry ? formatTimeWIB(g.inEntry.punched_at) : "-",
-          g.inEntry?.selfie_data ? "TIMEMARK + WAJAH" : "-",
           g.outEntry ? formatTimeWIB(g.outEntry.punched_at) : "-",
-          g.outEntry?.selfie_data ? "TIMEMARK + WAJAH" : "-",
           "0j 00m",
           "0j 00m",
           lateInfo.isLate ? `${lateInfo.lateMinutes}m` : "0m",
@@ -2853,7 +3041,7 @@ export default function AbsensiMultiServerPage() {
             : g.shiftInfo.code === "OFF"
             ? "LIBUR (OFF)"
             : "HADIR",
-          g.inEntry?.mode || g.outEntry?.mode || "TIMEMARK + BARCODE + WAJAH",
+          g.inEntry?.mode || g.outEntry?.mode || "BARCODE + GPS",
         ];
       });
 
@@ -2886,12 +3074,6 @@ export default function AbsensiMultiServerPage() {
         const lateInfo = g.inEntry
           ? calcLateDetail(g.inEntry.punched_at, g.shiftInfo.startTime)
           : { lateMinutes: 0, isLate: false, statusNote: "-" };
-        const inImgHtml = g.inEntry?.selfie_data
-          ? `<img src="${g.inEntry.selfie_data}" width="54" height="54" style="width:54px;height:54px;object-fit:cover;border-radius:4px;border:1px solid #082A63" />`
-          : `<span style="color:#64748b">-</span>`;
-        const outImgHtml = g.outEntry?.selfie_data
-          ? `<img src="${g.outEntry.selfie_data}" width="54" height="54" style="width:54px;height:54px;object-fit:cover;border-radius:4px;border:1px solid #082A63" />`
-          : `<span style="color:#64748b">-</span>`;
         const shiftHtml =
           g.shiftInfo.code === "OFF"
             ? `<span style="color:#DC2626;font-weight:900">OFF</span>`
@@ -2912,14 +3094,12 @@ export default function AbsensiMultiServerPage() {
           <td style="font-size:10px">${g.deviceSummary}</td>
           <td>${shiftHtml}</td>
           <td>${g.inEntry ? formatTimeWIB(g.inEntry.punched_at) : "-"}</td>
-          <td style="text-align:center">${inImgHtml}</td>
           <td>${g.outEntry ? formatTimeWIB(g.outEntry.punched_at) : "-"}</td>
-          <td style="text-align:center">${outImgHtml}</td>
           <td>0j 00m</td>
           <td>0j 00m</td>
           <td>${telatHtml}</td>
           <td>${ketText}</td>
-          <td>${g.inEntry?.mode || g.outEntry?.mode || "TIMEMARK + BARCODE + WAJAH"}</td>
+          <td>${g.inEntry?.mode || g.outEntry?.mode || "BARCODE + GPS"}</td>
         </tr>`;
       })
       .join("");
@@ -3935,6 +4115,303 @@ export default function AbsensiMultiServerPage() {
           </section>
         )}
 
+        {isAdminServer && (
+          <section className="bg-white rounded-2xl p-3.5 border-t-4 border-t-cyan-600 border border-slate-200/80 shadow-sm space-y-2.5">
+            <div className="flex items-center justify-between gap-2">
+              <div>
+                <h2 className="text-xs font-extrabold text-slate-800">
+                  Dashboard Foto Absen Masuk &amp; Keluar per Anggota
+                </h2>
+                <p className="text-[10px] text-slate-500">
+                  Verifikasi autentik foto anti-manipulasi: jam masuk/keluar,
+                  koordinat, ID, hari, tanggal &amp; tahun.
+                </p>
+              </div>
+              <span className="px-2 py-0.5 rounded bg-cyan-100 text-cyan-800 text-[9px] font-extrabold uppercase shrink-0">
+                SERVER ADMIN
+              </span>
+            </div>
+
+            <div className="grid grid-cols-2 gap-1.5">
+              <select
+                value={photoEmpFilter}
+                onChange={(e) => setPhotoEmpFilter(e.target.value)}
+                className="rounded-lg border border-slate-300 px-2 py-1.5 text-[10px] font-semibold bg-white"
+              >
+                <option value="ALL">Semua Anggota ({staffList.length})</option>
+                {staffList.map((emp) => (
+                  <option key={emp.id} value={String(emp.id)}>
+                    {emp.full_name}
+                  </option>
+                ))}
+              </select>
+              <input
+                type="date"
+                value={photoDateFilter || todayStr}
+                onChange={(e) => setPhotoDateFilter(e.target.value)}
+                className="rounded-lg border border-slate-300 px-2 py-1.5 text-[10px] font-mono bg-white"
+              />
+            </div>
+
+            <div className="space-y-2.5">
+              {employeePhotoCards.map((card) => {
+                const primaryEntry = card.outEntry || card.inEntry;
+                return (
+                  <div
+                    key={card.emp.emp_code}
+                    className="p-2.5 rounded-xl bg-slate-50 border border-slate-200 space-y-2"
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <div>
+                        <div className="text-xs font-extrabold text-slate-900">
+                          {card.emp.full_name}
+                        </div>
+                        <div className="text-[10px] font-mono text-slate-600">
+                          ID: {card.emp.emp_code}
+                        </div>
+                      </div>
+                      <span
+                        className={`px-2 py-0.5 rounded text-[9px] font-extrabold uppercase shrink-0 ${
+                          card.isAuthentic
+                            ? "bg-emerald-100 text-emerald-800"
+                            : "bg-amber-100 text-amber-800"
+                        }`}
+                      >
+                        {card.authStatus}
+                      </span>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-2">
+                      <div className="p-2 rounded-lg bg-white border border-slate-200 space-y-1.5">
+                        <div className="flex items-center justify-between text-[10px] font-bold">
+                          <span className="text-blue-700">FOTO MASUK</span>
+                          <span className="font-mono text-slate-700">
+                            {card.inTimeWib}
+                          </span>
+                        </div>
+                        {card.inEntry?.selfie_data ? (
+                          <>
+                            {/* eslint-disable-next-line @next/next/no-img-element */}
+                            <img
+                              src={card.inEntry.selfie_data}
+                              alt={`Foto Masuk ${card.emp.full_name}`}
+                              className="w-full h-28 object-cover rounded-md border border-slate-300"
+                            />
+                            <div className="grid grid-cols-2 gap-1">
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setInspectedPhotoModal({
+                                    entry: card.inEntry!,
+                                    empName: card.emp.full_name,
+                                    empCode: card.emp.emp_code,
+                                    inTimeWib: card.inTimeWib,
+                                    outTimeWib: card.outTimeWib,
+                                    dayName: card.dayName,
+                                    dateYearLabel: card.dateYearLabel,
+                                    coordsLabel: `${
+                                      card.inEntry?.latitude ??
+                                      targetLocation.latitude
+                                    }, ${
+                                      card.inEntry?.longitude ??
+                                      targetLocation.longitude
+                                    }`,
+                                    authStatus: card.authStatus,
+                                    authSeal:
+                                      card.inEntry?.auth_seal || card.authSeal,
+                                  })
+                                }
+                                className="py-1 rounded bg-slate-800 text-white text-[10px] font-bold"
+                              >
+                                Cek Foto
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  handleDownloadPhotoAsset({
+                                    dataUrl: card.inEntry!.selfie_data!,
+                                    empCode: card.emp.emp_code,
+                                    typeLabel: "MASUK",
+                                    dateStr: card.dateStr,
+                                    timeWib: card.inTimeWib,
+                                    coordsLabel: `${
+                                      card.inEntry?.latitude ??
+                                      targetLocation.latitude
+                                    }, ${
+                                      card.inEntry?.longitude ??
+                                      targetLocation.longitude
+                                    }`,
+                                    authSeal:
+                                      card.inEntry?.auth_seal || card.authSeal,
+                                  })
+                                }
+                                className="py-1 rounded bg-emerald-700 text-white text-[10px] font-bold"
+                              >
+                                Download
+                              </button>
+                            </div>
+                          </>
+                        ) : (
+                          <div className="h-28 rounded-md bg-slate-100 border border-dashed border-slate-300 flex items-center justify-center text-[10px] text-slate-400">
+                            Belum ada foto masuk
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="p-2 rounded-lg bg-white border border-slate-200 space-y-1.5">
+                        <div className="flex items-center justify-between text-[10px] font-bold">
+                          <span className="text-indigo-700">FOTO KELUAR</span>
+                          <span className="font-mono text-slate-700">
+                            {card.outTimeWib}
+                          </span>
+                        </div>
+                        {card.outEntry?.selfie_data ? (
+                          <>
+                            {/* eslint-disable-next-line @next/next/no-img-element */}
+                            <img
+                              src={card.outEntry.selfie_data}
+                              alt={`Foto Keluar ${card.emp.full_name}`}
+                              className="w-full h-28 object-cover rounded-md border border-slate-300"
+                            />
+                            <div className="grid grid-cols-2 gap-1">
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setInspectedPhotoModal({
+                                    entry: card.outEntry!,
+                                    empName: card.emp.full_name,
+                                    empCode: card.emp.emp_code,
+                                    inTimeWib: card.inTimeWib,
+                                    outTimeWib: card.outTimeWib,
+                                    dayName: card.dayName,
+                                    dateYearLabel: card.dateYearLabel,
+                                    coordsLabel: `${
+                                      card.outEntry?.latitude ??
+                                      targetLocation.latitude
+                                    }, ${
+                                      card.outEntry?.longitude ??
+                                      targetLocation.longitude
+                                    }`,
+                                    authStatus: card.authStatus,
+                                    authSeal:
+                                      card.outEntry?.auth_seal || card.authSeal,
+                                  })
+                                }
+                                className="py-1 rounded bg-slate-800 text-white text-[10px] font-bold"
+                              >
+                                Cek Foto
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  handleDownloadPhotoAsset({
+                                    dataUrl: card.outEntry!.selfie_data!,
+                                    empCode: card.emp.emp_code,
+                                    typeLabel: "KELUAR",
+                                    dateStr: card.dateStr,
+                                    timeWib: card.outTimeWib,
+                                    coordsLabel: `${
+                                      card.outEntry?.latitude ??
+                                      targetLocation.latitude
+                                    }, ${
+                                      card.outEntry?.longitude ??
+                                      targetLocation.longitude
+                                    }`,
+                                    authSeal:
+                                      card.outEntry?.auth_seal || card.authSeal,
+                                  })
+                                }
+                                className="py-1 rounded bg-emerald-700 text-white text-[10px] font-bold"
+                              >
+                                Download
+                              </button>
+                            </div>
+                          </>
+                        ) : (
+                          <div className="h-28 rounded-md bg-slate-100 border border-dashed border-slate-300 flex items-center justify-center text-[10px] text-slate-400">
+                            Belum ada foto keluar
+                          </div>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="p-2 rounded-lg bg-white border border-slate-200 text-[10px] text-slate-700 space-y-0.5 font-mono">
+                      <div>
+                        <b>Hari / Tanggal / Tahun:</b> {card.dayName},{" "}
+                        {card.dateYearLabel}
+                      </div>
+                      <div>
+                        <b>Jam Masuk / Keluar:</b> {card.inTimeWib} WIB /{" "}
+                        {card.outTimeWib} WIB
+                      </div>
+                      <div>
+                        <b>Titik Koordinat:</b> {card.coordsLabel}
+                      </div>
+                      <div>
+                        <b>ID Karyawan:</b> {card.emp.emp_code}
+                      </div>
+                      <div className="text-[9px] text-emerald-800 break-all">
+                        <b>Segel Autentikasi:</b> {card.authSeal} •{" "}
+                        {primaryEntry?.mode || "TIMEMARK + WAJAH"}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            {inspectedPhotoModal && (
+              <div className="p-3 rounded-xl bg-[#0B1220] text-white border border-cyan-400 space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[11px] font-extrabold text-cyan-300 uppercase">
+                    Verifikasi Autentik Foto Server
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setInspectedPhotoModal(null)}
+                    className="px-2 py-0.5 rounded bg-rose-600 text-white text-[10px] font-bold"
+                  >
+                    Tutup
+                  </button>
+                </div>
+                {inspectedPhotoModal.entry.selfie_data && (
+                  /* eslint-disable-next-line @next/next/no-img-element */
+                  <img
+                    src={inspectedPhotoModal.entry.selfie_data}
+                    alt="Preview Verifikasi Foto"
+                    className="w-full max-h-64 object-contain rounded-lg bg-black border border-slate-700"
+                  />
+                )}
+                <div className="text-[10px] font-mono space-y-0.5 text-slate-200">
+                  <div>
+                    <b>Nama:</b> {inspectedPhotoModal.empName}
+                  </div>
+                  <div>
+                    <b>ID Karyawan:</b> {inspectedPhotoModal.empCode}
+                  </div>
+                  <div>
+                    <b>Hari / Tanggal / Tahun:</b>{" "}
+                    {inspectedPhotoModal.dayName},{" "}
+                    {inspectedPhotoModal.dateYearLabel}
+                  </div>
+                  <div>
+                    <b>Jam Masuk / Keluar:</b>{" "}
+                    {inspectedPhotoModal.inTimeWib} WIB /{" "}
+                    {inspectedPhotoModal.outTimeWib} WIB
+                  </div>
+                  <div>
+                    <b>Titik Koordinat:</b> {inspectedPhotoModal.coordsLabel}
+                  </div>
+                  <div className="text-emerald-300 break-all">
+                    <b>Status &amp; Segel:</b> {inspectedPhotoModal.authStatus}{" "}
+                    • {inspectedPhotoModal.authSeal}
+                  </div>
+                </div>
+              </div>
+            )}
+          </section>
+        )}
+
         <section className="bg-white rounded-2xl p-3.5 border-t-4 border-t-blue-500 border border-slate-200/80 shadow-sm space-y-2.5">
           <div className="flex items-center justify-between">
             <h2 className="text-xs font-extrabold text-slate-800">
@@ -4442,7 +4919,6 @@ export default function AbsensiMultiServerPage() {
                       <th className="p-1.5">Nama</th>
                       <th className="p-1.5">Device HP</th>
                       <th className="p-1.5">Jenis</th>
-                      <th className="p-1.5">Foto</th>
                       <th className="p-1.5">Scan</th>
                       <th className="p-1.5">Telat</th>
                       <th className="p-1.5">Aksi</th>
@@ -4452,7 +4928,7 @@ export default function AbsensiMultiServerPage() {
                     {filteredEntries.length === 0 ? (
                       <tr>
                         <td
-                          colSpan={9}
+                          colSpan={8}
                           className="p-4 text-center text-slate-400"
                         >
                           Belum ada data absensi
@@ -4508,18 +4984,6 @@ export default function AbsensiMultiServerPage() {
                               {item.entry_type === "CLOCK_IN"
                                 ? "MASUK"
                                 : "KELUAR"}
-                            </td>
-                            <td className="p-1.5 whitespace-nowrap">
-                              {item.selfie_data ? (
-                                /* eslint-disable-next-line @next/next/no-img-element */
-                                <img
-                                  src={item.selfie_data}
-                                  alt="Wajah TimeMark"
-                                  className="w-8 h-8 rounded object-cover border border-slate-300"
-                                />
-                              ) : (
-                                "-"
-                              )}
                             </td>
                             <td className="p-1.5 whitespace-nowrap">
                               {formatTimeWIB(item.punched_at)}
